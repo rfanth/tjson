@@ -1,0 +1,15 @@
+[package]
+name = "tjson"
+version = "0.1.0"
+edition = "2024"
+authors = ["R.F. Anthracite <rfa@rfanth.com>"]
+
+[[bin]]
+name = "tjson"
+path = "src/bin/tjson.rs"
+
+[dependencies]
+argh = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+unicode-general-category = "1.0"
