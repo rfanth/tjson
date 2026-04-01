@@ -1,2 +1,12 @@
 /target
 /pkg
+/pkg-*
+/local
+/.local
+/notes
+/.cargo
+/.claude
+*.swp
+Cargo.toml.bak
+Cargo.toml.bak2
+Cargo.lock
