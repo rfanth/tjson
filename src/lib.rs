@@ -552,6 +552,78 @@ impl Default for TjsonOptions {
     }
 }
 
+// Deserializers that accept camelCase (for JS/WASM) for all enum fields in TjsonConfig.
+// PascalCase (serde default) is also accepted as a fallback.
+mod camel_de {
+    use serde::{Deserialize, Deserializer};
+
+    fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        Ok(Option::<String>::deserialize(d)?)
+    }
+
+    macro_rules! camel_option_de {
+        ($fn_name:ident, $Enum:ty, $($camel:literal => $variant:expr),+ $(,)?) => {
+            pub fn $fn_name<'de, D: Deserializer<'de>>(d: D) -> Result<Option<$Enum>, D::Error> {
+                let Some(s) = de_str(d)? else { return Ok(None); };
+                match s.as_str() {
+                    $($camel => return Ok(Some($variant)),)+
+                    _ => {}
+                }
+                // Fall back to PascalCase via serde
+                serde_json::from_value(serde_json::Value::String(s.clone()))
+                    .map(Some)
+                    .map_err(|_| serde::de::Error::unknown_variant(&s, &[$($camel),+]))
+            }
+        };
+    }
+
+    camel_option_de!(bare_style, super::BareStyle,
+        "prefer" => super::BareStyle::Prefer,
+        "none"   => super::BareStyle::None,
+    );
+
+    camel_option_de!(fold_style, super::FoldStyle,
+        "auto"  => super::FoldStyle::Auto,
+        "fixed" => super::FoldStyle::Fixed,
+        "none"  => super::FoldStyle::None,
+    );
+
+    camel_option_de!(multiline_style, super::MultilineStyle,
+        "floating"      => super::MultilineStyle::Floating,
+        "bold"          => super::MultilineStyle::Bold,
+        "boldFloating"  => super::MultilineStyle::BoldFloating,
+        "transparent"   => super::MultilineStyle::Transparent,
+        "light"         => super::MultilineStyle::Light,
+        "foldingQuotes" => super::MultilineStyle::FoldingQuotes,
+    );
+
+    camel_option_de!(table_unindent_style, super::TableUnindentStyle,
+        "left"     => super::TableUnindentStyle::Left,
+        "auto"     => super::TableUnindentStyle::Auto,
+        "floating" => super::TableUnindentStyle::Floating,
+        "none"     => super::TableUnindentStyle::None,
+    );
+
+    camel_option_de!(indent_glyph_style, super::IndentGlyphStyle,
+        "auto"  => super::IndentGlyphStyle::Auto,
+        "fixed" => super::IndentGlyphStyle::Fixed,
+        "none"  => super::IndentGlyphStyle::None,
+    );
+
+    camel_option_de!(indent_glyph_marker_style, super::IndentGlyphMarkerStyle,
+        "compact"  => super::IndentGlyphMarkerStyle::Compact,
+        "separate" => super::IndentGlyphMarkerStyle::Separate,
+    );
+
+    camel_option_de!(string_array_style, super::StringArrayStyle,
+        "spaces"       => super::StringArrayStyle::Spaces,
+        "preferSpaces" => super::StringArrayStyle::PreferSpaces,
+        "comma"        => super::StringArrayStyle::Comma,
+        "preferComma"  => super::StringArrayStyle::PreferComma,
+        "none"         => super::StringArrayStyle::None,
+    );
+}
+
 /// A camelCase-deserializable options bag for WASM/JS and test configs.
 /// Not part of the public Rust API — use [`TjsonOptions`] directly in Rust code.
 #[doc(hidden)]
@@ -561,27 +633,38 @@ pub struct TjsonConfig {
     canonical: bool,
     force_markers: Option<bool>,
     wrap_width: Option<usize>,
+    #[serde(deserialize_with = "camel_de::bare_style")]
     bare_strings: Option<BareStyle>,
+    #[serde(deserialize_with = "camel_de::bare_style")]
     bare_keys: Option<BareStyle>,
     inline_objects: Option<bool>,
     inline_arrays: Option<bool>,
     multiline_strings: Option<bool>,
+    #[serde(deserialize_with = "camel_de::multiline_style")]
     multiline_style: Option<MultilineStyle>,
     multiline_min_lines: Option<usize>,
     multiline_max_lines: Option<usize>,
     tables: Option<bool>,
     table_fold: Option<bool>,
+    #[serde(deserialize_with = "camel_de::table_unindent_style")]
     table_unindent_style: Option<TableUnindentStyle>,
     table_min_rows: Option<usize>,
     table_min_cols: Option<usize>,
     table_min_similarity: Option<f32>,
     table_column_max_width: Option<usize>,
+    #[serde(deserialize_with = "camel_de::string_array_style")]
     string_array_style: Option<StringArrayStyle>,
+    #[serde(deserialize_with = "camel_de::fold_style")]
     number_fold_style: Option<FoldStyle>,
+    #[serde(deserialize_with = "camel_de::fold_style")]
     string_bare_fold_style: Option<FoldStyle>,
+    #[serde(deserialize_with = "camel_de::fold_style")]
     string_quoted_fold_style: Option<FoldStyle>,
+    #[serde(deserialize_with = "camel_de::fold_style")]
     string_multiline_fold_style: Option<FoldStyle>,
+    #[serde(deserialize_with = "camel_de::indent_glyph_style")]
     indent_glyph_style: Option<IndentGlyphStyle>,
+    #[serde(deserialize_with = "camel_de::indent_glyph_marker_style")]
     indent_glyph_marker_style: Option<IndentGlyphMarkerStyle>,
 }
 
@@ -6424,5 +6507,32 @@ mod tests {
             !rendered.contains(" /<"),
             "expected no /< when indent is small:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn tjson_config_camel_case_enums() {
+        // multi-word camelCase variants
+        let c: TjsonConfig = serde_json::from_str(r#"{"stringArrayStyle":"preferSpaces","multilineStyle":"boldFloating"}"#).unwrap();
+        assert_eq!(c.string_array_style, Some(StringArrayStyle::PreferSpaces));
+        assert_eq!(c.multiline_style, Some(MultilineStyle::BoldFloating));
+
+        // PascalCase still works
+        let c: TjsonConfig = serde_json::from_str(r#"{"stringArrayStyle":"PreferComma","multilineStyle":"FoldingQuotes"}"#).unwrap();
+        assert_eq!(c.string_array_style, Some(StringArrayStyle::PreferComma));
+        assert_eq!(c.multiline_style, Some(MultilineStyle::FoldingQuotes));
+
+        // single-word lowercase (BareStyle, FoldStyle, IndentGlyphStyle, TableUnindentStyle, IndentGlyphMarkerStyle)
+        let c: TjsonConfig = serde_json::from_str(r#"{
+            "bareStrings": "prefer",
+            "numberFoldStyle": "auto",
+            "indentGlyphStyle": "fixed",
+            "tableUnindentStyle": "floating",
+            "indentGlyphMarkerStyle": "compact"
+        }"#).unwrap();
+        assert_eq!(c.bare_strings, Some(BareStyle::Prefer));
+        assert_eq!(c.number_fold_style, Some(FoldStyle::Auto));
+        assert_eq!(c.indent_glyph_style, Some(IndentGlyphStyle::Fixed));
+        assert_eq!(c.table_unindent_style, Some(TableUnindentStyle::Floating));
+        assert_eq!(c.indent_glyph_marker_style, Some(IndentGlyphMarkerStyle::Compact));
     }
 }

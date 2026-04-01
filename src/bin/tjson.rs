@@ -328,6 +328,6 @@ mod tests {
 
     #[test]
     fn reports_program_version() {
-        assert_eq!(version_text(), "tjson-rs 0.1.0");
+        assert_eq!(version_text(), "tjson-rs 0.3.0");
     }
 }
