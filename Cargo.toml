@@ -1,15 +1,36 @@
 [package]
-name = "tjson"
-version = "0.1.0"
+name = "tjson-rs"
+version = "0.3.0"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
+description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"
+license = "BSD-3-Clause"
+readme = "README.md"
+repository = "https://github.com/rfanth/tjson"
+homepage = "https://textjson.com"
+
+[lib]
+name = "tjson"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "tjson"
 path = "src/bin/tjson.rs"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+terminal_size = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
 [dependencies]
-argh = "0.1"
+pico-args = { version = "0.5", features = ["eq-separator"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precision"] }
 unicode-general-category = "1.0"
+
