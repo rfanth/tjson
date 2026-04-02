@@ -328,6 +328,6 @@ mod tests {
 
     #[test]
     fn reports_program_version() {
-        assert_eq!(version_text(), "tjson-rs 0.3.0");
+        assert_eq!(version_text(), format!("tjson-rs {}", env!("CARGO_PKG_VERSION")));
     }
 }
