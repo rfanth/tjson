@@ -13,6 +13,7 @@ homepage = "https://textjson.com"
 name = "tjson"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
+# musl compatibility is important, but compiles to WebAssembly via wasm-pack, so "cdylib" above
 
 [[bin]]
 name = "tjson"

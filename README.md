@@ -12,7 +12,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tjson = "0.1"
+tjson = "0.3"
 ```
 
 Install the CLI:
@@ -86,11 +86,28 @@ tjson --canonical -i data.json
 
 ## WASM / JavaScript
 
-The library compiles to WebAssembly via [wasm-pack](https://rustwasm.github.io/wasm-pack/):
+Install:
 
 ```sh
-wasm-pack build --target bundler
+npm install @rfanth/tjson
 ```
+
+Usage:
+
+```js
+import { parse, stringify } from '@rfanth/tjson';
+
+// Render JSON as TJSON
+const tjson = stringify('{"name":"Alice","scores":[1,2,3]}');
+
+// With options (camelCase for WASM/JS only)
+const canonical = stringify('{"name":"Alice"}', { canonical: true });
+const narrow = stringify('{"name":"Alice"}', { wrapWidth: 40, stringArrayStyle: 'preferSpaces' });
+
+// Parse TJSON back to a JSON string
+const json = parse('  name: Alice');
+```
+
 
 ## Resources
 
