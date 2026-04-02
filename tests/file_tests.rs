@@ -2,11 +2,16 @@ use std::path::Path;
 use tjson::{TjsonConfig, TjsonOptions, TjsonValue};
 
 fn tests_dir() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("TJSON_TESTS_DIR") {
-        return std::path::PathBuf::from(p);
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
+    let pathbuf = if let Ok(p) = std::env::var("TJSON_TESTS_DIR") {
+        std::path::PathBuf::from(p)
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+    };
+    let tests_missing_message = "You are trying to test without the tjson-tests subrepository.  Did you follow the instructions in CONTRIBUTING.md first?";
+    _ = pathbuf.read_dir().unwrap_or_else(|e| panic!("Cannot read tests directory {pathbuf:?}: {e}\n{tests_missing_message}"))
+        .next().unwrap_or_else(|| panic!("Cannot find anything in tests directory {pathbuf:?}.\n{tests_missing_message}"));
+    pathbuf
 }
 
 #[test]
