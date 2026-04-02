@@ -95,8 +95,8 @@ wasm-pack build --target bundler
 ## Resources
 
 - Website and online demo: [textjson.com](https://textjson.com)
-- Specification: _coming soon_
-- Test suite: _coming soon_
+- Specification: [tjson-specification.md](https://github.com/rfanth/tjson-spec/blob/master/tjson-specification.md)
+- Test suite: [tjson-tests](https://github.com/rfanth/tjson-tests)
 
 ## License
 
