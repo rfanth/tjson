@@ -2,10 +2,11 @@ use std::path::Path;
 use tjson::{TjsonConfig, TjsonOptions, TjsonValue};
 
 fn tests_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("TJSON_TESTS_DIR") {
+        return std::path::PathBuf::from(p);
+    }
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("tjson-tests")
+        .join("tests/fixtures")
 }
 
 #[test]
