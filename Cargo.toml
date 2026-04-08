@@ -1,6 +1,6 @@
 [package]
 name = "tjson-rs"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
 description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"
@@ -8,6 +8,7 @@ license = "BSD-3-Clause"
 readme = "README.md"
 repository = "https://github.com/rfanth/tjson"
 homepage = "https://textjson.com"
+exclude = ["tests/fixtures"]
 
 [lib]
 name = "tjson"
