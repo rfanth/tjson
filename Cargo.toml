@@ -1,6 +1,6 @@
 [package]
 name = "tjson-rs"
-version = "0.3.4"
+version = "0.4.1"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
 description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"
@@ -22,6 +22,7 @@ path = "src/bin/tjson.rs"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 terminal_size = "0.4"

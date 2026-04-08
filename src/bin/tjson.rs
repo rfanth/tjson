@@ -233,7 +233,7 @@ fn main() {
         if let Some(v) = opt_table_min_rows   { opts = opts.table_min_rows(v); }
         if let Some(v) = opt_table_min_cols   { opts = opts.table_min_cols(v); }
         if let Some(v) = opt_table_min_similarity { opts = opts.table_min_similarity(v); }
-        if let Some(v) = opt_table_col_max    { opts = opts.table_column_max_width(v); }
+        if let Some(v) = opt_table_col_max    { opts = opts.table_column_max_width(if v == 0 { None } else { Some(v) }); }
         if let Some(v) = opt_indent_glyph_style.as_deref().map(|s| s.parse::<tjson::IndentGlyphStyle>().unwrap_or_else(|e| { eprintln!("tjson: --indent-glyph-style: {e}"); std::process::exit(1); })) {
             opts = opts.indent_glyph_style(v);
         }
@@ -244,10 +244,7 @@ fn main() {
         if let Some(v) = opt_multiline_max    { opts = opts.multiline_max_lines(v); }
         // --fold sets all four; per-type flags override (more specific wins)
         if let Some(v) = opt_fold.as_deref().map(|s| s.parse::<tjson::FoldStyle>().unwrap_or_else(|e| { eprintln!("tjson: --fold: {e}"); std::process::exit(1); })) {
-            opts = opts.string_bare_fold_style(v)
-                       .string_quoted_fold_style(v)
-                       .string_multiline_fold_style(v)
-                       .number_fold_style(v);
+            opts = opts.fold(v);
         }
         if let Some(v) = opt_fold_bare.as_deref().map(|s| s.parse::<tjson::FoldStyle>().unwrap_or_else(|e| { eprintln!("tjson: --fold-bare: {e}"); std::process::exit(1); })) {
             opts = opts.string_bare_fold_style(v);

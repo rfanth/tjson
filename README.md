@@ -2,7 +2,7 @@
 
 A Rust library and CLI tool for [TJSON](https://textjson.com)
 
-TJSON is a hyper-readable, round trip safe and data preserving substitute for JSON that feels like text and represents the same data while looking quite different and allowing different generator rules to optimize readibility.  It is not a superset or a subset of JSON.  It's commonality is that it represents the same underlying data, not the format itself.  It's position based to emphasize locality of meaning, and adds bare strings, pipe tables, comments, multiline string literals, and line folding to make the contained data easier to read while remaining fully convertible to and from standard JSON without data loss.  TJSON is optimized for reading and deterministic data, not human editing.
+TJSON is a hyper-readable, round trip safe and data preserving substitute for JSON that feels like text and represents the same data while looking quite different and allowing different generator rules to optimize readability.  It is not a superset or a subset of JSON, but it does represent the same underlying data in a different format.  It's position based to emphasize locality of meaning, and adds bare strings, pipe tables, comments, multiline string literals, and line folding to make the contained data easier to read while remaining fully convertible to and from standard JSON while retaining exactly the same data.  TJSON is optimized for reading and deterministic data, not human editing.
 
 Usage as a binary, library (including WASM too), and through serde Serialize are all fully supported.
 
@@ -12,7 +12,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tjson = "0.3"
+tjson = { package = "tjson-rs", version = "0.4" }
 ```
 
 Install the CLI:
@@ -45,7 +45,7 @@ let value = TjsonValue::from(serde_json::json!({"name": "Alice", "age": 30}));
 // Default options
 let tjson = value.to_tjson_with(TjsonOptions::default())?;
 
-// Canonical (one key per line, no packing)
+// Canonical (one key per line, no packing, see docs for details)
 let canonical = value.to_tjson_with(TjsonOptions::canonical())?;
 ```
 
@@ -95,17 +95,23 @@ npm install @rfanth/tjson
 Usage:
 
 ```js
-import { parse, stringify } from '@rfanth/tjson';
+import { parse, stringify, toJson, fromJson } from '@rfanth/tjson';
 
-// Render JSON as TJSON
-const tjson = stringify('{"name":"Alice","scores":[1,2,3]}');
+// Render JSON as TJSON with or without options
+const tjsonString = fromJson('{"name":"Alice","scores":[1,2,3]}');
+const tjsonStringNarrow = fromJson('{"name":"Alice","scores":[1,2,3]}', { wrapWidth: 40 });
 
-// With options (camelCase for WASM/JS only)
-const canonical = stringify('{"name":"Alice"}', { canonical: true });
-const narrow = stringify('{"name":"Alice"}', { wrapWidth: 40, stringArrayStyle: 'preferSpaces' });
+// Parse TJSON to a JSON string
+const jsonString = toJson(tjsonString);
 
-// Parse TJSON back to a JSON string
-const json = parse('  name: Alice');
+// Render from a native javascript object with or without options (camelCase for WASM/JS only)
+const defaultTjson = stringify({name: "Alice"});
+const canonicalTjson = stringify({name: "Alice"}, { canonical: true });
+const noFoldTjson = stringify({name: "Alice"}, { fold: "none", stringArrayStyle: 'preferSpaces' });
+
+// Parse TJSON to a native javascript value
+const jsObject = parse('  name: Alice');
+
 ```
 
 

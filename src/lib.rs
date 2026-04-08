@@ -17,14 +17,15 @@ const MIN_FOLD_CONTINUATION: usize = 10;
 
 /// Controls when `/<` / `/>` indent-offset glyphs are emitted to push content to visual indent 0.
 ///
-/// - `Auto` (default): apply glyphs when content would overflow `wrap_width` at its natural indent,
-///   or when the indent depth exceeds half of `wrap_width`.
+/// - `Auto` (default): apply glyphs to avoid overflow and reduce screen volume, using a weighted
+///   algorithm that considers the overall shape of the object.
 /// - `Fixed`: always apply glyphs once the indent depth exceeds a threshold, without waiting for overflow.
 /// - `None`: never apply glyphs; content may overflow `wrap_width`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndentGlyphStyle {
-    /// Apply glyphs reactively on overflow, or proactively at half of `wrap_width`.
+    /// Apply glyphs in order to avoid overflow and save screen volume, using an
+    /// intelligent weighting algorithm that looks at the entire object shape.
     #[default]
     Auto,
     /// Always apply glyphs past a fixed indent threshold, regardless of overflow.
@@ -165,7 +166,7 @@ pub struct TjsonOptions {
     table_min_rows: usize,
     table_min_cols: usize,
     table_min_similarity: f32,
-    table_column_max_width: usize,
+    table_column_max_width: Option<usize>,
     multiline_strings: bool,
     multiline_style: MultilineStyle,
     multiline_min_lines: usize,
@@ -180,8 +181,8 @@ pub struct TjsonOptions {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FoldStyle {
-    /// Prefer folding immediately after EOL characters, and at whitespace to word
-    /// boundaries to fit `wrap_width`.
+    /// Prefer folding immediately after EOL characters, and immediately before
+    /// whitespace boundaries to fit `wrap_width`.
     #[default]
     Auto,
     /// Fold right at, or if it violates specification (e.g. not between two data
@@ -211,11 +212,12 @@ impl FromStr for FoldStyle {
 /// Only affects strings that contain at least one EOL (LF or CRLF). Single-line strings
 /// always follow the normal `bare_strings` / `string_quoted_fold_style` options.
 ///
-/// - `Bold` (` `` `, default): double backtick, body always at col 2. Always safe.
-/// - `Floating` (`` ` ``): single backtick, body at `n+2`. Falls back to `Bold` when any content
-///   line would overflow `wrap_width` at that indent, or when the string exceeds
-///   `multiline_max_lines`, or when content is pipe-heavy / backtick-starting.
-/// - `BoldFloating` (` `` `): double backtick, body at `n+2` when it fits, col 2 when it overflows.
+/// - `Bold` (` `` `, default): body pinned to col 2, each content line begins with `| `. Always safe.
+/// - `Floating` (`` ` ``): single backtick, body at natural indent `n+2`. Falls back to `Bold`
+///   (col 2) on overflow, when the string exceeds `multiline_max_lines`, or when content is
+///   pipe-heavy / backtick-starting.
+/// - `BoldFloating` (` `` `): same format as `Bold`; body at natural indent `n+2` when it fits,
+///   otherwise falls back to col 2.
 /// - `Transparent` (` ``` `): triple backtick, body at col 0. Falls back to `Bold` when content is
 ///   pipe-heavy or has backtick-starting lines (visually unsafe in that format).
 /// - `Light` (`` ` `` or ` `` `): prefers `` ` ``; falls back to ` `` ` like `Floating`, but the
@@ -227,12 +229,14 @@ impl FromStr for FoldStyle {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MultilineStyle {
-    /// `` ` `` with body at `n+2`; falls back to `Bold` on overflow or excessive length.
+    /// Single-backtick (`` ` ``); body at natural indent `n+2`. Falls back to `Bold` (col 2)
+    /// on overflow, excessive length, or pipe-heavy / backtick-starting content.
     Floating,
-    /// ` `` ` with body always at col 2.
+    /// ` `` `: body at col 2, each content line begins with `| `. Always safe.
     #[default]
     Bold,
-    /// ` `` ` with body at `n+2` when it fits, col 2 when any line overflows `wrap_width`.
+    /// Same ` `` ` format as `Bold`; body at natural indent `n+2` when it fits within
+    /// `wrap_width`, otherwise falls back to col 2.
     BoldFloating,
     /// ` ``` ` with body at col 0; falls back to `Bold` when content is pipe-heavy or
     /// starts with backtick characters. `string_multiline_fold_style` has no effect here —
@@ -345,20 +349,24 @@ impl TjsonOptions {
         }
     }
 
-    /// When true, force explicit `[` / `{` markers even for non-empty arrays and objects
-    /// that would normally use implicit (marker-free) layout. Default is false.
+    /// When true, force explicit `[` / `{` indent markers even for a only a single n+2
+    /// indent jump at a time, that would normally have an implicit indent marker.
+    /// Normally, we only use markers when we jump at least two indent steps at once (n+2, n+2 again).
+    /// Default is false.
     pub fn force_markers(mut self, force_markers: bool) -> Self {
         self.force_markers = force_markers;
         self
     }
 
-    /// Controls whether string values are rendered bare (unquoted) when possible. Default is `Prefer`.
+    /// Controls whether string values use bare string format or JSON quoted strings. `Prefer` uses
+    /// bare strings whenever the spec permits; `None` always uses JSON quoted strings. Default is `Prefer`.
     pub fn bare_strings(mut self, bare_strings: BareStyle) -> Self {
         self.bare_strings = bare_strings;
         self
     }
 
-    /// Controls whether object keys are rendered bare (unquoted) when possible. Default is `Prefer`.
+    /// Controls whether object keys use bare key format or JSON quoted strings. `Prefer` uses
+    /// bare keys whenever the spec permits; `None` always uses JSON quoted strings. Default is `Prefer`.
     pub fn bare_keys(mut self, bare_keys: BareStyle) -> Self {
         self.bare_keys = bare_keys;
         self
@@ -376,7 +384,8 @@ impl TjsonOptions {
         self
     }
 
-    /// Controls how arrays of short strings are packed. Default is `PreferComma`.
+    /// Controls how arrays where every element is a string are packed onto a single line.
+    /// Has no effect on arrays that contain any non-string values. Default is `PreferComma`.
     pub fn string_array_style(mut self, string_array_style: StringArrayStyle) -> Self {
         self.string_array_style = string_array_style;
         self
@@ -398,7 +407,7 @@ impl TjsonOptions {
     }
 
     /// Set the wrap width with validation. `None` means no wrap limit (infinite width).
-    /// Returns an error if the value is `Some(n)` where `n < 10`.
+    /// Returns an error if the value is `Some(n)` where `n < 20`.
     /// Use [`wrap_width`](Self::wrap_width) if you want clamping instead.
     pub fn wrap_width_checked(self, wrap_width: Option<usize>) -> std::result::Result<Self, String> {
         if let Some(w) = wrap_width
@@ -430,26 +439,38 @@ impl TjsonOptions {
         self
     }
 
-    /// Maximum rendered width (in characters) of any single table column. Default is 40.
-    pub fn table_column_max_width(mut self, table_column_max_width: usize) -> Self {
+    /// If any column's content width (including the leading space on bare string values) exceeds
+    /// this value, the table is abandoned entirely and falls back to block layout.
+    /// `None` means no limit. Default is `Some(40)`.
+    pub fn table_column_max_width(mut self, table_column_max_width: Option<usize>) -> Self {
         self.table_column_max_width = table_column_max_width;
         self
     }
 
+    /// Set all four fold styles at once. Individual fold options override this if set after.
+    pub fn fold(self, style: FoldStyle) -> Self {
+        self.number_fold_style(style)
+            .string_bare_fold_style(style)
+            .string_quoted_fold_style(style)
+            .string_multiline_fold_style(style)
+    }
+
     /// Fold style for numbers. `Auto` folds before `.`/`e`/`E` first, then between digits.
-    /// `Fixed` folds between any two digits at the wrap limit. Default is `None`.
+    /// `Fixed` folds between any two digits at the wrap limit. Default is `Auto`.
     pub fn number_fold_style(mut self, style: FoldStyle) -> Self {
         self.number_fold_style = style;
         self
     }
 
-    /// Fold style for bare strings. Default is `Auto`.
+    /// Whether and how to fold long bare strings and bare keys across lines using `/ ` continuation
+    /// markers. Applies to both string values and object keys rendered in bare format. Default is `Auto`.
     pub fn string_bare_fold_style(mut self, style: FoldStyle) -> Self {
         self.string_bare_fold_style = style;
         self
     }
 
-    /// Fold style for quoted strings. Default is `Auto`.
+    /// Whether and how to fold long quoted strings and quoted keys across lines using `/ ` continuation
+    /// markers. Applies to both string values and object keys rendered in JSON quoted format. Default is `Auto`.
     pub fn string_quoted_fold_style(mut self, style: FoldStyle) -> Self {
         self.string_quoted_fold_style = style;
         self
@@ -481,13 +502,16 @@ impl TjsonOptions {
         self
     }
 
-    /// Controls when `/<` / `/>` indent-offset glyphs are applied. Default is `Auto`.
+    /// Controls when `/<` / `/>` indent-offset glyphs are emitted to push deeply-indented
+    /// content back toward the left margin, improving readability at high nesting depths.
+    /// Default is `Auto`.
     pub fn indent_glyph_style(mut self, style: IndentGlyphStyle) -> Self {
         self.indent_glyph_style = style;
         self
     }
 
-    /// Controls how the `/<` opening glyph is placed relative to its key. Default is `Compact`.
+    /// Controls whether the `/<` opening glyph trails its key on the same line (`Compact`)
+    /// or appears on its own line (`Separate`). Default is `Compact`.
     pub fn indent_glyph_marker_style(mut self, style: IndentGlyphMarkerStyle) -> Self {
         self.indent_glyph_marker_style = style;
         self
@@ -500,7 +524,9 @@ impl TjsonOptions {
         self
     }
 
-    /// Preferred multiline string rendering style. Default is `Bold`.
+    /// Selects the multiline string format: minimal (`` ` ``), bold (` `` `), or transparent (` ``` `),
+    /// each with different body positioning and fallback rules. See [`MultilineStyle`] for the full
+    /// breakdown. Default is `Bold`.
     pub fn multiline_style(mut self, multiline_style: MultilineStyle) -> Self {
         self.multiline_style = multiline_style;
         self
@@ -535,7 +561,7 @@ impl Default for TjsonOptions {
             table_min_rows: 3,
             table_min_cols: 3,
             table_min_similarity: 0.8,
-            table_column_max_width: 40,
+            table_column_max_width: Some(40),
             number_fold_style: FoldStyle::Auto,
             string_bare_fold_style: FoldStyle::Auto,
             string_quoted_fold_style: FoldStyle::Auto,
@@ -655,6 +681,8 @@ pub struct TjsonConfig {
     #[serde(deserialize_with = "camel_de::string_array_style")]
     string_array_style: Option<StringArrayStyle>,
     #[serde(deserialize_with = "camel_de::fold_style")]
+    fold: Option<FoldStyle>,
+    #[serde(deserialize_with = "camel_de::fold_style")]
     number_fold_style: Option<FoldStyle>,
     #[serde(deserialize_with = "camel_de::fold_style")]
     string_bare_fold_style: Option<FoldStyle>,
@@ -687,8 +715,9 @@ impl From<TjsonConfig> for TjsonOptions {
         if let Some(v) = c.table_min_rows     { opts = opts.table_min_rows(v); }
         if let Some(v) = c.table_min_cols     { opts = opts.table_min_cols(v); }
         if let Some(v) = c.table_min_similarity { opts = opts.table_min_similarity(v); }
-        if let Some(v) = c.table_column_max_width { opts = opts.table_column_max_width(v); }
+        if let Some(v) = c.table_column_max_width { opts = opts.table_column_max_width(if v == 0 { None } else { Some(v) }); }
         if let Some(v) = c.string_array_style { opts = opts.string_array_style(v); }
+        if let Some(v) = c.fold               { opts = opts.fold(v); }
         if let Some(v) = c.number_fold_style  { opts = opts.number_fold_style(v); }
         if let Some(v) = c.string_bare_fold_style { opts = opts.string_bare_fold_style(v); }
         if let Some(v) = c.string_quoted_fold_style { opts = opts.string_quoted_fold_style(v); }
@@ -3293,14 +3322,28 @@ impl Renderer {
                 widths[index] = widths[index].max(cell.len());
             }
         }
-        let col_max = options.table_column_max_width;
-        if col_max > 0 {
-            for width in &mut widths {
-                *width = (*width).min(col_max);
+        // Bail out if any column's content exceeds table_column_max_width.
+        if let Some(col_max) = options.table_column_max_width {
+            if widths.iter().any(|w| *w > col_max) {
+                return Ok(None);
             }
         }
         for width in &mut widths {
             *width += 2;
+        }
+
+        // Bail out if the table is too wide to fit within wrap_width even at indent 0.
+        // Each row is: (parent_indent + 2) spaces + |col1|col2|...|, where each colN width
+        // includes 2 chars of padding. The caller handles unindenting via /< />, but if the
+        // table still won't fit even at indent 0, block layout is better than overflow.
+        if let Some(w) = options.wrap_width {
+            // Each column renders as "|" + cell padded to `width` chars, plus trailing "|".
+            // Minimum row width assumes indent 0: 2 spaces prefix + sum(widths) + one "|" per column + trailing "|".
+            // The unindent logic may reduce indent below parent_indent, so only bail if it can't fit even at indent 0.
+            let min_row_width = 2 + widths.iter().sum::<usize>() + widths.len() + 1;
+            if min_row_width > w {
+                return Ok(None);
+            }
         }
 
         let indent = spaces(parent_indent + 2);
@@ -3335,7 +3378,7 @@ impl Renderer {
                 // Check if any cell exceeds table_column_max_width and fold if so.
                 // The fold splits the row line at a point within a cell's string value,
                 // between the first and last data character (not between `|` and value start).
-                // For simplicity, fold the whole row line at the wrap boundary.
+                // Find the fold point by scanning back from the wrap boundary.
                 let fold_avail = options
                     .wrap_width
                     .unwrap_or(usize::MAX)
