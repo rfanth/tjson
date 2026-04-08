@@ -159,7 +159,9 @@ fn parse_options(options: JsValue) -> Result<crate::TjsonOptions, JsValue> {
     if options.is_null() || options.is_undefined() {
         Ok(crate::TjsonOptions::default())
     } else {
-        let config: crate::TjsonConfig = serde_wasm_bindgen::from_value(options)
+        let json: serde_json::Value = serde_wasm_bindgen::from_value(options)
+            .map_err(|e| err(format!("invalid option value (see StringifyOptions for valid values): {e}")))?;
+        let config: crate::TjsonConfig = serde_json::from_value(json)
             .map_err(|e| err(format!("invalid option value (see StringifyOptions for valid values): {e}")))?;
         Ok(config.into())
     }
