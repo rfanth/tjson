@@ -23,10 +23,10 @@ TJSON represents the same data model as JSON but renders it in a way that feels 
 
 **TJSON output**
 ```
-  name: Alice  age:30  active:true
+  name: Alice    age:30    active:true
   bio: ``
-  | She is a developer.
-  | She loves Rust.
+| She is a developer.
+| She loves Rust.
    ``
   scores:  90, 85, 92
   tags:   rust,  wasm,  json,  serialization
@@ -81,7 +81,7 @@ All four functions throw an `Error` on invalid input.
 
 Options use **camelCase** in JavaScript. The underlying library's Rust API uses snake_case and idiomatic Rust, but exposes the same options.
 
-Key options at a glance:
+**Key options:**
 
 | Option | Default | Description |
 |---|---|---|
@@ -89,20 +89,24 @@ Key options at a glance:
 | `wrapWidth` | `80` | Column wrap limit; `0` for unlimited |
 | `tables` | `true` | Render arrays-of-objects as pipe tables |
 | `multilineStrings` | `true` | Use `\`\`` blocks for strings containing newlines |
-| `bareStrings` | `"prefer"` | Use bare (unquoted) string values when spec permits |
-| `bareKeys` | `"prefer"` | Use bare (unquoted) object keys when spec permits |
 | `inlineObjects` | `true` | Pack multiple key-value pairs onto one line |
 | `inlineArrays` | `true` | Pack multiple array items onto one line |
 | `stringArrayStyle` | `"preferComma"` | How to pack all-string arrays |
-| `indentGlyphStyle` | `"auto"` | When to emit `/<` `/>` glyphs for deeply nested content |
-| `forceMarkers` | `false` | Always emit `=` / `:` markers, even when inferrable |
-| `multilineStyle` | `"bold"` | Multiline block style (`"bold"`, `"floating"`, etc.) |
-| `multilineMinLines` | `1` | Min newlines in a string before using a block |
-| `multilineMaxLines` | `10` | Max lines in a block before falling back |
-| `tableFold` | `false` | Fold long table rows across continuation lines |
-| `tableUnindentStyle` | `"auto"` | How to reposition wide tables using indent glyphs |
+
+**Advanced options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `bareStrings` | `"prefer"` | Use bare (unquoted) string values when spec permits |
+| `bareKeys` | `"prefer"` | Use bare (unquoted) object keys when spec permits |
+| `forceMarkers` | `false` | Force explicit `[` / `{` indent markers on single-step indents |
+| `multilineStyle` | `"bold"` | Multiline block style (`"bold"`, `"floating"`, `"light"`, etc.) |
+| `multilineMinLines` | `1` | Min newlines in a string before using a multiline block |
+| `indentGlyphStyle` | `"auto"` | When to wrap deeply nested content in `/<` `/>` glyphs |
+| `indentGlyphMarkerStyle` | `"compact"` | Where to place the opening `/<` glyph |
+| `tableUnindentStyle` | `"auto"` | How to reposition wide tables toward the left margin |
 | `tableMinRows` | `3` | Min rows required to render a table |
-| `tableMinCols` | `3` | Min columns required to render a table |
+| `tableMinColumns` | `3` | Min columns required to render a table |
 | `tableMinSimilarity` | `0.8` | Min fraction of rows sharing a column |
 | `tableColumnMaxWidth` | `40` | Bail on table if any column exceeds this width |
 | `fold` | — | Set all four fold styles at once; more specific options override |
@@ -110,9 +114,16 @@ Key options at a glance:
 | `stringBareFoldStyle` | `"auto"` | How to fold long bare strings |
 | `stringQuotedFoldStyle` | `"auto"` | How to fold long quoted strings |
 | `stringMultilineFoldStyle` | `"none"` | How to fold multiline block continuation lines |
-| `indentGlyphMarkerStyle` | `"compact"` | Where to place the opening `/<` glyph |
 
-Full option reference with documentation is in the TypeScript types bundled with the package.
+**Experimental options** (may change or be removed in a future version):
+
+| Option | Default | Description |
+|---|---|---|
+| `kvPackMultiple` | `2` | Spacing multiplier between packed key-value pairs (1–4; spaces = value × 2) |
+| `multilineMaxLines` | `10` | Max lines in a `"floating"` block before falling back to `"bold"` |
+| `tableFold` | `false` | Fold long table rows across continuation lines |
+
+Full option reference with inline documentation is in the TypeScript types bundled with the package.
 
 ## Resources
 

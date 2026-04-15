@@ -13,6 +13,8 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 /// The minimum accepted wrap width. Values below this are clamped by [`TjsonOptions::wrap_width`]
 /// and rejected by [`TjsonOptions::wrap_width_checked`].
 pub const MIN_WRAP_WIDTH: usize = 20;
+/// The default wrap width used by [`TjsonOptions::default`].
+pub const DEFAULT_WRAP_WIDTH: usize = 80;
 const MIN_FOLD_CONTINUATION: usize = 10;
 
 /// Controls when `/<` / `/>` indent-offset glyphs are emitted to push content to visual indent 0.
@@ -164,9 +166,11 @@ pub struct TjsonOptions {
     indent_glyph_style: IndentGlyphStyle,
     indent_glyph_marker_style: IndentGlyphMarkerStyle,
     table_min_rows: usize,
-    table_min_cols: usize,
+    table_min_columns: usize,
     table_min_similarity: f32,
     table_column_max_width: Option<usize>,
+    /// Undocumented. Use at your own risk — may be discontinued at any time.
+    kv_pack_multiple: usize,
     multiline_strings: bool,
     multiline_style: MultilineStyle,
     multiline_min_lines: usize,
@@ -424,8 +428,8 @@ impl TjsonOptions {
     }
 
     /// Minimum number of columns a table must have to be rendered as a pipe table. Default is 3.
-    pub fn table_min_cols(mut self, table_min_cols: usize) -> Self {
-        self.table_min_cols = table_min_cols;
+    pub fn table_min_columns(mut self, table_min_columns: usize) -> Self {
+        self.table_min_columns = table_min_columns;
         self
     }
 
@@ -444,6 +448,23 @@ impl TjsonOptions {
     /// `None` means no limit. Default is `Some(40)`.
     pub fn table_column_max_width(mut self, table_column_max_width: Option<usize>) -> Self {
         self.table_column_max_width = table_column_max_width;
+        self
+    }
+
+    /// Undocumented. Use at your own risk — may be discontinued at any time.
+    /// Valid values are 1–4; returns an error otherwise.
+    pub fn kv_pack_multiple(mut self, v: usize) -> std::result::Result<Self, String> {
+        if !(1..=4).contains(&v) {
+            return Err(format!("kv_pack_multiple must be 1–4, got {v}"));
+        }
+        self.kv_pack_multiple = v;
+        Ok(self)
+    }
+
+    /// Undocumented. Use at your own risk — may be discontinued at any time.
+    /// Sets `kv_pack_multiple` with clamping to 1–4 instead of erroring.
+    pub fn kv_pack_multiple_clamped(mut self, v: usize) -> Self {
+        self.kv_pack_multiple = v.clamp(1, 4);
         self
     }
 
@@ -492,19 +513,18 @@ impl TjsonOptions {
         self
     }
 
-    /// Controls table horizontal repositioning via `/< />` indent-offset glyphs. Default is `Auto`.
-    ///
-    /// Note: [`indent_glyph_style`](Self::indent_glyph_style) must not be `None` for glyphs
-    /// to appear — `table_unindent_style` decides *when* to unindent; `indent_glyph_style`
-    /// decides whether glyphs are permitted at all.
+    /// Controls whether wide tables are repositioned toward the left margin using `/< />`
+    /// glyphs. Default is `Auto`. This is independent of [`indent_glyph_style`](Self::indent_glyph_style).
     pub fn table_unindent_style(mut self, style: TableUnindentStyle) -> Self {
         self.table_unindent_style = style;
         self
     }
 
-    /// Controls when `/<` / `/>` indent-offset glyphs are emitted to push deeply-indented
-    /// content back toward the left margin, improving readability at high nesting depths.
-    /// Default is `Auto`.
+    /// Controls whether deeply-nested objects and arrays are wrapped in `/< />` glyphs
+    /// and repositioned toward the left margin to reduce visual depth. Default is `Auto`.
+    ///
+    /// This applies to objects and arrays only — it is independent of table repositioning,
+    /// which is controlled by [`table_unindent_style`](Self::table_unindent_style).
     pub fn indent_glyph_style(mut self, style: IndentGlyphStyle) -> Self {
         self.indent_glyph_style = style;
         self
@@ -557,11 +577,12 @@ impl Default for TjsonOptions {
             inline_arrays: true,
             string_array_style: StringArrayStyle::PreferComma,
             tables: true,
-            wrap_width: Some(80),
+            wrap_width: Some(DEFAULT_WRAP_WIDTH),
             table_min_rows: 3,
-            table_min_cols: 3,
+            table_min_columns: 3,
             table_min_similarity: 0.8,
             table_column_max_width: Some(40),
+            kv_pack_multiple: 2,
             number_fold_style: FoldStyle::Auto,
             string_bare_fold_style: FoldStyle::Auto,
             string_quoted_fold_style: FoldStyle::Auto,
@@ -584,7 +605,7 @@ mod camel_de {
     use serde::{Deserialize, Deserializer};
 
     fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-        Ok(Option::<String>::deserialize(d)?)
+        Option::<String>::deserialize(d)
     }
 
     macro_rules! camel_option_de {
@@ -675,7 +696,7 @@ pub struct TjsonConfig {
     #[serde(deserialize_with = "camel_de::table_unindent_style")]
     table_unindent_style: Option<TableUnindentStyle>,
     table_min_rows: Option<usize>,
-    table_min_cols: Option<usize>,
+    table_min_columns: Option<usize>,
     table_min_similarity: Option<f32>,
     table_column_max_width: Option<usize>,
     #[serde(deserialize_with = "camel_de::string_array_style")]
@@ -694,6 +715,7 @@ pub struct TjsonConfig {
     indent_glyph_style: Option<IndentGlyphStyle>,
     #[serde(deserialize_with = "camel_de::indent_glyph_marker_style")]
     indent_glyph_marker_style: Option<IndentGlyphMarkerStyle>,
+    kv_pack_multiple: Option<usize>,
 }
 
 impl From<TjsonConfig> for TjsonOptions {
@@ -713,7 +735,7 @@ impl From<TjsonConfig> for TjsonOptions {
         if let Some(v) = c.table_fold        { opts = opts.table_fold(v); }
         if let Some(v) = c.table_unindent_style { opts = opts.table_unindent_style(v); }
         if let Some(v) = c.table_min_rows     { opts = opts.table_min_rows(v); }
-        if let Some(v) = c.table_min_cols     { opts = opts.table_min_cols(v); }
+        if let Some(v) = c.table_min_columns     { opts = opts.table_min_columns(v); }
         if let Some(v) = c.table_min_similarity { opts = opts.table_min_similarity(v); }
         if let Some(v) = c.table_column_max_width { opts = opts.table_column_max_width(if v == 0 { None } else { Some(v) }); }
         if let Some(v) = c.string_array_style { opts = opts.string_array_style(v); }
@@ -724,6 +746,7 @@ impl From<TjsonConfig> for TjsonOptions {
         if let Some(v) = c.string_multiline_fold_style { opts = opts.string_multiline_fold_style(v); }
         if let Some(v) = c.indent_glyph_style { opts = opts.indent_glyph_style(v); }
         if let Some(v) = c.indent_glyph_marker_style { opts = opts.indent_glyph_marker_style(v); }
+        if let Some(v) = c.kv_pack_multiple { opts = opts.kv_pack_multiple_clamped(v); }
         opts
     }
 }
@@ -1184,12 +1207,25 @@ impl Parser {
             if !row.starts_with('|') {
                 return Err(self.error_current("table arrays may only contain table rows"));
             }
-            // Collect fold continuation lines: `\ ` marker at pair_indent (elem_indent - 2),
+            // Collect fold continuation lines: `/ ` marker at pair_indent (elem_indent - 2),
             // two characters to the left of the opening `|` per spec.
+            // Blank lines and `//` comments between a partial row and its continuation are
+            // skipped. A parser would also be within its rights to reject them.
             let pair_indent = elem_indent.saturating_sub(2);
             let mut row_owned = row.to_owned();
             loop {
-                let Some(next_line) = self.lines.get(self.line + 1) else {
+                // Peek past ignorable lines to find the next meaningful line.
+                let mut offset = 1usize;
+                loop {
+                    let Some(peek) = self.lines.get(self.line + offset) else { break; };
+                    let trimmed = peek.trim_start_matches(' ');
+                    if trimmed.starts_with("//") {
+                        offset += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let Some(next_line) = self.lines.get(self.line + offset) else {
                     break;
                 };
                 let next_indent = count_leading_spaces(next_line);
@@ -1197,10 +1233,14 @@ impl Parser {
                     break;
                 }
                 let next_content = &next_line[pair_indent..];
-                if !next_content.starts_with("\\ ") {
+                if !next_content.starts_with("/ ") {
                     break;
                 }
-                self.line += 1;
+                // Consume ignorable lines then the continuation line.
+                for i in 1..offset {
+                    self.ensure_line_has_no_tabs(self.line + i)?;
+                }
+                self.line += offset;
                 self.ensure_line_has_no_tabs(self.line)?;
                 row_owned.push_str(&next_content[2..]);
             }
@@ -1390,9 +1430,12 @@ impl Parser {
             }
             if !rest.starts_with("  ") {
                 return Err(self
-                    .error_current("expected two spaces between object entries on the same line"));
+                    .error_current("expected at least two spaces between object entries on the same line"));
             }
-            rest = rest[2..].to_owned();
+            // Consume all leading spaces. Generators must produce even counts only;
+            // a parser would be within its rights to reject an odd number of spaces here.
+            let space_count = rest.bytes().take_while(|&b| b == b' ').count();
+            rest = rest[space_count..].to_owned();
             if rest.is_empty() {
                 return Err(self.error_current("object lines cannot end with a separator"));
             }
@@ -1601,20 +1644,30 @@ impl Parser {
         if rest.is_empty() {
             return Err(self.error_current("a nesting marker must be followed by content"));
         }
+        let deepest_parent_indent = line_indent + 2 * markers.len().saturating_sub(1);
+
+        // Special case: the last `[` marker followed immediately by a table header means
+        // the last `[` IS the table array itself, not a wrapper around it.
+        if *markers.last().unwrap() == ContainerKind::Array {
+            let rest_trimmed = rest.trim_start_matches(' ');
+            if rest_trimmed.starts_with('|') {
+                let leading_spaces = rest.len() - rest_trimmed.len();
+                let table_elem_indent = deepest_parent_indent + 2 + leading_spaces;
+                let mut value = self.parse_table_array(table_elem_indent)?;
+                for level in (0..markers.len().saturating_sub(1)).rev() {
+                    let parent_indent = line_indent + 2 * level;
+                    let mut wrapped = vec![value];
+                    self.parse_array_tail(parent_indent, &mut wrapped)?;
+                    value = TjsonValue::Array(wrapped);
+                }
+                return Ok(value);
+            }
+        }
+
         let mut value = match *markers.last().unwrap() {
             ContainerKind::Array => {
-                let deepest_parent_indent = line_indent + 2 * markers.len().saturating_sub(1);
                 let mut elements = Vec::new();
-                let rest_trimmed = rest.trim_start_matches(' ');
-                if rest_trimmed.starts_with('|') {
-                    // Table header is embedded in this marker chain line.
-                    // The '|' sits at deepest_parent_indent + 2 + any padding spaces.
-                    let leading_spaces = rest.len() - rest_trimmed.len();
-                    let table_elem_indent = deepest_parent_indent + 2 + leading_spaces;
-                    let table = self.parse_table_array(table_elem_indent)?;
-                    elements.push(table);
-                    self.parse_array_tail(deepest_parent_indent, &mut elements)?;
-                } else if is_minimal_json_candidate(rest) {
+                if is_minimal_json_candidate(rest) {
                     elements.push(self.parse_minimal_json_line(rest)?);
                     self.line += 1;
                     self.parse_array_tail(deepest_parent_indent, &mut elements)?;
@@ -1650,7 +1703,7 @@ impl Parser {
         // Bare key on this line
         if let Some(end) = parse_bare_key_prefix(content) {
             if content.get(end..).is_some_and(|rest| rest.starts_with(':')) {
-                return Ok((content[..end].to_owned(), content[end + 1..].to_owned()));
+                return Ok((content[..end].to_owned(), content[end + ':'.len_utf8()..].to_owned()));
             }
             // Bare key fills the whole line — look for fold continuations
             if end == content.len() {
@@ -1673,7 +1726,7 @@ impl Parser {
                     if let Some(colon_pos) = cont.find(':') {
                         key_acc.push_str(&cont[..colon_pos]);
                         self.line = next - 1; // point to last fold line; caller will +1
-                        return Ok((key_acc, cont[colon_pos + 1..].to_owned()));
+                        return Ok((key_acc, cont[colon_pos + ':'.len_utf8()..].to_owned()));
                     }
                     key_acc.push_str(cont);
                 }
@@ -1682,7 +1735,7 @@ impl Parser {
         // JSON string key on this line
         if let Some((value, end)) = parse_json_string_prefix(content)
             && content.get(end..).is_some_and(|rest| rest.starts_with(':')) {
-                return Ok((value, content[end + 1..].to_owned()));
+                return Ok((value, content[end + ':'.len_utf8()..].to_owned()));
             }
         // JSON string key that doesn't close on this line — look for fold continuations
         if content.starts_with('"') && parse_json_string_prefix(content).is_none() {
@@ -1705,7 +1758,7 @@ impl Parser {
                 if let Some((value, end)) = parse_json_string_prefix(&json_acc)
                     && json_acc.get(end..).is_some_and(|rest| rest.starts_with(':')) {
                         self.line = next - 1; // point to last fold line; caller will +1
-                        return Ok((value, json_acc[end + 1..].to_owned()));
+                        return Ok((value, json_acc[end + ':'.len_utf8()..].to_owned()));
                     }
             }
         }
@@ -1744,7 +1797,7 @@ impl Parser {
                 if end == 0 {
                     return Err(self.error_current("bare strings cannot start with a forbidden character"));
                 }
-                let value = &content[1..end];
+                let value = &content[' '.len_utf8()..end]; // leading space before bare string value
                 if !is_allowed_bare_string(value) {
                     return Err(self.error_current("invalid bare string"));
                 }
@@ -2226,7 +2279,7 @@ impl Renderer {
                     let candidate = if packed_line.is_empty() {
                         format!("{}{}", spaces(pair_indent), token)
                     } else {
-                        format!("{packed_line}  {token}")
+                        format!("{packed_line}{}{token}", spaces(options.kv_pack_multiple * 2))
                     };
                     if fits_wrap(options, &candidate) {
                         packed_line = candidate;
@@ -2347,12 +2400,6 @@ impl Renderer {
     ) -> Result<Vec<String>> {
         match value {
             TjsonValue::Array(values) if !values.is_empty() => {
-                if effective_force_markers(options) {
-                    let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                    lines.extend(Self::render_explicit_array(values, pair_indent, options)?);
-                    return Ok(lines);
-                }
-
                 if effective_tables(options)
                     && let Some(table_lines) = Self::render_table(values, pair_indent, options)? {
                         if let Some(target_indent) = table_unindent_target(pair_indent, &table_lines, options) {
@@ -2363,12 +2410,28 @@ impl Renderer {
                             };
                             let key_line = format!("{}{}", spaces(pair_indent), key_text);
                             let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
-                            lines.extend(offset_lines);
+                            if effective_force_markers(options) {
+                                let elem_indent = target_indent + 2;
+                                let first = offset_lines.first().ok_or_else(|| Error::Render("empty table".to_owned()))?;
+                                let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".to_owned()))?;
+                                lines.push(format!("{}[ {}", spaces(target_indent), stripped));
+                                lines.extend(offset_lines.into_iter().skip(1));
+                            } else {
+                                lines.extend(offset_lines);
+                            }
                             lines.push(format!("{} />", spaces(pair_indent)));
                             return Ok(lines);
                         }
                         let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                        lines.extend(table_lines);
+                        if effective_force_markers(options) {
+                            let elem_indent = pair_indent + 2;
+                            let first = table_lines.first().ok_or_else(|| Error::Render("empty table".to_owned()))?;
+                            let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".to_owned()))?;
+                            lines.push(format!("{}[ {}", spaces(pair_indent), stripped));
+                            lines.extend(table_lines.into_iter().skip(1));
+                        } else {
+                            lines.extend(table_lines);
+                        }
                         return Ok(lines);
                     }
 
@@ -2402,10 +2465,10 @@ impl Renderer {
                 }
 
                 let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                if values.first().is_some_and(needs_explicit_array_marker) {
+                if values.first().is_some_and(needs_explicit_array_marker) || effective_force_markers(options) {
                     lines.extend(Self::render_explicit_array(
                         values,
-                        pair_indent + 2,
+                        pair_indent,
                         options,
                     )?);
                 } else {
@@ -2418,12 +2481,6 @@ impl Renderer {
                 Ok(lines)
             }
             TjsonValue::Object(entries) if !entries.is_empty() => {
-                if effective_force_markers(options) {
-                    let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                    lines.extend(Self::render_explicit_object(entries, pair_indent, options)?);
-                    return Ok(lines);
-                }
-
                 if should_use_indent_glyph(value, pair_indent, options) {
                     let key_line = format!("{}{}", spaces(pair_indent), key_text);
                     let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
@@ -2433,7 +2490,11 @@ impl Renderer {
                 }
 
                 let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                lines.extend(Self::render_implicit_object(entries, pair_indent, options)?);
+                if effective_force_markers(options) {
+                    lines.extend(Self::render_explicit_object(entries, pair_indent, options)?);
+                } else {
+                    lines.extend(Self::render_implicit_object(entries, pair_indent, options)?);
+                }
                 Ok(lines)
             }
             _ => {
@@ -2738,7 +2799,7 @@ impl Renderer {
                     MultilineStyle::Floating => {
                         // Fall back to `` when content is unsafe OR would exceed width/line-count
                         if forced_bold || overflows_at_natural || too_many_lines {
-                            bold(2)
+                            bold(0)
                         } else {
                             Self::render_multiline_single_backtick(
                                 &parts, indent, suffix, fold_style, wrap,
@@ -2750,21 +2811,21 @@ impl Renderer {
                         // backtick-starting). Width overflow and line count do NOT trigger fallback —
                         // Light prefers a long ` over a heavy ``.
                         if forced_bold {
-                            bold(2)
+                            bold(0)
                         } else {
                             Self::render_multiline_single_backtick(
                                 &parts, indent, suffix, fold_style, wrap,
                             )
                         }
                     }
-                    MultilineStyle::Bold => bold(2),
+                    MultilineStyle::Bold => bold(0),
                     MultilineStyle::BoldFloating => {
-                        let body = if forced_bold || overflows_at_natural { 2 } else { (indent + 2).max(2) };
+                        let body = if forced_bold || overflows_at_natural { 0 } else { indent };
                         bold(body)
                     }
                     MultilineStyle::Transparent => {
                         if forced_bold {
-                            bold(2)
+                            bold(0)
                         } else {
                             Self::render_multiline_triple_backtick(&parts, indent, suffix)
                         }
@@ -3281,7 +3342,7 @@ impl Renderer {
             }
         }
 
-        if columns.len() < options.table_min_cols {
+        if columns.len() < options.table_min_columns {
             return Ok(None);
         }
 
@@ -3323,10 +3384,9 @@ impl Renderer {
             }
         }
         // Bail out if any column's content exceeds table_column_max_width.
-        if let Some(col_max) = options.table_column_max_width {
-            if widths.iter().any(|w| *w > col_max) {
+        if let Some(col_max) = options.table_column_max_width
+            && widths.iter().any(|w| *w > col_max) {
                 return Ok(None);
-            }
         }
         for width in &mut widths {
             *width += 2;
@@ -3614,10 +3674,6 @@ fn effective_tables(options: &TjsonOptions) -> bool {
 //
 // `natural_lines` are the table lines as rendered at pair_indent (spaces(pair_indent+2) prefix).
 fn table_unindent_target(pair_indent: usize, natural_lines: &[String], options: &TjsonOptions) -> Option<usize> {
-    // indent_glyph_style: None means glyphs are never allowed regardless of table_unindent_style.
-    if matches!(options.indent_glyph_style, IndentGlyphStyle::None) {
-        return None;
-    }
     let n = pair_indent;
     let max_natural = natural_lines.iter().map(|l| l.len()).max().unwrap_or(0);
     // data_width: widest line with the natural indent stripped
@@ -3797,7 +3853,7 @@ fn parse_json_string_prefix(content: &str) -> Option<(String, usize)> {
         match ch {
             '\\' => escaped = true,
             '"' => {
-                end = Some(index + 1);
+                end = Some(index + '"'.len_utf8());
                 break;
             }
             '\n' | '\r' => return None,
@@ -4805,7 +4861,7 @@ fn split_table_row_for_fold(row: &str, max_len: usize) -> Option<(String, String
         pos -= 1;
         if bytes[pos] == b' ' && pos > 0 && bytes[pos - 1] != b'|' && bytes[pos - 1] != b' ' {
             let before = row[..pos].to_owned();
-            let after = row[pos + 1..].to_owned(); // skip the space itself
+            let after = row[pos + ' '.len_utf8()..].to_owned(); // skip the space itself
             return Some((before, after));
         }
     }
@@ -5009,7 +5065,7 @@ mod tests {
             "  |name     |score |\n",
             "  | Alice   |100   |\n",
             "  | Bob with a very long\n",
-            "\\ name    |200   |\n",
+            "/ name    |200   |\n",
             "  | Carol   |300   |",
         );
         let expected = json(
@@ -5028,7 +5084,7 @@ mod tests {
             "  |name     |value |\n",
             "  | short   |1     |\n",
             "  | this is really long\n",
-            "\\ continuation|2     |",
+            "/ continuation|2     |",
         );
         let expected = json(
             "[{\"name\":\"short\",\"value\":1},{\"name\":\"this is really longcontinuation\",\"value\":2}]"
@@ -5199,7 +5255,7 @@ mod tests {
             render_string(&tjson_value("{\"note\":\"first\\nsecond\\n  indented\"}")).unwrap();
         assert_eq!(
             rendered,
-            "  note: ``\n  | first\n  | second\n  |   indented\n   ``"
+            "  note: ``\n| first\n| second\n|   indented\n   ``"
         );
     }
 
@@ -5212,7 +5268,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rendered,
-            "  note: ``\\r\\n\n  | first\n  | second\n  |   indented\n   ``\\r\\n"
+            "  note: ``\\r\\n\n| first\n| second\n|   indented\n   ``\\r\\n"
         );
     }
 
@@ -5275,7 +5331,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(rendered, " ``\n  | line one\n  | line two\n ``");
+        assert_eq!(rendered, " ``\n| line one\n| line two\n ``");
     }
 
     #[test]
@@ -5596,6 +5652,18 @@ mod tests {
     }
 
     #[test]
+    fn packs_explicit_nested_arrays_and_objects_kv1() {
+        let value = tjson_value(
+            "{\"nested\":[[1,2],[3,4]],\"rows\":[{\"a\":1,\"b\":2},{\"c\":3,\"d\":4}]}",
+        );
+        let rendered = render_string_with_options(&value, TjsonOptions::default().kv_pack_multiple(1).unwrap()).unwrap();
+        assert_eq!(
+            rendered,
+            "  nested:\n  [ [ 1, 2\n    [ 3, 4\n  rows:\n  [ { a:1  b:2\n    { c:3  d:4"
+        );
+    }
+
+    #[test]
     fn packs_explicit_nested_arrays_and_objects() {
         let value = tjson_value(
             "{\"nested\":[[1,2],[3,4]],\"rows\":[{\"a\":1,\"b\":2},{\"c\":3,\"d\":4}]}",
@@ -5603,7 +5671,7 @@ mod tests {
         let rendered = render_string(&value).unwrap();
         assert_eq!(
             rendered,
-            "  nested:\n    [ [ 1, 2\n      [ 3, 4\n  rows:\n    [ { a:1  b:2\n      { c:3  d:4"
+            "  nested:\n  [ [ 1, 2\n    [ 3, 4\n  rows:\n  [ { a:1    b:2\n    { c:3    d:4"
         );
     }
 
@@ -5652,6 +5720,21 @@ mod tests {
     }
 
     #[test]
+    fn bare_keys_none_quotes_keys_in_objects_and_tables_kv1() {
+        let object_value = tjson_value("{\"alpha\":1,\"beta key\":2}");
+        let rendered_object = render_string_with_options(
+            &object_value,
+            TjsonOptions {
+                bare_keys: BareStyle::None,
+                kv_pack_multiple: 1,
+                ..TjsonOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rendered_object, "  \"alpha\":1  \"beta key\":2");
+    }
+
+    #[test]
     fn bare_keys_none_quotes_keys_in_objects_and_tables() {
         let object_value = tjson_value("{\"alpha\":1,\"beta key\":2}");
         let rendered_object = render_string_with_options(
@@ -5662,7 +5745,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(rendered_object, "  \"alpha\":1  \"beta key\":2");
+        assert_eq!(rendered_object, "  \"alpha\":1    \"beta key\":2");
 
         let table_value = tjson_value(
             "{\"rows\":[{\"alpha\":1,\"beta\":2},{\"alpha\":3,\"beta\":4},{\"alpha\":5,\"beta\":6}]}",
@@ -5671,7 +5754,7 @@ mod tests {
             &table_value,
             TjsonOptions {
                 bare_keys: BareStyle::None,
-                table_min_cols: 2,
+                table_min_columns: 2,
                 ..TjsonOptions::default()
             },
         )
@@ -5688,6 +5771,27 @@ mod tests {
     }
 
     #[test]
+    fn force_markers_applies_to_root_and_key_nested_single_levels_kv1() {
+        let value =
+            tjson_value("{\"a\":5,\"6\":\"fred\",\"xy\":[],\"de\":{},\"e\":[1],\"o\":{\"k\":2}}");
+        let rendered = render_string_with_options(
+            &value,
+            TjsonOptions {
+                force_markers: true,
+                kv_pack_multiple: 1,
+                ..TjsonOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "{ a:5  6: fred  xy:[]  de:{}\n  e:  1\n  o:\n  { k:2"
+        );
+        let reparsed = parse_str(&rendered).unwrap().to_json().unwrap();
+        assert_eq!(reparsed, value.to_json().unwrap());
+    }
+
+    #[test]
     fn force_markers_applies_to_root_and_key_nested_single_levels() {
         let value =
             tjson_value("{\"a\":5,\"6\":\"fred\",\"xy\":[],\"de\":{},\"e\":[1],\"o\":{\"k\":2}}");
@@ -5701,7 +5805,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rendered,
-            "{ a:5  6: fred  xy:[]  de:{}\n  e:\n  [ 1\n  o:\n  { k:2"
+            "{ a:5    6: fred    xy:[]    de:{}\n  e:  1\n  o:\n  { k:2"
         );
         let reparsed = parse_str(&rendered).unwrap().to_json().unwrap();
         assert_eq!(reparsed, value.to_json().unwrap());
@@ -5730,7 +5834,7 @@ mod tests {
             &value,
             TjsonOptions {
                 force_markers: true,
-                table_min_cols: 2,
+                table_min_columns: 2,
                 ..TjsonOptions::default()
             },
         )
@@ -6517,8 +6621,8 @@ mod tests {
     }
 
     #[test]
-    fn table_unindent_style_left_blocked_by_indent_glyph_none() {
-        // indent_glyph_style=None overrides even Left — no glyphs ever.
+    fn table_unindent_style_left_independent_of_indent_glyph_none() {
+        // indent_glyph_style=None disables object glyphs but does not block table unindent.
         let rendered = render_string_with_options(
             &deep3_table_value(),
             TjsonOptions::default()
@@ -6526,7 +6630,7 @@ mod tests {
                 .table_unindent_style(TableUnindentStyle::Left)
                 .indent_glyph_style(IndentGlyphStyle::None),
         ).unwrap();
-        assert!(!rendered.contains("/<"), "indent_glyph_style=None must block Left: {rendered}");
+        assert!(rendered.contains("/<"), "table_unindent_style=Left must still fire with indent_glyph_style=None: {rendered}");
     }
 
     #[test]

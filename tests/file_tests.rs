@@ -19,6 +19,7 @@ fn parse_valid() {
     let base = tests_dir().join("parse/valid");
     let expected_dir = base.join("expected");
     let mut failures: Vec<String> = Vec::new();
+    let mut total = 0usize;
 
     let entries: Vec<_> = std::fs::read_dir(&base)
         .expect("cannot read parse/valid dir")
@@ -36,6 +37,7 @@ fn parse_valid() {
     }
 
     for entry in entries {
+        total += 1;
         let tjson_path = entry.path();
         let stem = tjson_path.file_stem().unwrap().to_string_lossy().into_owned();
         let json_path = expected_dir.join(format!("{}.json", stem));
@@ -91,7 +93,7 @@ fn parse_valid() {
     }
 
     if !failures.is_empty() {
-        panic!("parse_valid failures:\n{}", failures.join("\n"));
+        panic!("\n\nFAILED: {}/{} parse_valid fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
     }
 }
 
@@ -99,6 +101,7 @@ fn parse_valid() {
 fn parse_invalid() {
     let base = tests_dir().join("parse/invalid");
     let mut failures: Vec<String> = Vec::new();
+    let mut total = 0usize;
 
     let entries: Vec<_> = std::fs::read_dir(&base)
         .expect("cannot read parse/invalid dir")
@@ -116,6 +119,7 @@ fn parse_invalid() {
     }
 
     for entry in entries {
+        total += 1;
         let tjson_path = entry.path();
         let stem = tjson_path.file_stem().unwrap().to_string_lossy().into_owned();
 
@@ -141,7 +145,7 @@ fn parse_invalid() {
     }
 
     if !failures.is_empty() {
-        panic!("parse_invalid failures:\n{}", failures.join("\n"));
+        panic!("\n\nFAILED: {}/{} parse_invalid fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
     }
 }
 
@@ -149,6 +153,7 @@ fn parse_invalid() {
 fn roundtrip() {
     let base = tests_dir().join("roundtrip");
     let mut failures: Vec<String> = Vec::new();
+    let mut total = 0usize;
 
     let entries: Vec<_> = std::fs::read_dir(&base)
         .expect("cannot read roundtrip dir")
@@ -168,6 +173,7 @@ fn roundtrip() {
     }
 
     for entry in entries {
+        total += 1;
         let tjson_path = entry.path();
         let stem = tjson_path.file_stem().unwrap().to_string_lossy().into_owned();
 
@@ -233,7 +239,7 @@ fn roundtrip() {
     }
 
     if !failures.is_empty() {
-        panic!("roundtrip failures:\n{}", failures.join("\n"));
+        panic!("\n\nFAILED: {}/{} roundtrip fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
     }
 }
 
@@ -241,6 +247,7 @@ fn roundtrip() {
 fn render() {
     let render_base = tests_dir().join("render");
     let mut failures: Vec<String> = Vec::new();
+    let mut total = 0usize;
 
     let subdirs: Vec<_> = std::fs::read_dir(&render_base)
         .expect("cannot read render dir")
@@ -285,6 +292,7 @@ fn render() {
             .collect();
 
         for json_entry in json_entries {
+            total += 1;
             let json_path = json_entry.path();
             let stem = json_path.file_stem().unwrap().to_string_lossy().into_owned();
             let tjson_path = subdir.join(format!("{}.tjson", stem));
@@ -339,6 +347,6 @@ fn render() {
     }
 
     if !failures.is_empty() {
-        panic!("render failures:\n{}", failures.join("\n"));
+        panic!("\n\nFAILED: {}/{} render fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
     }
 }
