@@ -506,14 +506,14 @@ impl TjsonOptions {
         self
     }
 
-    /// When true, emit `\ ` fold continuations for wide table cells. Off by default —
+    /// @experimental When true, emit `/ ` fold continuations for wide table lines. Off by default;
     /// the spec notes that table folds are almost always a bad idea.
     pub fn table_fold(mut self, table_fold: bool) -> Self {
         self.table_fold = table_fold;
         self
     }
 
-    /// Controls whether wide tables are repositioned toward the left margin using `/< />`
+    /// Controls whether wide tables are repositioned toward the left margin using ` /<' and ` />` indent
     /// glyphs. Default is `Auto`. This is independent of [`indent_glyph_style`](Self::indent_glyph_style).
     pub fn table_unindent_style(mut self, style: TableUnindentStyle) -> Self {
         self.table_unindent_style = style;
@@ -751,6 +751,13 @@ impl From<TjsonConfig> for TjsonOptions {
     }
 }
 
+/// A single key-value entry in a TJSON object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub key: String,
+    pub value: TjsonValue,
+}
+
 /// A parsed TJSON value. Mirrors the JSON type system with the same six variants.
 ///
 /// Numbers are stored as strings to preserve exact representation. Objects are stored as
@@ -769,7 +776,7 @@ pub enum TjsonValue {
     /// JSON array.
     Array(Vec<TjsonValue>),
     /// JSON object, as an ordered list of key-value pairs.
-    Object(Vec<(String, TjsonValue)>),
+    Object(Vec<Entry>),
 }
 
 impl From<JsonValue> for TjsonValue {
@@ -784,7 +791,7 @@ impl From<JsonValue> for TjsonValue {
             }
             JsonValue::Object(map) => Self::Object(
                 map.into_iter()
-                    .map(|(key, value)| (key, Self::from(value)))
+                    .map(|(key, value)| Entry { key, value: Self::from(value) })
                     .collect(),
             ),
         }
@@ -835,7 +842,7 @@ impl TjsonValue {
             ),
             Self::Object(entries) => {
                 let mut map = JsonMap::new();
-                for (key, value) in entries {
+                for Entry { key, value } in entries {
                     map.insert(key.clone(), value.to_json()?);
                 }
                 JsonValue::Object(map)
@@ -861,8 +868,8 @@ impl serde::Serialize for TjsonValue {
             }
             Self::Object(entries) => {
                 let mut map = serializer.serialize_map(Some(entries.len()))?;
-                for (k, v) in entries {
-                    map.serialize_entry(k, v)?;
+                for Entry { key, value } in entries {
+                    map.serialize_entry(key, value)?;
                 }
                 map.end()
             }
@@ -1071,31 +1078,118 @@ impl MultilineLocalEol {
     }
 }
 
-struct Parser {
-    lines: Vec<String>,
-    line: usize,
-    start_indent: usize,
+struct IndentFrame {
+    /// Amount added to raw file indents to get logical (structural) indents.
+    offset: usize,
+    /// Raw file column where the matching ` />` close glyph must appear.
+    close_file_indent: usize,
 }
 
-impl Parser {
+/// Tracks the active indent offset caused by ` /<` / ` />` glyphs.
+struct IndentTracker {
+    stack: Vec<IndentFrame>,
+}
+
+impl IndentTracker {
+    fn new() -> Self {
+        Self { stack: vec![] }
+    }
+
+    /// Current offset: amount added to file indents to get logical indents.
+    fn offset(&self) -> usize {
+        self.stack.last().map_or(0, |f| f.offset)
+    }
+
+    /// Convert a raw file indent to the logical (structural) indent.
+    fn logical(&self, file_indent: usize) -> usize {
+        file_indent + self.offset()
+    }
+
+    /// Push a glyph context.  `glyph_file_indent` is the raw column of the ` /<` line.
+    fn push_glyph(&mut self, glyph_file_indent: usize) {
+        self.stack.push(IndentFrame {
+            offset: glyph_file_indent + self.offset(),
+            close_file_indent: glyph_file_indent,
+        });
+    }
+
+    /// If `line` is the close glyph ` />` for the current context, pop and return true.
+    fn try_pop_close(&mut self, line: &str) -> bool {
+        if let Some(f) = self.stack.last() {
+            if line.len() == f.close_file_indent + 3
+                && line[..f.close_file_indent].bytes().all(|b| b == b' ')
+                && &line[f.close_file_indent..] == " />"
+            {
+                self.stack.pop();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_active(&self) -> bool {
+        !self.stack.is_empty()
+    }
+}
+
+struct Parser<'a> {
+    input: &'a str,
+    line_offsets: Vec<LineSpan>,
+    line: usize,
+    start_indent: usize,
+    idt: IndentTracker,
+}
+
+struct LineSpan {
+    /// Byte offset of the first character of the line in the original input.
+    start: usize,
+    /// Byte length of the line content, excluding any line-ending bytes (`\r\n` or `\n`).
+    len: usize,
+}
+
+fn scan_lines(input: &str) -> std::result::Result<Vec<LineSpan>, ParseError> {
+    let mut offsets = Vec::new();
+    let mut pos = 0usize;
+    let mut line_num = 1usize;
+    for raw in input.split('\n') {
+        let len = if raw.ends_with('\r') { raw.len() - 1 } else { raw.len() };
+        let content = &raw[..len];
+        for (col, ch) in content.chars().enumerate() {
+            if is_forbidden_literal_tjson_char(ch) {
+                return Err(ParseError::new(
+                    line_num,
+                    col + 1,
+                    format!("forbidden character U+{:04X} must be escaped", ch as u32),
+                    None,
+                ));
+            }
+        }
+        offsets.push(LineSpan { start: pos, len });
+        pos += raw.len() + 1; // +1 for the '\n'
+        line_num += 1;
+    }
+    Ok(offsets)
+}
+
+impl<'a> Parser<'a> {
     fn parse_document(
-        input: &str,
+        input: &'a str,
         start_indent: usize,
     ) -> std::result::Result<TjsonValue, ParseError> {
-        let normalized = normalize_input(input)?;
-        let expanded = expand_indent_adjustments(&normalized);
         let mut parser = Self {
-            lines: expanded.split('\n').map(str::to_owned).collect(),
+            input,
+            line_offsets: scan_lines(input)?,
             line: 0,
             start_indent,
+            idt: IndentTracker::new(),
         };
         parser.skip_ignorable_lines()?;
-        if parser.line >= parser.lines.len() {
+        if parser.line >= parser.line_offsets.len() {
             return Err(ParseError::new(1, 1, "empty input", None));
         }
         let value = parser.parse_root_value()?;
         parser.skip_ignorable_lines()?;
-        if parser.line < parser.lines.len() {
+        if parser.line < parser.line_offsets.len() {
             let current = parser.current_line().unwrap_or("").trim_start();
             let msg = if current.starts_with("/>") {
                 "unexpected /> indent offset glyph: no previous matching /< indent offset glyph"
@@ -1115,11 +1209,22 @@ impl Parser {
             .ok_or_else(|| ParseError::new(1, 1, "empty input", None))?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let indent = count_leading_spaces(&line);
-        let content = &line[indent..];
+        let file_indent = count_leading_spaces(&line);
+        let indent = self.idt.logical(file_indent);
+        let content = &line[file_indent..];
 
         if indent == self.start_indent && starts_with_marker_chain(content) {
             return self.parse_marker_chain_line(content, indent);
+        }
+
+        // Standalone root-level start glyph: ` /<` at structural indent start_indent+2.
+        // Structural indent is always even; file_indent is structural+1 (the glyph's leading space).
+        let root_glyph_struct = (self.start_indent + 2).saturating_sub(self.idt.offset());
+        if file_indent == root_glyph_struct + 1 && content == "/<" {
+            self.idt.push_glyph(root_glyph_struct);
+            self.line += 1;
+            self.skip_ignorable_lines()?;
+            return self.parse_root_value();
         }
 
         if indent <= self.start_indent + 1 {
@@ -1128,7 +1233,8 @@ impl Parser {
         }
 
         if indent >= self.start_indent + 2 {
-            let child_content = &line[self.start_indent + 2..];
+            let child_file_pos = (self.start_indent + 2).saturating_sub(self.idt.offset());
+            let child_content = &line[child_file_pos..];
             if self.looks_like_object_start(child_content, self.start_indent + 2) {
                 return self.parse_implicit_object(self.start_indent);
             }
@@ -1161,11 +1267,12 @@ impl Parser {
             .ok_or_else(|| self.error_current("expected array contents"))?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let indent = count_leading_spaces(&line);
+        let file_indent = count_leading_spaces(&line);
+        let indent = self.idt.logical(file_indent);
         if indent < elem_indent {
             return Err(self.error_current("expected array elements indented by two spaces"));
         }
-        let content = &line[elem_indent..];
+        let content = &line[file_indent..];
         if content.starts_with('|') {
             return self.parse_table_array(elem_indent);
         }
@@ -1186,7 +1293,8 @@ impl Parser {
             .ok_or_else(|| self.error_current("expected a table header"))?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let header = &header_line[elem_indent..];
+        let header_file_indent = elem_indent.saturating_sub(self.idt.offset());
+        let header = &header_line[header_file_indent..];
         let columns = self.parse_table_header(header, elem_indent)?;
         self.line += 1;
         let mut rows = Vec::new();
@@ -1195,15 +1303,20 @@ impl Parser {
             let Some(line) = self.current_line().map(str::to_owned) else {
                 break;
             };
+            if self.idt.try_pop_close(&line) {
+                self.line += 1;
+                continue;
+            }
             self.ensure_line_has_no_tabs(self.line)?;
-            let indent = count_leading_spaces(&line);
+            let file_indent = count_leading_spaces(&line);
+            let indent = self.idt.logical(file_indent);
             if indent < elem_indent {
                 break;
             }
             if indent != elem_indent {
                 return Err(self.error_current("expected a table row at the array indent"));
             }
-            let row = &line[elem_indent..];
+            let row = &line[file_indent..];
             if !row.starts_with('|') {
                 return Err(self.error_current("table arrays may only contain table rows"));
             }
@@ -1217,7 +1330,7 @@ impl Parser {
                 // Peek past ignorable lines to find the next meaningful line.
                 let mut offset = 1usize;
                 loop {
-                    let Some(peek) = self.lines.get(self.line + offset) else { break; };
+                    let Some(peek) = self.line_str(self.line + offset) else { break; };
                     let trimmed = peek.trim_start_matches(' ');
                     if trimmed.starts_with("//") {
                         offset += 1;
@@ -1225,24 +1338,28 @@ impl Parser {
                         break;
                     }
                 }
-                let Some(next_line) = self.lines.get(self.line + offset) else {
-                    break;
+                let cont_suffix = {
+                    let Some(next_line) = self.line_str(self.line + offset) else {
+                        break;
+                    };
+                    let next_file_indent = count_leading_spaces(next_line);
+                    let next_indent = self.idt.logical(next_file_indent);
+                    if next_indent != pair_indent {
+                        break;
+                    }
+                    let next_content = &next_line[next_file_indent..];
+                    if !next_content.starts_with("/ ") {
+                        break;
+                    }
+                    next_content[2..].to_owned()
                 };
-                let next_indent = count_leading_spaces(next_line);
-                if next_indent != pair_indent {
-                    break;
-                }
-                let next_content = &next_line[pair_indent..];
-                if !next_content.starts_with("/ ") {
-                    break;
-                }
                 // Consume ignorable lines then the continuation line.
                 for i in 1..offset {
                     self.ensure_line_has_no_tabs(self.line + i)?;
                 }
                 self.line += offset;
                 self.ensure_line_has_no_tabs(self.line)?;
-                row_owned.push_str(&next_content[2..]);
+                row_owned.push_str(&cont_suffix);
             }
             rows.push(self.parse_table_row(&columns, &row_owned, elem_indent)?);
             self.line += 1;
@@ -1317,7 +1434,7 @@ impl Parser {
             if cell.is_empty() {
                 continue;
             }
-            entries.push((key.clone(), self.parse_table_cell_value(cell)?));
+            entries.push(Entry { key: key.clone(), value: self.parse_table_cell_value(cell)? });
         }
         Ok(TjsonValue::Object(entries))
     }
@@ -1364,7 +1481,7 @@ impl Parser {
     fn parse_object_tail(
         &mut self,
         pair_indent: usize,
-        entries: &mut Vec<(String, TjsonValue)>,
+        entries: &mut Vec<Entry>,
     ) -> std::result::Result<(), ParseError> {
         loop {
             self.skip_ignorable_lines()?;
@@ -1372,12 +1489,18 @@ impl Parser {
                 break;
             };
             self.ensure_line_has_no_tabs(self.line)?;
-            let indent = count_leading_spaces(&line);
+            // Close glyph: pop offset and continue so the loop re-evaluates indent.
+            if self.idt.try_pop_close(&line) {
+                self.line += 1;
+                continue;
+            }
+            let file_indent = count_leading_spaces(&line);
+            let indent = self.idt.logical(file_indent);
             if indent < pair_indent {
                 break;
             }
             if indent != pair_indent {
-                let content = line[indent..].to_owned();
+                let content = line[file_indent..].to_owned();
                 let msg = if content.starts_with("/>") {
                     format!("misplaced /> indent offset glyph: found at column {}, expected at column {}", indent + 1, pair_indent + 1)
                 } else if content.starts_with("/ ") {
@@ -1387,7 +1510,7 @@ impl Parser {
                 };
                 return Err(self.error_current(msg));
             }
-            let content = &line[pair_indent..];
+            let content = &line[file_indent..];
             if content.is_empty() {
                 return Err(self.error_current("blank lines are not valid inside objects"));
             }
@@ -1401,7 +1524,7 @@ impl Parser {
         &mut self,
         content: &str,
         pair_indent: usize,
-    ) -> std::result::Result<Vec<(String, TjsonValue)>, ParseError> {
+    ) -> std::result::Result<Vec<Entry>, ParseError> {
         let mut rest = content.to_owned();
         let mut entries = Vec::new();
         loop {
@@ -1411,13 +1534,23 @@ impl Parser {
             if rest.is_empty() {
                 self.line += 1;
                 let value = self.parse_value_after_key(pair_indent)?;
-                entries.push((key, value));
+                entries.push(Entry { key, value });
+                return Ok(entries);
+            }
+
+            // Inline indent glyph: `key: /<` — value follows on next lines at shifted indent.
+            if rest == " /<" {
+                let glyph_file_indent = pair_indent.saturating_sub(self.idt.offset());
+                self.idt.push_glyph(glyph_file_indent);
+                self.line += 1;
+                let value = self.parse_value_after_key(pair_indent)?;
+                entries.push(Entry { key, value });
                 return Ok(entries);
             }
 
             let (value, consumed) =
                 self.parse_inline_value(&rest, pair_indent, ArrayLineValueContext::ObjectValue)?;
-            entries.push((key, value));
+            entries.push(Entry { key, value });
 
             let Some(consumed) = consumed else {
                 return Ok(entries);
@@ -1453,8 +1586,9 @@ impl Parser {
             .ok_or_else(|| self.error_at_line(self.line, 1, "expected a nested value"))?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let indent = count_leading_spaces(&line);
-        let content = &line[indent..];
+        let file_indent = count_leading_spaces(&line);
+        let indent = self.idt.logical(file_indent);
+        let content = &line[file_indent..];
         if starts_with_marker_chain(content) && (indent == pair_indent || indent == child_indent) {
             return self.parse_marker_chain_line(content, indent);
         }
@@ -1471,15 +1605,19 @@ impl Parser {
             }
             return Ok(value);
         }
+        // Own-line indent glyph: ` /<` at pair_indent (file_indent + 1 with content "/<").
+        // The glyph's leading space sits at position pair_indent - offset in the file.
+        if indent == pair_indent + 1 && content == "/<" {
+            let glyph_file_indent = pair_indent.saturating_sub(self.idt.offset());
+            self.idt.push_glyph(glyph_file_indent);
+            self.line += 1;
+            return self.parse_value_after_key(pair_indent);
+        }
         if indent < child_indent {
             return Err(self.error_current("nested values must be indented by two spaces"));
         }
-        let content = &line[child_indent..];
-        if is_minimal_json_candidate(content) {
-            let value = self.parse_minimal_json_line(content)?;
-            self.line += 1;
-            return Ok(value);
-        }
+        let child_file_indent = child_indent.saturating_sub(self.idt.offset());
+        let content = &line[child_file_indent..];
         if self.looks_like_object_start(content, pair_indent) {
             self.parse_implicit_object(pair_indent)
         } else {
@@ -1520,8 +1658,14 @@ impl Parser {
                 break;
             };
             self.ensure_line_has_no_tabs(self.line)?;
-            let indent = count_leading_spaces(&line);
-            let content = &line[indent..];
+            // Close glyph: pop offset and continue.
+            if self.idt.try_pop_close(&line) {
+                self.line += 1;
+                continue;
+            }
+            let file_indent = count_leading_spaces(&line);
+            let indent = self.idt.logical(file_indent);
+            let content = &line[file_indent..];
             if indent < parent_indent {
                 break;
             }
@@ -1532,16 +1676,33 @@ impl Parser {
             if indent < elem_indent {
                 break;
             }
-            // Bare strings have a leading space, so they sit at elem_indent+1.
-            if indent == elem_indent + 1 && line.as_bytes().get(elem_indent) == Some(&b' ') {
-                let content = &line[elem_indent..];
-                self.parse_array_line_content(content, elem_indent, elements)?;
+            // Structural indents are always even; an odd file_indent means the extra space is part
+            // of the content (glyph leading space or bare string leading space).
+            let elem_struct_pos = elem_indent.saturating_sub(self.idt.offset());
+            if file_indent == elem_struct_pos + 1 {
+                // Bare strings can never start with `/`, so content=="/<" is unambiguously a glyph.
+                if content == "/<" {
+                    self.idt.push_glyph(elem_struct_pos);
+                    self.line += 1;
+                    continue;
+                }
+                self.parse_array_line_content(&line[elem_struct_pos..], elem_indent, elements)?;
+                continue;
+            }
+            // Standalone glyph at structural indent elem_indent+2: introduces a nested sub-array.
+            let sub_glyph_struct = (elem_indent + 2).saturating_sub(self.idt.offset());
+            if file_indent == sub_glyph_struct + 1 && content == "/<" {
+                self.idt.push_glyph(sub_glyph_struct);
+                self.line += 1;
+                let mut sub_elements = Vec::new();
+                self.parse_array_tail(elem_indent, &mut sub_elements)?;
+                elements.push(TjsonValue::Array(sub_elements));
                 continue;
             }
             if indent != elem_indent {
                 return Err(self.error_current("invalid indent level: array elements must be indented by exactly two spaces"));
             }
-            let content = &line[elem_indent..];
+            let content = &line[file_indent..];
             if content.is_empty() {
                 return Err(self.error_current("blank lines are not valid inside arrays"));
             }
@@ -1641,10 +1802,45 @@ impl Parser {
                 self.error_current("only the final explicit nesting marker on a line may be '{'")
             );
         }
+        let deepest_parent_indent = line_indent + 2 * markers.len().saturating_sub(1);
+
+        // Indent glyph after markers: `[ [ /<` — content follows on next lines at shifted indent.
+        if rest == " /<" {
+            let glyph_file_indent = (deepest_parent_indent + 2).saturating_sub(self.idt.offset());
+            self.idt.push_glyph(glyph_file_indent);
+            self.line += 1;
+            // The deepest container's content starts on the next lines.
+            let mut value = match *markers.last().unwrap() {
+                ContainerKind::Array => {
+                    let mut elements = Vec::new();
+                    self.parse_array_tail(deepest_parent_indent, &mut elements)?;
+                    if elements.is_empty() {
+                        return Err(self.error_current("expected at least one array element after indent glyph"));
+                    }
+                    TjsonValue::Array(elements)
+                }
+                ContainerKind::Object => {
+                    let pair_indent = deepest_parent_indent + 2;
+                    let mut entries = Vec::new();
+                    self.parse_object_tail(pair_indent, &mut entries)?;
+                    if entries.is_empty() {
+                        return Err(self.error_current("expected at least one object entry after indent glyph"));
+                    }
+                    TjsonValue::Object(entries)
+                }
+            };
+            for level in (0..markers.len().saturating_sub(1)).rev() {
+                let parent_indent = line_indent + 2 * level;
+                let mut wrapped = vec![value];
+                self.parse_array_tail(parent_indent, &mut wrapped)?;
+                value = TjsonValue::Array(wrapped);
+            }
+            return Ok(value);
+        }
+
         if rest.is_empty() {
             return Err(self.error_current("a nesting marker must be followed by content"));
         }
-        let deepest_parent_indent = line_indent + 2 * markers.len().saturating_sub(1);
 
         // Special case: the last `[` marker followed immediately by a table header means
         // the last `[` IS the table array itself, not a wrapper around it.
@@ -1710,25 +1906,22 @@ impl Parser {
                 let mut key_acc = content[..end].to_owned();
                 let mut next = self.line + 1;
                 loop {
-                    let Some(fold_line) = self.lines.get(next).cloned() else {
-                        break;
+                    let (colon_pos, cont_owned) = {
+                        let Some(fold_line) = self.line_str(next) else { break; };
+                        let raw_fi = count_leading_spaces(fold_line);
+                        if self.idt.logical(raw_fi) != fold_indent { break; }
+                        let rest = &fold_line[raw_fi..];
+                        if !rest.starts_with("/ ") { break; }
+                        let cont = &rest[2..];
+                        (cont.find(':'), cont.to_owned())
                     };
-                    let fi = count_leading_spaces(&fold_line);
-                    if fi != fold_indent {
-                        break;
-                    }
-                    let rest = &fold_line[fi..];
-                    if !rest.starts_with("/ ") {
-                        break;
-                    }
-                    let cont = &rest[2..];
                     next += 1;
-                    if let Some(colon_pos) = cont.find(':') {
-                        key_acc.push_str(&cont[..colon_pos]);
+                    if let Some(colon_pos) = colon_pos {
+                        key_acc.push_str(&cont_owned[..colon_pos]);
                         self.line = next - 1; // point to last fold line; caller will +1
-                        return Ok((key_acc, cont[colon_pos + ':'.len_utf8()..].to_owned()));
+                        return Ok((key_acc, cont_owned[colon_pos + ':'.len_utf8()..].to_owned()));
                     }
-                    key_acc.push_str(cont);
+                    key_acc.push_str(&cont_owned);
                 }
             }
         }
@@ -1742,10 +1935,10 @@ impl Parser {
             let mut json_acc = content.to_owned();
             let mut next = self.line + 1;
             loop {
-                let Some(fold_line) = self.lines.get(next).cloned() else {
+                let Some(fold_line) = self.line_str(next) else {
                     break;
                 };
-                let fi = count_leading_spaces(&fold_line);
+                let fi = count_leading_spaces(fold_line);
                 if fi != fold_indent {
                     break;
                 }
@@ -1807,14 +2000,14 @@ impl Parser {
                     let mut next = self.line + 1;
                     let mut fold_count = 0usize;
                     loop {
-                        let Some(fold_line) = self.lines.get(next) else {
+                        let Some(fold_line) = self.line_str(next) else {
                             break;
                         };
-                        let fi = count_leading_spaces(fold_line);
-                        if fi != line_indent {
+                        let raw_fi = count_leading_spaces(fold_line);
+                        if self.idt.logical(raw_fi) != line_indent {
                             break;
                         }
-                        let rest = &fold_line[fi..];
+                        let rest = &fold_line[raw_fi..];
                         if !rest.starts_with("/ ") {
                             break;
                         }
@@ -1840,11 +2033,19 @@ impl Parser {
                 if content.starts_with("[]") {
                     return Ok((TjsonValue::Array(Vec::new()), Some(2)));
                 }
+                if is_minimal_json_candidate(content) {
+                    let value = self.parse_minimal_json_line(content)?;
+                    return Ok((value, Some(content.len())));
+                }
                 Err(self.error_current("nonempty arrays require container context"))
             }
             '{' => {
                 if content.starts_with("{}") {
                     return Ok((TjsonValue::Object(Vec::new()), Some(2)));
+                }
+                if is_minimal_json_candidate(content) {
+                    let value = self.parse_minimal_json_line(content)?;
+                    return Ok((value, Some(content.len())));
                 }
                 Err(self.error_current("nonempty objects require object or array context"))
             }
@@ -1860,10 +2061,10 @@ impl Parser {
                     let mut next = self.line + 1;
                     let mut fold_count = 0usize;
                     loop {
-                        let Some(fold_line) = self.lines.get(next) else { break; };
-                        let fi = count_leading_spaces(fold_line);
-                        if fi != line_indent { break; }
-                        let rest = &fold_line[fi..];
+                        let Some(fold_line) = self.line_str(next) else { break; };
+                        let raw_fi = count_leading_spaces(fold_line);
+                        if self.idt.logical(raw_fi) != line_indent { break; }
+                        let rest = &fold_line[raw_fi..];
                         if !rest.starts_with("/ ") { break; }
                         acc.push_str(&rest[2..]);
                         next += 1;
@@ -2095,11 +2296,11 @@ impl Parser {
                 .ok_or_else(|| self.error_at_line(start_line, fold_indent + 1, "unterminated JSON string"))?
                 .to_owned();
             self.ensure_line_has_no_tabs(self.line)?;
-            let fi = count_leading_spaces(&line);
-            if fi != fold_indent {
+            let raw_fi = count_leading_spaces(&line);
+            if self.idt.logical(raw_fi) != fold_indent {
                 return Err(self.error_at_line(start_line, fold_indent + 1, "unterminated JSON string"));
             }
-            let rest = &line[fi..];
+            let rest = &line[raw_fi..];
             if !rest.starts_with("/ ") {
                 return Err(self.error_at_line(start_line, fold_indent + 1, "unterminated JSON string"));
             }
@@ -2134,8 +2335,12 @@ impl Parser {
         Ok(TjsonValue::from(value))
     }
 
+    fn line_str(&self, index: usize) -> Option<&str> {
+        self.line_offsets.get(index).map(|s| &self.input[s.start..s.start + s.len])
+    }
+
     fn current_line(&self) -> Option<&str> {
-        self.lines.get(self.line).map(String::as_str)
+        self.line_str(self.line)
     }
 
     fn skip_ignorable_lines(&mut self) -> std::result::Result<(), ParseError> {
@@ -2152,7 +2357,7 @@ impl Parser {
     }
 
     fn ensure_line_has_no_tabs(&self, line_index: usize) -> std::result::Result<(), ParseError> {
-        let Some(line) = self.lines.get(line_index) else {
+        let Some(line) = self.line_str(line_index) else {
             return Ok(());
         };
         // Only reject tabs in the leading indent — tabs inside quoted string values are allowed.
@@ -2194,9 +2399,9 @@ impl Parser {
     }
 
     fn next_line_is_fold_continuation(&self, expected_indent: usize) -> bool {
-        self.lines.get(self.line + 1).is_some_and(|l| {
-            let fi = count_leading_spaces(l);
-            fi == expected_indent && l[fi..].starts_with("/ ")
+        self.line_str(self.line + 1).is_some_and(|l| {
+            let raw_fi = count_leading_spaces(l);
+            self.idt.logical(raw_fi) == expected_indent && l[raw_fi..].starts_with("/ ")
         })
     }
 
@@ -2214,7 +2419,7 @@ impl Parser {
         column: usize,
         message: impl Into<String>,
     ) -> ParseError {
-        ParseError::new(line_index + 1, column, message, self.lines.get(line_index).map(|l| l.to_owned()))
+        ParseError::new(line_index + 1, column, message, self.line_str(line_index).map(str::to_owned))
     }
 }
 
@@ -2265,7 +2470,7 @@ impl Renderer {
     }
 
     fn render_implicit_object(
-        entries: &[(String, TjsonValue)],
+        entries: &[Entry],
         parent_indent: usize,
         options: &TjsonOptions,
     ) -> Result<Vec<String>> {
@@ -2273,7 +2478,7 @@ impl Renderer {
         let mut lines = Vec::new();
         let mut packed_line = String::new();
 
-        for (key, value) in entries {
+        for Entry { key, value } in entries {
             if effective_inline_objects(options)
                 && let Some(token) = Self::render_inline_object_token(key, value, options)? {
                     let candidate = if packed_line.is_empty() {
@@ -2652,7 +2857,7 @@ impl Renderer {
     }
 
     fn render_explicit_object(
-        entries: &[(String, TjsonValue)],
+        entries: &[Entry],
         marker_indent: usize,
         options: &TjsonOptions,
     ) -> Result<Vec<String>> {
@@ -2677,11 +2882,11 @@ impl Renderer {
         match value {
             TjsonValue::Array(values) if !values.is_empty() => {
                 if should_use_indent_glyph(value, elem_indent, options) {
-                    let mut lines = vec![format!("{}[ /<", spaces(elem_indent))];
+                    let mut lines = vec![format!("{} /<", spaces(elem_indent))];
                     if values.first().is_some_and(needs_explicit_array_marker) {
-                        lines.extend(Self::render_explicit_array(values, 2, options)?);
+                        lines.extend(Self::render_explicit_array(values, 0, options)?);
                     } else {
-                        lines.extend(Self::render_array_children(values, 2, options)?);
+                        lines.extend(Self::render_array_children(values, 0, options)?);
                     }
                     lines.push(format!("{} />", spaces(elem_indent)));
                     return Ok(lines);
@@ -3156,6 +3361,13 @@ impl Renderer {
             return Ok(Some(vec![first_prefix]));
         }
 
+        // If the prefix alone already fills or exceeds wrap_width, no token can fit inline.
+        if let Some(w) = options.wrap_width {
+            if first_prefix.len() >= w {
+                return Ok(None);
+            }
+        }
+
         // Spaces mode is incompatible with block elements (which are never strings).
         if string_spaces_mode && tokens.iter().any(|t| matches!(t, PackedToken::Block(_))) {
             return Ok(None);
@@ -3318,7 +3530,7 @@ impl Renderer {
                 return Ok(None);
             };
             present_cells += entries.len();
-            for (key, cell) in entries {
+            for Entry { key, value: cell } in entries {
                 if matches!(cell, TjsonValue::Array(inner) if !inner.is_empty())
                     || matches!(cell, TjsonValue::Object(inner) if !inner.is_empty())
                     || matches!(cell, TjsonValue::String(text) if text.contains('\n') || text.contains('\r'))
@@ -3330,7 +3542,7 @@ impl Renderer {
                 }
             }
             // Check that shared keys appear in the same relative order as in the first row.
-            let row_keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+            let row_keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
             if let Some(ref first) = first_row_keys {
                 let shared_in_first: Vec<&str> = first.iter().copied().filter(|k| row_keys.contains(k)).collect();
                 let shared_in_row: Vec<&str> = row_keys.iter().copied().filter(|k| first.contains(k)).collect();
@@ -3363,8 +3575,8 @@ impl Renderer {
             };
             let mut row: Vec<String> = Vec::new();
             for column in &columns {
-                let token = if let Some((_, value)) = entries.iter().find(|(key, _)| key == column)
-                {
+                let token = if let Some(entry) = entries.iter().find(|e| &e.key == column) {
+                    let value = &entry.value;
                     Self::render_table_cell_token(value, options)?
                 } else {
                     None
@@ -3384,6 +3596,7 @@ impl Renderer {
             }
         }
         // Bail out if any column's content exceeds table_column_max_width.
+        // This does not and should not depend on table_fold.
         if let Some(col_max) = options.table_column_max_width
             && widths.iter().any(|w| *w > col_max) {
                 return Ok(None);
@@ -3400,8 +3613,9 @@ impl Renderer {
             // Each column renders as "|" + cell padded to `width` chars, plus trailing "|".
             // Minimum row width assumes indent 0: 2 spaces prefix + sum(widths) + one "|" per column + trailing "|".
             // The unindent logic may reduce indent below parent_indent, so only bail if it can't fit even at indent 0.
+            // If table_fold is on, skip this bail-out — the fold logic below will handle overflow rows.
             let min_row_width = 2 + widths.iter().sum::<usize>() + widths.len() + 1;
-            if min_row_width > w {
+            if min_row_width > w && !options.table_fold {
                 return Ok(None);
             }
         }
@@ -3435,7 +3649,7 @@ impl Renderer {
             );
 
             if options.table_fold {
-                // Check if any cell exceeds table_column_max_width and fold if so.
+                // Fold if the row line exceeds wrap_width.
                 // The fold splits the row line at a point within a cell's string value,
                 // between the first and last data character (not between `|` and value start).
                 // Find the fold point by scanning back from the wrap boundary.
@@ -3449,7 +3663,7 @@ impl Renderer {
                     // We look for a space inside a cell value (not the cell padding spaces).
                     if let Some((before, after)) = split_table_row_for_fold(&row_line, fold_avail + pair_indent + 2) {
                         lines.push(before);
-                        lines.push(format!("{}\\ {}", fold_prefix, after));
+                        lines.push(format!("{}/ {}", fold_prefix, after));
                         continue;
                     }
                 }
@@ -3493,156 +3707,6 @@ impl Renderer {
             _ => None,
         })
     }
-}
-
-fn normalize_input(input: &str) -> std::result::Result<String, ParseError> {
-    let mut normalized = String::with_capacity(input.len());
-    let mut line = 1;
-    let mut column = 1;
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-                normalized.push('\n');
-                line += 1;
-                column = 1;
-                continue;
-            }
-            return Err(ParseError::new(
-                line,
-                column,
-                "bare carriage returns are not valid",
-                None,
-            ));
-        }
-        if is_forbidden_literal_tjson_char(ch) {
-            return Err(ParseError::new(
-                line,
-                column,
-                format!("forbidden character U+{:04X} must be escaped", ch as u32),
-                None,
-            ));
-        }
-        normalized.push(ch);
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    Ok(normalized)
-}
-
-// Expands /< /> indent-adjustment glyphs before parsing.
-//
-// /< appears as the value in "key: /<" and resets the visible indent to n=0,
-// meaning subsequent lines are rendered as if at the document root (visual
-// indent 0).  The actual nesting depth is unchanged.
-//
-// /> must be alone on the line (with optional leading/trailing spaces) and
-// restores the previous indent context.
-//
-// Preprocessing converts shifted lines back to their real indent so the main
-// parser never sees /< or />.
-fn expand_indent_adjustments(input: &str) -> String {
-    if !input.contains(" /<") {
-        return input.to_owned();
-    }
-
-    let mut output_lines: Vec<String> = Vec::with_capacity(input.lines().count() + 4);
-    // Stack entries: (offset, expected_close_file_indent).
-    // offset_stack.last() is the current offset; effective = file_indent + offset.
-    // The base entry uses usize::MAX as a sentinel (no /< to close at the root level).
-    let mut offset_stack: Vec<(usize, usize)> = vec![(0, usize::MAX)];
-    // When a line ends with ':' and no value, it may be the first half of an own-line
-    // /< open. Hold it here; flush it as a regular line if the next line is not " /<".
-    let mut pending_key_line: Option<String> = None;
-
-    for raw_line in input.split('\n') {
-        let (current_offset, expected_close) = *offset_stack.last().unwrap();
-
-        // /> – restoration glyph: must be exactly spaces(expected_close_file_indent) + " />".
-        // Any other indentation is not a close glyph and falls through as a regular line.
-        if offset_stack.len() > 1
-            && raw_line.len() == expected_close + 3
-            && raw_line[..expected_close].bytes().all(|b| b == b' ')
-            && &raw_line[expected_close..] == " />"
-        {
-            if let Some(held) = pending_key_line.take() { output_lines.push(held); }
-            offset_stack.pop();
-            continue; // consume the line without emitting it
-        }
-
-        // Own-line /< – a line whose trimmed content is exactly " /<" following a pending key.
-        // The /< must be at pair_indent (= pending key's file_indent) spaces + " /<".
-        let trimmed = raw_line.trim_end();
-        if let Some(ref held) = pending_key_line {
-            let key_file_indent = count_leading_spaces(held);
-            if trimmed.len() == key_file_indent + 3
-                && trimmed[..key_file_indent].bytes().all(|b| b == b' ')
-                && &trimmed[key_file_indent..] == " /<"
-            {
-                // Treat as if the held key line had " /<" appended.
-                let eff_indent = key_file_indent + current_offset;
-                let content = &held[key_file_indent..]; // "key:"
-                output_lines.push(format!("{}{}", spaces(eff_indent), content));
-                offset_stack.push((eff_indent, key_file_indent));
-                pending_key_line = None;
-                continue;
-            }
-            // Not a /< — flush the held key line as a regular line.
-            output_lines.push(pending_key_line.take().unwrap());
-        }
-
-        // /< – adjustment glyph: the trimmed line ends with " /<" and what
-        // precedes it ends with ':' (confirming this is a key-value context,
-        // not a multiline-string body or other content).
-        let trimmed_end = trimmed;
-        if let Some(without_glyph) = trimmed_end.strip_suffix(" /<")
-            && without_glyph.trim_end().ends_with(':') {
-                let file_indent = count_leading_spaces(raw_line);
-                let eff_indent = file_indent + current_offset;
-                let content = &without_glyph[file_indent..];
-                output_lines.push(format!("{}{}", spaces(eff_indent), content));
-                offset_stack.push((eff_indent, file_indent));
-                continue;
-        }
-
-        // Key-only line (ends with ':' after trimming, no value after the colon):
-        // may be the first half of an own-line /<. Hold it for one iteration.
-        if trimmed_end.ends_with(':') && !trimmed_end.trim_start().contains(' ') {
-            // Preserve any active offset re-indentation in the held form.
-            let held = if current_offset == 0 || raw_line.trim().is_empty() {
-                raw_line.to_owned()
-            } else {
-                let file_indent = count_leading_spaces(raw_line);
-                let eff_indent = file_indent + current_offset;
-                let content = &raw_line[file_indent..];
-                format!("{}{}", spaces(eff_indent), content)
-            };
-            pending_key_line = Some(held);
-            continue;
-        }
-
-        // Regular line: re-indent if there is an active offset.
-        if current_offset == 0 || raw_line.trim().is_empty() {
-            output_lines.push(raw_line.to_owned());
-        } else {
-            let file_indent = count_leading_spaces(raw_line);
-            let eff_indent = file_indent + current_offset;
-            let content = &raw_line[file_indent..];
-            output_lines.push(format!("{}{}", spaces(eff_indent), content));
-        }
-    }
-    // Flush any trailing pending key line.
-    if let Some(held) = pending_key_line.take() { output_lines.push(held); }
-
-    // split('\n') produces a trailing "" for inputs that end with '\n'.
-    // Joining that back with '\n' naturally reproduces the trailing newline,
-    // so no explicit suffix is needed.
-    output_lines.join("\n")
 }
 
 fn count_leading_spaces(line: &str) -> usize {
@@ -3728,7 +3792,7 @@ fn subtree_line_count(value: &TjsonValue) -> usize {
     match value {
         TjsonValue::Array(v) if !v.is_empty() => v.iter().map(subtree_line_count).sum::<usize>() + 1,
         TjsonValue::Object(e) if !e.is_empty() => {
-            e.iter().map(|(_, v)| subtree_line_count(v) + 1).sum()
+            e.iter().map(|entry| subtree_line_count(&entry.value) + 1).sum()
         }
         _ => 1,
     }
@@ -3742,7 +3806,7 @@ fn subtree_byte_count(value: &TjsonValue) -> usize {
         TjsonValue::Bool(b) => if *b { 4 } else { 5 },
         TjsonValue::Null => 4,
         TjsonValue::Array(v) => v.iter().map(subtree_byte_count).sum(),
-        TjsonValue::Object(e) => e.iter().map(|(k, v)| k.len() + subtree_byte_count(v)).sum(),
+        TjsonValue::Object(e) => e.iter().map(|entry| entry.key.len() + subtree_byte_count(&entry.value)).sum(),
     }
 }
 
@@ -3754,7 +3818,7 @@ fn subtree_max_depth(value: &TjsonValue) -> usize {
             1 + v.iter().map(subtree_max_depth).max().unwrap_or(0)
         }
         TjsonValue::Object(e) if !e.is_empty() => {
-            1 + e.iter().map(|(_, v)| subtree_max_depth(v)).max().unwrap_or(0)
+            1 + e.iter().map(|entry| subtree_max_depth(&entry.value)).max().unwrap_or(0)
         }
         _ => 0,
     }
@@ -3819,7 +3883,34 @@ fn pick_preferred_string_array_layout(
     }
 }
 
-fn string_array_layout_score(lines: &[String], options: &TjsonOptions) -> (usize, usize, usize) {
+struct StringArrayLayoutScore {
+    overflow: usize,
+    line_count: usize,
+    max_width: usize,
+}
+
+impl PartialOrd for StringArrayLayoutScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for StringArrayLayoutScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.overflow, self.line_count, self.max_width)
+            .cmp(&(other.overflow, other.line_count, other.max_width))
+    }
+}
+
+impl PartialEq for StringArrayLayoutScore {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for StringArrayLayoutScore {}
+
+fn string_array_layout_score(lines: &[String], options: &TjsonOptions) -> StringArrayLayoutScore {
     let overflow = match options.wrap_width {
         Some(0) | None => 0,
         Some(width) => lines
@@ -3832,7 +3923,7 @@ fn string_array_layout_score(lines: &[String], options: &TjsonOptions) -> (usize
         .map(|line| line.chars().count())
         .max()
         .unwrap_or(0);
-    (overflow, lines.len(), max_width)
+    StringArrayLayoutScore { overflow, line_count: lines.len(), max_width }
 }
 
 fn starts_with_marker_chain(content: &str) -> bool {
@@ -6344,7 +6435,7 @@ mod tests {
             TjsonValue::Object(entries) => {
                 let keys = entries
                     .iter()
-                    .map(|(key, _)| key.as_str())
+                    .map(|e| e.key.as_str())
                     .collect::<Vec<_>>();
                 assert_eq!(keys, vec!["first", "second", "third"]);
             }
@@ -6373,41 +6464,6 @@ mod tests {
     }
 
     // ---- /< /> indent-offset tests ----
-
-    #[test]
-    fn expand_indent_adjustments_noops_when_no_glyph_present() {
-        let input = "  a:1\n  b:2\n";
-        assert_eq!(expand_indent_adjustments(input), input);
-    }
-
-    #[test]
-    fn expand_indent_adjustments_removes_opener_and_re_indents_content() {
-        // pair_indent=2 ("  outer: /<"), then table at visual 2 → actual 4.
-        let input = "  outer: /<\n  |a  |b  |\n  | x  | y  |\n   />\n  sib:1\n";
-        let result = expand_indent_adjustments(input);
-        // "  outer: /<" → "  outer:" (offset pushed = 2)
-        // "  |a  |b  |" at file-indent 2 → effective 4 → "    |a  |b  |"
-        // "   />" → pop, discarded
-        // "  sib:1" → offset=0, unchanged
-        let expected = "  outer:\n    |a  |b  |\n    | x  | y  |\n  sib:1\n";
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn expand_indent_adjustments_handles_nested_opener() {
-        // Two stacked /< contexts.
-        let input = "  a: /<\n  b: /<\n  c:1\n   />\n  d:2\n   />\n  e:3\n";
-        let result = expand_indent_adjustments(input);
-        // After "  a: /<": offset=2
-        // "  b: /<" at file-indent 2 → eff=4, emit "    b:", push offset=4
-        // "  c:1" at file-indent 2 → eff=6 → "      c:1"
-        // "   />" → pop offset to 2
-        // "  d:2" at file-indent 2 → eff=4 → "    d:2"
-        // "   />" → pop offset to 0
-        // "  e:3" unchanged
-        let expected = "  a:\n    b:\n      c:1\n    d:2\n  e:3\n";
-        assert_eq!(result, expected);
-    }
 
     #[test]
     fn parses_indent_offset_table() {
