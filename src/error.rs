@@ -54,7 +54,7 @@ pub enum Error {
     Parse(ParseError),
     /// A JSON serialization or deserialization error from serde_json.
     Json(serde_json::Error),
-    /// A render error (e.g. invalid number representation).
+    /// A render error due to an internal invariant violation (indicates a bug in this library).
     Render(String),
 }
 

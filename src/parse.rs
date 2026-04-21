@@ -1,10 +1,10 @@
-use std::str::FromStr;
 use serde::{Deserialize, Serialize};
-use serde_json::{Number as JsonNumber, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
-use crate::error::{ParseError, Result};
-use crate::options::{BareStyle, TjsonOptions};
-use crate::value::{Entry, TjsonValue};
+use crate::number::Number;
+
+use crate::error::ParseError;
+use crate::value::{Entry, Value};
 use crate::util::*;
 
 #[non_exhaustive]
@@ -14,7 +14,7 @@ pub(crate) struct ParseOptions {
     pub(crate) start_indent: usize,
 }
 
-/// Options controlling how TJSON is rendered. Use [`TjsonOptions::default`] for sensible
+/// Options controlling how TJSON is rendered. Use [`RenderOptions::default`] for sensible
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArrayLineValueContext {
@@ -89,20 +89,15 @@ impl IndentTracker {
 
     /// If `line` is the close glyph ` />` for the current context, pop and return true.
     fn try_pop_close(&mut self, line: &str) -> bool {
-        if let Some(f) = self.stack.last() {
-            if line.len() == f.close_file_indent + 3
-                && line[..f.close_file_indent].bytes().all(|b| b == b' ')
-                && &line[f.close_file_indent..] == " />"
-            {
-                self.stack.pop();
-                return true;
-            }
+        if let Some(f) = self.stack.last()
+            && line.len() == f.close_file_indent + 3
+            && line[..f.close_file_indent].bytes().all(|b| b == b' ')
+            && &line[f.close_file_indent..] == " />"
+        {
+            self.stack.pop();
+            return true;
         }
         false
-    }
-
-    fn is_active(&self) -> bool {
-        !self.stack.is_empty()
     }
 }
 
@@ -149,7 +144,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn parse_document(
         input: &'a str,
         start_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         let mut parser = Self {
             input,
             line_offsets: scan_lines(input)?,
@@ -177,7 +172,7 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn parse_root_value(&mut self) -> std::result::Result<TjsonValue, ParseError> {
+    fn parse_root_value(&mut self) -> std::result::Result<Value, ParseError> {
         let line = self
             .current_line()
             .ok_or_else(|| ParseError::new(1, 1, "empty input", None))?
@@ -221,19 +216,19 @@ impl<'a> Parser<'a> {
     fn parse_implicit_object(
         &mut self,
         parent_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         let mut entries = Vec::new();
         self.parse_object_tail(parent_indent + 2, &mut entries)?;
         if entries.is_empty() {
             return Err(self.error_current("expected at least one object entry"));
         }
-        Ok(TjsonValue::Object(entries))
+        Ok(Value::Object(entries))
     }
 
     fn parse_implicit_array(
         &mut self,
         parent_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         self.skip_ignorable_lines()?;
         let elem_indent = parent_indent + 2;
         let line = self
@@ -255,13 +250,13 @@ impl<'a> Parser<'a> {
         if elements.is_empty() {
             return Err(self.error_current("expected at least one array element"));
         }
-        Ok(TjsonValue::Array(elements))
+        Ok(Value::Array(elements))
     }
 
     fn parse_table_array(
         &mut self,
         elem_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         let header_line = self
             .current_line()
             .ok_or_else(|| self.error_current("expected a table header"))?
@@ -341,7 +336,7 @@ impl<'a> Parser<'a> {
         if rows.is_empty() {
             return Err(self.error_current("table arrays must contain at least one row"));
         }
-        Ok(TjsonValue::Array(rows))
+        Ok(Value::Array(rows))
     }
 
     fn parse_table_header(&self, row: &str, indent: usize) -> std::result::Result<Vec<String>, ParseError> {
@@ -385,7 +380,7 @@ impl<'a> Parser<'a> {
         columns: &[String],
         row: &str,
         indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         let mut cells = split_pipe_cells(row)
             .ok_or_else(|| self.error_at_line(self.line, indent + 1, "invalid table row"))?;
         if cells.first().is_some_and(String::is_empty) {
@@ -410,10 +405,10 @@ impl<'a> Parser<'a> {
             }
             entries.push(Entry { key: key.clone(), value: self.parse_table_cell_value(cell)? });
         }
-        Ok(TjsonValue::Object(entries))
+        Ok(Value::Object(entries))
     }
 
-    fn parse_table_cell_value(&self, cell: &str) -> std::result::Result<TjsonValue, ParseError> {
+    fn parse_table_cell_value(&self, cell: &str) -> std::result::Result<Value, ParseError> {
         if cell.is_empty() {
             return Err(self.error_at_line(
                 self.line,
@@ -425,29 +420,29 @@ impl<'a> Parser<'a> {
             if !is_allowed_bare_string(value) {
                 return Err(self.error_at_line(self.line, 1, "invalid bare string in table cell"));
             }
-            return Ok(TjsonValue::String(value.to_owned()));
+            return Ok(Value::String(value.to_owned()));
         }
         if let Some((value, end)) = parse_json_string_prefix(cell)
             && end == cell.len() {
-                return Ok(TjsonValue::String(value));
+                return Ok(Value::String(value));
             }
         if cell == "true" {
-            return Ok(TjsonValue::Bool(true));
+            return Ok(Value::Bool(true));
         }
         if cell == "false" {
-            return Ok(TjsonValue::Bool(false));
+            return Ok(Value::Bool(false));
         }
         if cell == "null" {
-            return Ok(TjsonValue::Null);
+            return Ok(Value::Null);
         }
         if cell == "[]" {
-            return Ok(TjsonValue::Array(Vec::new()));
+            return Ok(Value::Array(Vec::new()));
         }
         if cell == "{}" {
-            return Ok(TjsonValue::Object(Vec::new()));
+            return Ok(Value::Object(Vec::new()));
         }
-        if let Ok(n) = JsonNumber::from_str(cell) {
-            return Ok(TjsonValue::Number(n));
+        if let Ok(n) = cell.parse::<Number>() {
+            return Ok(Value::Number(n));
         }
         Err(self.error_at_line(self.line, 1, "invalid table cell value"))
     }
@@ -552,7 +547,7 @@ impl<'a> Parser<'a> {
     fn parse_value_after_key(
         &mut self,
         pair_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         self.skip_ignorable_lines()?;
         let child_indent = pair_indent + 2;
         let line = self
@@ -603,7 +598,7 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         line_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         if is_minimal_json_candidate(content) {
             let value = self.parse_minimal_json_line(content)?;
             self.line += 1;
@@ -623,7 +618,7 @@ impl<'a> Parser<'a> {
     fn parse_array_tail(
         &mut self,
         parent_indent: usize,
-        elements: &mut Vec<TjsonValue>,
+        elements: &mut Vec<Value>,
     ) -> std::result::Result<(), ParseError> {
         let elem_indent = parent_indent + 2;
         loop {
@@ -670,7 +665,7 @@ impl<'a> Parser<'a> {
                 self.line += 1;
                 let mut sub_elements = Vec::new();
                 self.parse_array_tail(elem_indent, &mut sub_elements)?;
-                elements.push(TjsonValue::Array(sub_elements));
+                elements.push(Value::Array(sub_elements));
                 continue;
             }
             if indent != elem_indent {
@@ -697,14 +692,14 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         elem_indent: usize,
-        elements: &mut Vec<TjsonValue>,
+        elements: &mut Vec<Value>,
     ) -> std::result::Result<(), ParseError> {
         let mut rest = content;
         let mut string_only_mode = false;
         loop {
             let (value, consumed) =
                 self.parse_inline_value(rest, elem_indent, ArrayLineValueContext::ArrayLine)?;
-            let is_string = matches!(value, TjsonValue::String(_));
+            let is_string = matches!(value, Value::String(_));
             if string_only_mode && !is_string {
                 return Err(self.error_current(
                     "two-space array packing is only allowed when all values are strings",
@@ -749,7 +744,7 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         line_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         let mut rest = content;
         let mut markers = Vec::new();
         loop {
@@ -791,7 +786,7 @@ impl<'a> Parser<'a> {
                     if elements.is_empty() {
                         return Err(self.error_current("expected at least one array element after indent glyph"));
                     }
-                    TjsonValue::Array(elements)
+                    Value::Array(elements)
                 }
                 ContainerKind::Object => {
                     let pair_indent = deepest_parent_indent + 2;
@@ -800,14 +795,14 @@ impl<'a> Parser<'a> {
                     if entries.is_empty() {
                         return Err(self.error_current("expected at least one object entry after indent glyph"));
                     }
-                    TjsonValue::Object(entries)
+                    Value::Object(entries)
                 }
             };
             for level in (0..markers.len().saturating_sub(1)).rev() {
                 let parent_indent = line_indent + 2 * level;
                 let mut wrapped = vec![value];
                 self.parse_array_tail(parent_indent, &mut wrapped)?;
-                value = TjsonValue::Array(wrapped);
+                value = Value::Array(wrapped);
             }
             return Ok(value);
         }
@@ -828,7 +823,7 @@ impl<'a> Parser<'a> {
                     let parent_indent = line_indent + 2 * level;
                     let mut wrapped = vec![value];
                     self.parse_array_tail(parent_indent, &mut wrapped)?;
-                    value = TjsonValue::Array(wrapped);
+                    value = Value::Array(wrapped);
                 }
                 return Ok(value);
             }
@@ -845,20 +840,20 @@ impl<'a> Parser<'a> {
                     self.parse_array_line_content(rest, deepest_parent_indent + 2, &mut elements)?;
                     self.parse_array_tail(deepest_parent_indent, &mut elements)?;
                 }
-                TjsonValue::Array(elements)
+                Value::Array(elements)
             }
             ContainerKind::Object => {
                 let pair_indent = line_indent + 2 * markers.len();
                 let mut entries = self.parse_object_line_content(rest, pair_indent)?;
                 self.parse_object_tail(pair_indent, &mut entries)?;
-                TjsonValue::Object(entries)
+                Value::Object(entries)
             }
         };
         for level in (0..markers.len().saturating_sub(1)).rev() {
             let parent_indent = line_indent + 2 * level;
             let mut wrapped = vec![value];
             self.parse_array_tail(parent_indent, &mut wrapped)?;
-            value = TjsonValue::Array(wrapped);
+            value = Value::Array(wrapped);
         }
         Ok(value)
     }
@@ -937,7 +932,7 @@ impl<'a> Parser<'a> {
         content: &str,
         line_indent: usize,
         context: ArrayLineValueContext,
-    ) -> std::result::Result<(TjsonValue, Option<usize>), ParseError> {
+    ) -> std::result::Result<(Value, Option<usize>), ParseError> {
         let first = content
             .chars()
             .next()
@@ -946,10 +941,10 @@ impl<'a> Parser<'a> {
             ' ' => {
                 if context == ArrayLineValueContext::ObjectValue {
                     if content.starts_with(" []") {
-                        return Ok((TjsonValue::Array(Vec::new()), Some(3)));
+                        return Ok((Value::Array(Vec::new()), Some(3)));
                     }
                     if content.starts_with(" {}") {
-                        return Ok((TjsonValue::Object(Vec::new()), Some(3)));
+                        return Ok((Value::Object(Vec::new()), Some(3)));
                     }
                     if let Some(rest) = content.strip_prefix("  ") {
                         let value = self.parse_inline_array(rest, line_indent)?;
@@ -958,7 +953,7 @@ impl<'a> Parser<'a> {
                 }
                 if content.starts_with(" `") {
                     let value = self.parse_multiline_string(content, line_indent)?;
-                    return Ok((TjsonValue::String(value), None));
+                    return Ok((Value::String(value), None));
                 }
                 let end = bare_string_end(content, context);
                 if end == 0 {
@@ -991,21 +986,21 @@ impl<'a> Parser<'a> {
                     }
                     if fold_count > 0 {
                         self.line = next;
-                        return Ok((TjsonValue::String(acc), None));
+                        return Ok((Value::String(acc), None));
                     }
                 }
-                Ok((TjsonValue::String(value.to_owned()), Some(end)))
+                Ok((Value::String(value.to_owned()), Some(end)))
             }
             '"' => {
                 if let Some((value, end)) = parse_json_string_prefix(content) {
-                    return Ok((TjsonValue::String(value), Some(end)));
+                    return Ok((Value::String(value), Some(end)));
                 }
                 let value = self.parse_folded_json_string(content, line_indent)?;
-                Ok((TjsonValue::String(value), None))
+                Ok((Value::String(value), None))
             }
             '[' => {
                 if content.starts_with("[]") {
-                    return Ok((TjsonValue::Array(Vec::new()), Some(2)));
+                    return Ok((Value::Array(Vec::new()), Some(2)));
                 }
                 if is_minimal_json_candidate(content) {
                     let value = self.parse_minimal_json_line(content)?;
@@ -1015,7 +1010,7 @@ impl<'a> Parser<'a> {
             }
             '{' => {
                 if content.starts_with("{}") {
-                    return Ok((TjsonValue::Object(Vec::new()), Some(2)));
+                    return Ok((Value::Object(Vec::new()), Some(2)));
                 }
                 if is_minimal_json_candidate(content) {
                     let value = self.parse_minimal_json_line(content)?;
@@ -1023,9 +1018,9 @@ impl<'a> Parser<'a> {
                 }
                 Err(self.error_current("nonempty objects require object or array context"))
             }
-            't' if content.starts_with("true") => Ok((TjsonValue::Bool(true), Some(4))),
-            'f' if content.starts_with("false") => Ok((TjsonValue::Bool(false), Some(5))),
-            'n' if content.starts_with("null") => Ok((TjsonValue::Null, Some(4))),
+            't' if content.starts_with("true") => Ok((Value::Bool(true), Some(4))),
+            'f' if content.starts_with("false") => Ok((Value::Bool(false), Some(5))),
+            'n' if content.starts_with("null") => Ok((Value::Null, Some(4))),
             '-' | '0'..='9' => {
                 let end = simple_token_end(content, context);
                 let token = &content[..end];
@@ -1045,15 +1040,15 @@ impl<'a> Parser<'a> {
                         fold_count += 1;
                     }
                     if fold_count > 0 {
-                        let n = JsonNumber::from_str(&acc)
+                        let n = acc.parse::<Number>()
                             .map_err(|_| self.error_current(format!("invalid JSON number after folding: \"{acc}\"")))?;
                         self.line = next;
-                        return Ok((TjsonValue::Number(n), None));
+                        return Ok((Value::Number(n), None));
                     }
                 }
-                let n = JsonNumber::from_str(token)
+                let n = token.parse::<Number>()
                     .map_err(|_| self.error_current(format!("invalid JSON number: \"{token}\"")))?;
-                Ok((TjsonValue::Number(n), Some(end)))
+                Ok((Value::Number(n), Some(end)))
             }
             '.' if content[1..].starts_with(|c: char| c.is_ascii_digit()) => {
                 let end = simple_token_end(content, context);
@@ -1068,11 +1063,11 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         parent_indent: usize,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         let mut values = Vec::new();
         self.parse_array_line_content(content, parent_indent + 2, &mut values)?;
         self.parse_array_tail(parent_indent, &mut values)?;
-        Ok(TjsonValue::Array(values))
+        Ok(Value::Array(values))
     }
 
     fn parse_multiline_string(
@@ -1294,7 +1289,7 @@ impl<'a> Parser<'a> {
     fn parse_minimal_json_line(
         &self,
         content: &str,
-    ) -> std::result::Result<TjsonValue, ParseError> {
+    ) -> std::result::Result<Value, ParseError> {
         if let Err(col) = is_valid_minimal_json(content) {
             return Err(self.error_at_line(
                 self.line,
@@ -1306,7 +1301,7 @@ impl<'a> Parser<'a> {
             let col = error.column();
             self.error_at_line(self.line, col, format!("minimal JSON error: {error}"))
         })?;
-        Ok(TjsonValue::from(value))
+        Ok(Value::from(value))
     }
 
     fn line_str(&self, index: usize) -> Option<&str> {

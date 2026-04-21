@@ -187,14 +187,13 @@ fn main() {
 
     let result = if flag_json {
         // TJSON -> JSON
-        input.parse::<tjson::TjsonValue>()
-            .and_then(|v| v.to_json())
-            .and_then(|v| serde_json::to_string_pretty(&v).map_err(tjson::Error::from))
+        input.parse::<tjson::Value>()
+            .and_then(|v| serde_json::to_string_pretty(&serde_json::Value::from(v)).map_err(tjson::Error::from))
     } else {
         let mut opts = if flag_canonical {
-            tjson::TjsonOptions::canonical()
+            tjson::RenderOptions::canonical()
         } else {
-            tjson::TjsonOptions::default()
+            tjson::RenderOptions::default()
         };
 
         // -T: terminal width baseline — applied first so explicit flags override
@@ -281,8 +280,8 @@ fn main() {
         // JSON -> TJSON (default)
         serde_json::from_str::<serde_json::Value>(&input)
             .map_err(tjson::Error::from)
-            .map(tjson::TjsonValue::from)
-            .and_then(|v| v.to_tjson_with(opts))
+            .map(tjson::Value::from)
+            .map(|v| v.to_tjson_with(opts))
     };
 
     let output_str = result.unwrap_or_else(|e| {

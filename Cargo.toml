@@ -1,6 +1,6 @@
 [package]
 name = "tjson-rs"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
 description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"
@@ -27,6 +27,10 @@ js-sys = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 terminal_size = "0.4"
+
+[features]
+default = ["serde_json"]
+serde_json = []
 
 [lints.rust]
 unsafe_code = "forbid"

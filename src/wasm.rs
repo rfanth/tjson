@@ -157,9 +157,9 @@ pub fn from_json(
     crate::to_string_with(&json, opts).map_err(|e| err(format!("TJSON render error (this is likely a TJSON bug, please report it): {e}")))
 }
 
-fn parse_options(options: JsValue) -> Result<crate::TjsonOptions, JsValue> {
+fn parse_options(options: JsValue) -> Result<crate::RenderOptions, JsValue> {
     if options.is_null() || options.is_undefined() {
-        Ok(crate::TjsonOptions::default())
+        Ok(crate::RenderOptions::default())
     } else {
         // Route through serde_json::Value as an intermediate step.
         // Direct serde_wasm_bindgen::from_value::<TjsonConfig> silently discards ALL

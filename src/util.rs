@@ -287,7 +287,6 @@ pub(crate) fn line_starts_with_ws_then(line: &str, ch: char) -> bool {
 /// Split a multiline-string body part into segments for fold continuations.
 /// Returns the original text as a single segment if no fold is needed.
 /// Segments: first is the line body, rest are fold continuations (without the `/ ` prefix).
-
 pub(crate) fn safe_json_split(s: &str, split_at: usize) -> usize {
     // Walk backwards from split_at to find the last `\` and see if split is mid-escape
     let bytes = s.as_bytes();
@@ -311,7 +310,6 @@ pub(crate) fn safe_json_split(s: &str, split_at: usize) -> usize {
 /// Returns None if folding is not needed or not possible.
 /// The first element is the first line (`{spaces(indent)} {first_segment}`),
 /// subsequent elements are fold lines (`{spaces(indent)}/ {segment}`).
-
 pub(crate) fn find_number_fold_point(s: &str, avail: usize, auto_mode: bool) -> usize {
     let avail = avail.min(s.len());
     if avail == 0 || avail >= s.len() {
@@ -435,7 +433,6 @@ pub(crate) fn find_bare_fold_point(s: &str, lookahead: Option<char>) -> usize {
 /// Attempt to fold a JSON-encoded string value into multiple lines with `/ ` continuations.
 /// The output strings form a JSON string spanning multiple lines with fold markers.
 /// Returns None if folding is not needed.
-
 pub(crate) fn count_preceding_backslashes(bytes: &[u8], pos: usize) -> usize {
     let mut count = 0;
     let mut p = pos;
@@ -518,7 +515,6 @@ pub(crate) fn find_json_fold_point(s: &str) -> usize {
 ///
 /// Always folds at `\n` boundaries — each newline in the original value becomes a `/ `
 /// continuation point. Within-piece width folding follows `string_multiline_fold_style`.
-
 pub(crate) fn split_table_row_for_fold(row: &str, max_len: usize) -> Option<(String, String)> {
     if row.len() <= max_len {
         return None;

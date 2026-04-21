@@ -45,7 +45,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tjson = { package = "tjson-rs", version = "0.5" }
+tjson = { package = "tjson-rs", version = "0.6" }
 ```
 
 Install the CLI:
@@ -59,27 +59,28 @@ cargo install tjson-rs
 ### Parse TJSON
 
 ```rust
-use tjson::TjsonValue;
+use tjson::Value;
 
 // Parse a TJSON object (keys indented 2 spaces at the top level)
-let value: TjsonValue = "  name: Alice\n  age:30".parse()?;
+let value: Value = "  name: Alice\n  age:30".parse()?;
 
 // Parse a bare string
-let value: TjsonValue = " hello world".parse()?;
+let value: Value = " hello world".parse()?;
 ```
 
 ### Render to TJSON
 
 ```rust
-use tjson::{TjsonValue, TjsonOptions};
+use tjson::{Value, RenderOptions};
 
-let value = TjsonValue::from(serde_json::json!({"name": "Alice", "age": 30}));
+// From a serde_json value (requires the default `serde_json` feature)
+let value = Value::from(serde_json::json!({"name": "Alice", "age": 30}));
 
 // Default options
-let tjson = value.to_tjson_with(TjsonOptions::default())?;
+let tjson = value.to_tjson_with(RenderOptions::default())?;
 
 // Canonical (one key per line, no packing, see docs for details)
-let canonical = value.to_tjson_with(TjsonOptions::canonical())?;
+let canonical = value.to_tjson_with(RenderOptions::canonical())?;
 ```
 
 ### Serde integration
@@ -102,10 +103,10 @@ let tjson = tjson::to_string(&person)?;
 
 ## Options
 
-`TjsonOptions` is a builder. All methods take `self` and return `Self`:
+`RenderOptions` is a builder. All methods take `self` and return `Self`:
 
 ```rust
-let opts = TjsonOptions::default()
+let opts = RenderOptions::default()
     .wrap_width(Some(60))
     .tables(false)
     .multiline_strings(false);

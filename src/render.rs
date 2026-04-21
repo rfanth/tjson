@@ -1,22 +1,22 @@
 use crate::error::{Error, Result};
-use crate::options::{BareStyle, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphStyle, IndentGlyphMode, MultilineStyle, StringArrayStyle, TableUnindentStyle, TjsonOptions, MIN_FOLD_CONTINUATION, indent_glyph_mode};
-use crate::value::{Entry, TjsonValue};
+use crate::options::{BareStyle, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphMode, MultilineStyle, StringArrayStyle, TableUnindentStyle, RenderOptions, MIN_FOLD_CONTINUATION, indent_glyph_mode};
+use crate::value::{Entry, Value};
 use crate::util::*;
 use crate::parse::{MultilineLocalEol, detect_multiline_local_eol};
 
-fn effective_inline_objects(options: &TjsonOptions) -> bool {
+fn effective_inline_objects(options: &RenderOptions) -> bool {
     options.inline_objects
 }
 
-fn effective_inline_arrays(options: &TjsonOptions) -> bool {
+fn effective_inline_arrays(options: &RenderOptions) -> bool {
     options.inline_arrays
 }
 
-fn effective_force_markers(options: &TjsonOptions) -> bool {
+fn effective_force_markers(options: &RenderOptions) -> bool {
     options.force_markers
 }
 
-fn effective_tables(options: &TjsonOptions) -> bool {
+fn effective_tables(options: &RenderOptions) -> bool {
     options.tables
 }
 
@@ -24,7 +24,7 @@ fn effective_tables(options: &TjsonOptions) -> bool {
 // used, or None if no unindenting should occur.
 //
 // `natural_lines` are the table lines as rendered at pair_indent (spaces(pair_indent+2) prefix).
-fn table_unindent_target(pair_indent: usize, natural_lines: &[String], options: &TjsonOptions) -> Option<usize> {
+fn table_unindent_target(pair_indent: usize, natural_lines: &[String], options: &RenderOptions) -> Option<usize> {
     let n = pair_indent;
     let max_natural = natural_lines.iter().map(|l| l.len()).max().unwrap_or(0);
     // data_width: widest line with the natural indent stripped
@@ -75,10 +75,10 @@ fn table_unindent_target(pair_indent: usize, natural_lines: &[String], options: 
 
 /// Approximate number of output lines a value will produce. Used for glyph volume estimation.
 /// Empty arrays and objects count as 1 (simple values); non-empty containers recurse.
-fn subtree_line_count(value: &TjsonValue) -> usize {
+fn subtree_line_count(value: &Value) -> usize {
     match value {
-        TjsonValue::Array(v) if !v.is_empty() => v.iter().map(subtree_line_count).sum::<usize>() + 1,
-        TjsonValue::Object(e) if !e.is_empty() => {
+        Value::Array(v) if !v.is_empty() => v.iter().map(subtree_line_count).sum::<usize>() + 1,
+        Value::Object(e) if !e.is_empty() => {
             e.iter().map(|entry| subtree_line_count(&entry.value) + 1).sum()
         }
         _ => 1,
@@ -86,25 +86,25 @@ fn subtree_line_count(value: &TjsonValue) -> usize {
 }
 
 /// Rough count of content bytes in a subtree. Used to weight volume in `ByteWeighted` mode.
-fn subtree_byte_count(value: &TjsonValue) -> usize {
+fn subtree_byte_count(value: &Value) -> usize {
     match value {
-        TjsonValue::String(s) => s.len(),
-        TjsonValue::Number(n) => n.to_string().len(),
-        TjsonValue::Bool(b) => if *b { 4 } else { 5 },
-        TjsonValue::Null => 4,
-        TjsonValue::Array(v) => v.iter().map(subtree_byte_count).sum(),
-        TjsonValue::Object(e) => e.iter().map(|entry| entry.key.len() + subtree_byte_count(&entry.value)).sum(),
+        Value::String(s) => s.len(),
+        Value::Number(n) => n.to_string().len(),
+        Value::Bool(b) => if *b { 4 } else { 5 },
+        Value::Null => 4,
+        Value::Array(v) => v.iter().map(subtree_byte_count).sum(),
+        Value::Object(e) => e.iter().map(|entry| entry.key.len() + subtree_byte_count(&entry.value)).sum(),
     }
 }
 
 /// Maximum nesting depth of non-empty containers below this value.
 /// Empty arrays/objects count as 0 (simple values).
-fn subtree_max_depth(value: &TjsonValue) -> usize {
+fn subtree_max_depth(value: &Value) -> usize {
     match value {
-        TjsonValue::Array(v) if !v.is_empty() => {
+        Value::Array(v) if !v.is_empty() => {
             1 + v.iter().map(subtree_max_depth).max().unwrap_or(0)
         }
-        TjsonValue::Object(e) if !e.is_empty() => {
+        Value::Object(e) if !e.is_empty() => {
             1 + e.iter().map(|entry| subtree_max_depth(&entry.value)).max().unwrap_or(0)
         }
         _ => 0,
@@ -112,7 +112,7 @@ fn subtree_max_depth(value: &TjsonValue) -> usize {
 }
 
 /// Returns true if a `/<` indent-offset glyph should be emitted for `value` at `pair_indent`.
-fn should_use_indent_glyph(value: &TjsonValue, pair_indent: usize, options: &TjsonOptions) -> bool {
+fn should_use_indent_glyph(value: &Value, pair_indent: usize, options: &RenderOptions) -> bool {
     let Some(w) = options.wrap_width else { return false; };
     let fold_floor = || {
         let max_depth = subtree_max_depth(value);
@@ -136,7 +136,7 @@ fn should_use_indent_glyph(value: &TjsonValue, pair_indent: usize, options: &Tjs
 
 /// Build the opening glyph line(s) for an indent-offset block.
 /// Returns either `["key: /<"]` or `["key:", "INDENT /<"]` depending on options.
-fn indent_glyph_open_lines(key_line: &str, pair_indent: usize, options: &TjsonOptions) -> Vec<String> {
+fn indent_glyph_open_lines(key_line: &str, pair_indent: usize, options: &RenderOptions) -> Vec<String> {
     match options.indent_glyph_marker_style {
         IndentGlyphMarkerStyle::Compact => vec![format!("{}: /<", key_line)],
         IndentGlyphMarkerStyle::Separate /*| IndentGlyphMarkerStyle::Marked*/ => vec![
@@ -146,7 +146,7 @@ fn indent_glyph_open_lines(key_line: &str, pair_indent: usize, options: &TjsonOp
     }
 }
 
-fn fits_wrap(options: &TjsonOptions, line: &str) -> bool {
+fn fits_wrap(options: &RenderOptions, line: &str) -> bool {
     match options.wrap_width {
         Some(0) | None => true,
         Some(width) => line.chars().count() <= width,
@@ -156,7 +156,7 @@ fn fits_wrap(options: &TjsonOptions, line: &str) -> bool {
 fn pick_preferred_string_array_layout(
     preferred: Option<Vec<String>>,
     fallback: Option<Vec<String>>,
-    options: &TjsonOptions,
+    options: &RenderOptions,
 ) -> Option<Vec<String>> {
     match (preferred, fallback) {
         (Some(preferred), Some(fallback))
@@ -197,7 +197,7 @@ impl PartialEq for StringArrayLayoutScore {
 
 impl Eq for StringArrayLayoutScore {}
 
-fn string_array_layout_score(lines: &[String], options: &TjsonOptions) -> StringArrayLayoutScore {
+fn string_array_layout_score(lines: &[String], options: &RenderOptions) -> StringArrayLayoutScore {
     let overflow = match options.wrap_width {
         Some(0) | None => 0,
         Some(width) => lines
@@ -214,7 +214,7 @@ fn string_array_layout_score(lines: &[String], options: &TjsonOptions) -> String
 }
 
 
-pub(crate) fn render_key(key: &str, options: &TjsonOptions) -> String {
+pub(crate) fn render_key(key: &str, options: &RenderOptions) -> String {
     if options.bare_keys == BareStyle::Prefer
         && parse_bare_key_prefix(key).is_some_and(|end| end == key.len())
     {
@@ -225,9 +225,9 @@ pub(crate) fn render_key(key: &str, options: &TjsonOptions) -> String {
 }
 
 
-pub(crate) fn needs_explicit_array_marker(value: &TjsonValue) -> bool {
-    matches!(value, TjsonValue::Array(values) if !values.is_empty())
-        || matches!(value, TjsonValue::Object(entries) if !entries.is_empty())
+pub(crate) fn needs_explicit_array_marker(value: &Value) -> bool {
+    matches!(value, Value::Array(values) if !values.is_empty())
+        || matches!(value, Value::Object(entries) if !entries.is_empty())
 }
 
 
@@ -272,7 +272,6 @@ fn split_multiline_fold(text: &str, avail: usize, style: FoldStyle) -> Vec<&str>
 /// Find the last safe byte position to split a JSON-encoded string, not mid-escape.
 /// `split_at` is the desired split position. May return a smaller value if `split_at`
 /// would land in the middle of a `\uXXXX` or `\X` escape.
-
 fn fold_bare_string(
     value: &str,
     indent: usize,
@@ -403,7 +402,6 @@ fn fold_bare_key(
 /// Auto mode: prefers splitting before `.` or `e`/`E` (keeping the semantic marker with the
 /// continuation); falls back to splitting between any two digits at the limit.
 /// Returns a byte offset (1..avail), or 0 if no valid point found.
-
 fn fold_number(
     value: &str,
     indent: usize,
@@ -487,7 +485,6 @@ fn fold_number(
 }
 
 /// Character class used by [`find_bare_fold_point`] to assign break priorities.
-
 fn fold_json_string(
     value: &str,
     indent: usize,
@@ -578,8 +575,7 @@ fn fold_json_string(
 }
 
 /// Count consecutive backslashes immediately before `pos` in `bytes`.
-
-fn render_folding_quotes(value: &str, indent: usize, options: &TjsonOptions) -> Vec<String> {
+fn render_folding_quotes(value: &str, indent: usize, options: &RenderOptions) -> Vec<String> {
     let ind = spaces(indent);
     let pieces: Vec<&str> = value.split('\n').collect();
     // Encode each piece's inner content (no outer quotes, no \n — we add \n explicitly).
@@ -620,48 +616,47 @@ fn render_folding_quotes(value: &str, indent: usize, options: &TjsonOptions) -> 
 /// The fold must happen within a cell's string value, between the first and last
 /// data character (spec: "between the first data character... and the last data character").
 /// Returns `(before_fold, after_fold)` or `None` if no valid fold point is found.
-
 enum PackedToken {
     /// A flat inline token string (number, null, bool, short string, empty array/object).
     /// Also carries the original value for lone-overflow fold fallback.
-    Inline(String, TjsonValue),
+    Inline(String, Value),
     /// A block element (multiline string, nonempty array, nonempty object) that interrupts
     /// packing. Carries the original value; rendered lazily at the right continuation indent.
-    Block(TjsonValue),
+    Block(Value),
 }
 
 pub(crate) struct Renderer;
 
 impl Renderer {
-    pub(crate) fn render(value: &TjsonValue, options: &TjsonOptions) -> Result<String> {
+    pub(crate) fn render(value: &Value, options: &RenderOptions) -> Result<String> {
         let lines = Self::render_root(value, options, options.start_indent)?;
         Ok(lines.join("\n"))
     }
 
     fn render_root(
-        value: &TjsonValue,
-        options: &TjsonOptions,
+        value: &Value,
+        options: &RenderOptions,
         start_indent: usize,
     ) -> Result<Vec<String>> {
         match value {
-            TjsonValue::Null
-            | TjsonValue::Bool(_)
-            | TjsonValue::Number(_)
-            | TjsonValue::String(_) => Ok(Self::render_scalar_lines(value, start_indent, options)?),
-            TjsonValue::Array(values) if values.is_empty() => {
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::String(_) => Ok(Self::render_scalar_lines(value, start_indent, options)?),
+            Value::Array(values) if values.is_empty() => {
                 Ok(Self::render_scalar_lines(value, start_indent, options)?)
             }
-            TjsonValue::Object(entries) if entries.is_empty() => {
+            Value::Object(entries) if entries.is_empty() => {
                 Ok(Self::render_scalar_lines(value, start_indent, options)?)
             }
-            TjsonValue::Array(values) if effective_force_markers(options) => {
+            Value::Array(values) if effective_force_markers(options) => {
                 Self::render_explicit_array(values, start_indent, options)
             }
-            TjsonValue::Array(values) => Self::render_implicit_array(values, start_indent, options),
-            TjsonValue::Object(entries) if effective_force_markers(options) => {
+            Value::Array(values) => Self::render_implicit_array(values, start_indent, options),
+            Value::Object(entries) if effective_force_markers(options) => {
                 Self::render_explicit_object(entries, start_indent, options)
             }
-            TjsonValue::Object(entries) => {
+            Value::Object(entries) => {
                 Self::render_implicit_object(entries, start_indent, options)
             }
         }
@@ -670,7 +665,7 @@ impl Renderer {
     fn render_implicit_object(
         entries: &[Entry],
         parent_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         let pair_indent = parent_indent + 2;
         let mut lines = Vec::new();
@@ -709,9 +704,9 @@ impl Renderer {
 
     fn render_object_entry(
         key: &str,
-        value: &TjsonValue,
+        value: &Value,
         pair_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         let is_bare = options.bare_keys == BareStyle::Prefer
             && parse_bare_key_prefix(key).is_some_and(|end| end == key.len());
@@ -776,13 +771,13 @@ impl Renderer {
     /// content is correctly fitted to `wrap_width - pair_indent - 2 - (leading space if bare)`.
     /// The caller prefixes the first element's content (after stripping `pair_indent`) with "/ ".
     fn render_scalar_value_continuation_lines(
-        value: &TjsonValue,
+        value: &Value,
         pair_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         match value {
-            TjsonValue::String(s) => Self::render_string_lines(s, pair_indent, 2, options),
-            TjsonValue::Number(n) => {
+            Value::String(s) => Self::render_string_lines(s, pair_indent, 2, options),
+            Value::Number(n) => {
                 let ns = n.to_string();
                 if let Some(folds) = fold_number(&ns, pair_indent, 2, options.number_fold_style, options.wrap_width) {
                     Ok(folds)
@@ -796,18 +791,18 @@ impl Renderer {
 
     fn render_object_entry_body(
         key_text: &str,
-        value: &TjsonValue,
+        value: &Value,
         pair_indent: usize,
         key_fold_enabled: bool,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         match value {
-            TjsonValue::Array(values) if !values.is_empty() => {
+            Value::Array(values) if !values.is_empty() => {
                 if effective_tables(options)
                     && let Some(table_lines) = Self::render_table(values, pair_indent, options)? {
                         if let Some(target_indent) = table_unindent_target(pair_indent, &table_lines, options) {
                             let Some(offset_lines) = Self::render_table(values, target_indent, options)? else {
-                                return Err(crate::Error::Render(
+                                return Err(Error::Render(
                                     "table eligible at natural indent failed to re-render at offset indent".into(),
                                 ));
                             };
@@ -815,8 +810,8 @@ impl Renderer {
                             let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
                             if effective_force_markers(options) {
                                 let elem_indent = target_indent + 2;
-                                let first = offset_lines.first().ok_or_else(|| Error::Render("empty table".to_owned()))?;
-                                let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".to_owned()))?;
+                                let first = offset_lines.first().ok_or_else(|| Error::Render("empty table".into()))?;
+                                let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".into()))?;
                                 lines.push(format!("{}[ {}", spaces(target_indent), stripped));
                                 lines.extend(offset_lines.into_iter().skip(1));
                             } else {
@@ -828,8 +823,8 @@ impl Renderer {
                         let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
                         if effective_force_markers(options) {
                             let elem_indent = pair_indent + 2;
-                            let first = table_lines.first().ok_or_else(|| Error::Render("empty table".to_owned()))?;
-                            let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".to_owned()))?;
+                            let first = table_lines.first().ok_or_else(|| Error::Render("empty table".into()))?;
+                            let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".into()))?;
                             lines.push(format!("{}[ {}", spaces(pair_indent), stripped));
                             lines.extend(table_lines.into_iter().skip(1));
                         } else {
@@ -852,8 +847,8 @@ impl Renderer {
 
                 if effective_inline_arrays(options) {
                     let all_simple = values.iter().all(|v| match v {
-                        TjsonValue::Array(a) => a.is_empty(),
-                        TjsonValue::Object(o) => o.is_empty(),
+                        Value::Array(a) => a.is_empty(),
+                        Value::Object(o) => o.is_empty(),
                         _ => true,
                     });
                     if all_simple
@@ -883,7 +878,7 @@ impl Renderer {
                 }
                 Ok(lines)
             }
-            TjsonValue::Object(entries) if !entries.is_empty() => {
+            Value::Object(entries) if !entries.is_empty() => {
                 if should_use_indent_glyph(value, pair_indent, options) {
                     let key_line = format!("{}{}", spaces(pair_indent), key_text);
                     let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
@@ -901,7 +896,7 @@ impl Renderer {
                 Ok(lines)
             }
             _ => {
-                let scalar_lines = if let TjsonValue::String(s) = value {
+                let scalar_lines = if let Value::String(s) = value {
                     Self::render_string_lines(s, pair_indent, key_text.len() + 1, options)?
                 } else {
                     Self::render_scalar_lines(value, pair_indent, options)?
@@ -937,9 +932,9 @@ impl Renderer {
     }
 
     fn render_implicit_array(
-        values: &[TjsonValue],
+        values: &[Value],
         parent_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         if effective_tables(options)
             && let Some(lines) = Self::render_table(values, parent_indent, options)? {
@@ -965,10 +960,10 @@ impl Renderer {
             let mut lines = Vec::new();
             let first = &element_lines[0];
             let first_line = first.first().ok_or_else(|| {
-                Error::Render("expected at least one array element line".to_owned())
+                Error::Render("expected at least one array element line".into())
             })?;
             let stripped = first_line.get(elem_indent..).ok_or_else(|| {
-                Error::Render("failed to align the explicit outer array marker".to_owned())
+                Error::Render("failed to align the explicit outer array marker".into())
             })?;
             lines.push(format!("{}[ {}", spaces(parent_indent), stripped));
             lines.extend(first.iter().skip(1).cloned());
@@ -982,9 +977,9 @@ impl Renderer {
     }
 
     fn render_array_children(
-        values: &[TjsonValue],
+        values: &[Value],
         elem_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         let mut lines = Vec::new();
         let table_row_prefix = format!("{}|", spaces(elem_indent));
@@ -1006,17 +1001,17 @@ impl Renderer {
     }
 
     fn render_explicit_array(
-        values: &[TjsonValue],
+        values: &[Value],
         marker_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         if effective_tables(options)
             && let Some(lines) = Self::render_table(values, marker_indent, options)? {
                 // Always prepend "[ " — render_explicit_array always needs its marker,
                 // whether the elements render as a table or in any other form.
                 let elem_indent = marker_indent + 2;
-                let first = lines.first().ok_or_else(|| Error::Render("empty table".to_owned()))?;
-                let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".to_owned()))?;
+                let first = lines.first().ok_or_else(|| Error::Render("empty table".into()))?;
+                let stripped = first.get(elem_indent..).ok_or_else(|| Error::Render("failed to align table marker".into()))?;
                 let mut out = vec![format!("{}[ {}", spaces(marker_indent), stripped)];
                 out.extend(lines.into_iter().skip(1));
                 return Ok(out);
@@ -1039,13 +1034,13 @@ impl Renderer {
         }
         let first = element_lines
             .first()
-            .ok_or_else(|| Error::Render("explicit arrays must be nonempty".to_owned()))?;
+            .ok_or_else(|| Error::Render("explicit arrays must be nonempty".into()))?;
         let first_line = first
             .first()
-            .ok_or_else(|| Error::Render("expected at least one explicit array line".to_owned()))?;
+            .ok_or_else(|| Error::Render("expected at least one explicit array line".into()))?;
         let stripped = first_line
             .get(elem_indent..)
-            .ok_or_else(|| Error::Render("failed to align an explicit array marker".to_owned()))?;
+            .ok_or_else(|| Error::Render("failed to align an explicit array marker".into()))?;
         let mut lines = vec![format!("{}[ {}", spaces(marker_indent), stripped)];
         lines.extend(first.iter().skip(1).cloned());
         for extra in element_lines.iter().skip(1) {
@@ -1057,28 +1052,27 @@ impl Renderer {
     fn render_explicit_object(
         entries: &[Entry],
         marker_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         let pair_indent = marker_indent + 2;
         let implicit_lines = Self::render_implicit_object(entries, marker_indent, options)?;
-        let first_line = implicit_lines.first().ok_or_else(|| {
-            Error::Render("expected at least one explicit object line".to_owned())
-        })?;
+        let first_line = implicit_lines.first()
+            .ok_or_else(|| Error::Render("expected at least one explicit object line".into()))?;
         let stripped = first_line
             .get(pair_indent..)
-            .ok_or_else(|| Error::Render("failed to align an explicit object marker".to_owned()))?;
+            .ok_or_else(|| Error::Render("failed to align an explicit object marker".into()))?;
         let mut lines = vec![format!("{}{{ {}", spaces(marker_indent), stripped)];
         lines.extend(implicit_lines.into_iter().skip(1));
         Ok(lines)
     }
 
     fn render_array_element(
-        value: &TjsonValue,
+        value: &Value,
         elem_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         match value {
-            TjsonValue::Array(values) if !values.is_empty() => {
+            Value::Array(values) if !values.is_empty() => {
                 if should_use_indent_glyph(value, elem_indent, options) {
                     let mut lines = vec![format!("{} /<", spaces(elem_indent))];
                     if values.first().is_some_and(needs_explicit_array_marker) {
@@ -1091,7 +1085,7 @@ impl Renderer {
                 }
                 Self::render_explicit_array(values, elem_indent, options)
             }
-            TjsonValue::Object(entries) if !entries.is_empty() => {
+            Value::Object(entries) if !entries.is_empty() => {
                 Self::render_explicit_object(entries, elem_indent, options)
             }
             _ => Self::render_scalar_lines(value, elem_indent, options),
@@ -1099,41 +1093,40 @@ impl Renderer {
     }
 
     fn render_scalar_lines(
-        value: &TjsonValue,
+        value: &Value,
         indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         match value {
-            TjsonValue::Null => Ok(vec![format!("{}null", spaces(indent))]),
-            TjsonValue::Bool(value) => Ok(vec![format!(
+            Value::Null => Ok(vec![format!("{}null", spaces(indent))]),
+            Value::Bool(value) => Ok(vec![format!(
                 "{}{}",
                 spaces(indent),
                 if *value { "true" } else { "false" }
             )]),
-            TjsonValue::Number(value) => {
+            Value::Number(value) => {
                 let s = value.to_string();
                 if let Some(lines) = fold_number(&s, indent, 0, options.number_fold_style, options.wrap_width) {
                     return Ok(lines);
                 }
                 Ok(vec![format!("{}{}", spaces(indent), s)])
             }
-            TjsonValue::String(value) => Self::render_string_lines(value, indent, 0, options),
-            TjsonValue::Array(values) => {
+            Value::String(value) => Self::render_string_lines(value, indent, 0, options),
+            Value::Array(values) => {
                 if values.is_empty() {
                     Ok(vec![format!("{}[]", spaces(indent))])
                 } else {
                     Err(Error::Render(
-                        "nonempty arrays must be rendered through array context".to_owned(),
+                        "nonempty arrays must be rendered through array context".into(),
                     ))
                 }
             }
-            TjsonValue::Object(entries) => {
+            Value::Object(entries) => {
                 if entries.is_empty() {
                     Ok(vec![format!("{}{{}}", spaces(indent))])
                 } else {
                     Err(Error::Render(
-                        "nonempty objects must be rendered through object or array context"
-                            .to_owned(),
+                        "nonempty objects must be rendered through object or array context".into(),
                     ))
                 }
             }
@@ -1144,7 +1137,7 @@ impl Renderer {
         value: &str,
         indent: usize,
         first_line_extra: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Vec<String>> {
         if value.is_empty() {
             return Ok(vec![format!("{}\"\"", spaces(indent))]);
@@ -1345,8 +1338,8 @@ impl Renderer {
 
     fn render_inline_object_token(
         key: &str,
-        value: &TjsonValue,
-        options: &TjsonOptions,
+        value: &Value,
+        options: &RenderOptions,
     ) -> Result<Option<String>> {
         let Some(value_text) = Self::render_scalar_token(value, options)? else {
             return Ok(None);
@@ -1354,18 +1347,18 @@ impl Renderer {
         Ok(Some(format!("{}:{}", render_key(key, options), value_text)))
     }
 
-    fn render_scalar_token(value: &TjsonValue, options: &TjsonOptions) -> Result<Option<String>> {
+    fn render_scalar_token(value: &Value, options: &RenderOptions) -> Result<Option<String>> {
         let rendered = match value {
-            TjsonValue::Null => "null".to_owned(),
-            TjsonValue::Bool(value) => {
+            Value::Null => "null".to_owned(),
+            Value::Bool(value) => {
                 if *value {
                     "true".to_owned()
                 } else {
                     "false".to_owned()
                 }
             }
-            TjsonValue::Number(value) => value.to_string(),
-            TjsonValue::String(value) => {
+            Value::Number(value) => value.to_string(),
+            Value::String(value) => {
                 if value.contains('\n') || value.contains('\r') {
                     return Ok(None);
                 }
@@ -1375,19 +1368,19 @@ impl Renderer {
                     render_json_string(value)
                 }
             }
-            TjsonValue::Array(values) if values.is_empty() => "[]".to_owned(),
-            TjsonValue::Object(entries) if entries.is_empty() => "{}".to_owned(),
-            TjsonValue::Array(_) | TjsonValue::Object(_) => return Ok(None),
+            Value::Array(values) if values.is_empty() => "[]".to_owned(),
+            Value::Object(entries) if entries.is_empty() => "{}".to_owned(),
+            Value::Array(_) | Value::Object(_) => return Ok(None),
         };
 
         Ok(Some(rendered))
     }
 
     fn render_packed_array_lines(
-        values: &[TjsonValue],
+        values: &[Value],
         first_prefix: String,
         continuation_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Option<Vec<String>>> {
         if values.is_empty() {
             return Ok(Some(vec![format!("{first_prefix}[]")]));
@@ -1395,7 +1388,7 @@ impl Renderer {
 
         if values
             .iter()
-            .all(|value| matches!(value, TjsonValue::String(_)))
+            .all(|value| matches!(value, Value::String(_)))
         {
             return Self::render_string_array_lines(
                 values,
@@ -1410,10 +1403,10 @@ impl Renderer {
     }
 
     fn render_string_array_lines(
-        values: &[TjsonValue],
+        values: &[Value],
         first_prefix: String,
         continuation_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Option<Vec<String>>> {
         match options.string_array_style {
             StringArrayStyle::None => Ok(None),
@@ -1479,23 +1472,23 @@ impl Renderer {
     }
 
     fn render_packed_array_tokens(
-        values: &[TjsonValue],
-        options: &TjsonOptions,
+        values: &[Value],
+        options: &RenderOptions,
     ) -> Result<Vec<PackedToken>> {
         let mut tokens = Vec::new();
         for value in values {
             let token = match value {
                 // Multiline strings are block elements — cannot be packed inline.
-                TjsonValue::String(text) if text.contains('\n') || text.contains('\r') => {
+                Value::String(text) if text.contains('\n') || text.contains('\r') => {
                     PackedToken::Block(value.clone())
                 }
                 // Nonempty arrays and objects are block elements.
-                TjsonValue::Array(vals) if !vals.is_empty() => PackedToken::Block(value.clone()),
-                TjsonValue::Object(entries) if !entries.is_empty() => {
+                Value::Array(vals) if !vals.is_empty() => PackedToken::Block(value.clone()),
+                Value::Object(entries) if !entries.is_empty() => {
                     PackedToken::Block(value.clone())
                 }
                 // Inline string: force JSON quoting for comma-like chars to avoid parse ambiguity.
-                TjsonValue::String(text) => {
+                Value::String(text) => {
                     let token_str = if text.chars().any(is_comma_like) {
                         render_json_string(text)
                     } else {
@@ -1520,18 +1513,18 @@ impl Renderer {
     /// Returns `Some(lines)` (with 2+ lines) when fold succeeded, `None` when it didn't
     /// (value fits or fold is disabled / below MIN_FOLD_CONTINUATION).
     fn fold_packed_inline(
-        value: &TjsonValue,
+        value: &Value,
         continuation_indent: usize,
         first_line_extra: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Option<Vec<String>>> {
         match value {
-            TjsonValue::String(s) => {
+            Value::String(s) => {
                 let lines =
                     Self::render_string_lines(s, continuation_indent, first_line_extra, options)?;
                 Ok(if lines.len() > 1 { Some(lines) } else { None })
             }
-            TjsonValue::Number(n) => {
+            Value::Number(n) => {
                 let ns = n.to_string();
                 Ok(
                     fold_number(
@@ -1553,17 +1546,17 @@ impl Renderer {
         first_prefix: String,
         continuation_indent: usize,
         string_spaces_mode: bool,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Option<Vec<String>>> {
         if tokens.is_empty() {
             return Ok(Some(vec![first_prefix]));
         }
 
         // If the prefix alone already fills or exceeds wrap_width, no token can fit inline.
-        if let Some(w) = options.wrap_width {
-            if first_prefix.len() >= w {
-                return Ok(None);
-            }
+        if let Some(w) = options.wrap_width
+            && first_prefix.len() >= w
+        {
+            return Ok(None);
         }
 
         // Spaces mode is incompatible with block elements (which are never strings).
@@ -1592,13 +1585,13 @@ impl Renderer {
                     }
 
                     let block_lines = match &value {
-                        TjsonValue::String(s) => {
+                        Value::String(s) => {
                             Self::render_string_lines(s, continuation_indent, 0, options)?
                         }
-                        TjsonValue::Array(vals) if !vals.is_empty() => {
+                        Value::Array(vals) if !vals.is_empty() => {
                             Self::render_explicit_array(vals, continuation_indent, options)?
                         }
-                        TjsonValue::Object(entries) if !entries.is_empty() => {
+                        Value::Object(entries) if !entries.is_empty() => {
                             Self::render_explicit_object(entries, continuation_indent, options)?
                         }
                         _ => unreachable!("PackedToken::Block must contain a block value"),
@@ -1707,9 +1700,9 @@ impl Renderer {
     }
 
     fn render_table(
-        values: &[TjsonValue],
+        values: &[Value],
         parent_indent: usize,
-        options: &TjsonOptions,
+        options: &RenderOptions,
     ) -> Result<Option<Vec<String>>> {
         if values.len() < options.table_min_rows {
             return Ok(None);
@@ -1724,14 +1717,14 @@ impl Renderer {
         let mut first_row_keys: Option<Vec<&str>> = None;
 
         for value in values {
-            let TjsonValue::Object(entries) = value else {
+            let Value::Object(entries) = value else {
                 return Ok(None);
             };
             present_cells += entries.len();
             for Entry { key, value: cell } in entries {
-                if matches!(cell, TjsonValue::Array(inner) if !inner.is_empty())
-                    || matches!(cell, TjsonValue::Object(inner) if !inner.is_empty())
-                    || matches!(cell, TjsonValue::String(text) if text.contains('\n') || text.contains('\r'))
+                if matches!(cell, Value::Array(inner) if !inner.is_empty())
+                    || matches!(cell, Value::Object(inner) if !inner.is_empty())
+                    || matches!(cell, Value::String(text) if text.contains('\n') || text.contains('\r'))
                 {
                     return Ok(None);
                 }
@@ -1768,7 +1761,7 @@ impl Renderer {
         }
 
         for value in values {
-            let TjsonValue::Object(entries) = value else {
+            let Value::Object(entries) = value else {
                 return Ok(None);
             };
             let mut row: Vec<String> = Vec::new();
@@ -1874,18 +1867,18 @@ impl Renderer {
     }
 
     fn render_table_cell_token(
-        value: &TjsonValue,
-        options: &TjsonOptions,
+        value: &Value,
+        options: &RenderOptions,
     ) -> Result<Option<String>> {
         Ok(match value {
-            TjsonValue::Null => Some("null".to_owned()),
-            TjsonValue::Bool(value) => Some(if *value {
+            Value::Null => Some("null".to_owned()),
+            Value::Bool(value) => Some(if *value {
                 "true".to_owned()
             } else {
                 "false".to_owned()
             }),
-            TjsonValue::Number(value) => Some(value.to_string()),
-            TjsonValue::String(value) => {
+            Value::Number(value) => Some(value.to_string()),
+            Value::String(value) => {
                 if value.contains('\n') || value.contains('\r') {
                     None
                 } else if options.bare_strings == BareStyle::Prefer
@@ -1900,8 +1893,8 @@ impl Renderer {
                     Some(render_json_string(value))
                 }
             }
-            TjsonValue::Array(values) if values.is_empty() => Some("[]".to_owned()),
-            TjsonValue::Object(entries) if entries.is_empty() => Some("{}".to_owned()),
+            Value::Array(values) if values.is_empty() => Some("[]".to_owned()),
+            Value::Object(entries) if entries.is_empty() => Some("{}".to_owned()),
             _ => None,
         })
     }

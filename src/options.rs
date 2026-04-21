@@ -58,7 +58,7 @@ pub enum IndentGlyphMarkerStyle {
 }
 
 /// Internal resolved glyph algorithm. Mapped from [`IndentGlyphStyle`] by `indent_glyph_mode()`.
-/// Not part of the public API — use [`IndentGlyphStyle`] and [`TjsonOptions`] instead.
+/// Not part of the public API — use [`IndentGlyphStyle`] and [`RenderOptions`] instead.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum IndentGlyphMode {
@@ -74,7 +74,7 @@ pub(crate) enum IndentGlyphMode {
     None,
 }
 
-pub(crate) fn indent_glyph_mode(options: &TjsonOptions) -> IndentGlyphMode {
+pub(crate) fn indent_glyph_mode(options: &RenderOptions) -> IndentGlyphMode {
     match options.indent_glyph_style {
         IndentGlyphStyle::Auto  => IndentGlyphMode::IndentWeighted(0.2),
         IndentGlyphStyle::Fixed => IndentGlyphMode::Fixed,
@@ -123,19 +123,20 @@ impl FromStr for TableUnindentStyle {
 
 
 #[non_exhaustive]
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct ParseOptions {
     start_indent: usize,
 }
 
-/// Options controlling how TJSON is rendered. Use [`TjsonOptions::default`] for sensible
-/// defaults, or [`TjsonOptions::canonical`] for a compact, diff-friendly format.
+/// Options controlling how TJSON is rendered. Use [`RenderOptions::default`] for sensible
+/// defaults, or [`RenderOptions::canonical`] for a compact, diff-friendly format.
 /// All fields are set via builder methods.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct TjsonOptions {
+pub struct RenderOptions {
     pub(crate) wrap_width: Option<usize>,
     pub(crate) start_indent: usize,
     pub(crate) force_markers: bool,
@@ -322,7 +323,7 @@ impl FromStr for StringArrayStyle {
     }
 }
 
-impl TjsonOptions {
+impl RenderOptions {
     /// Returns options that produce canonical TJSON: one key-value pair per line,
     /// no inline packing, no tables, no multiline strings, no folding.
     pub fn canonical() -> Self {
@@ -554,7 +555,7 @@ impl TjsonOptions {
     }
 }
 
-impl Default for TjsonOptions {
+impl Default for RenderOptions {
     fn default() -> Self {
         Self {
             start_indent: 0,
@@ -660,7 +661,7 @@ mod camel_de {
 }
 
 /// A camelCase-deserializable options bag for WASM/JS and test configs.
-/// Not part of the public Rust API — use [`TjsonOptions`] directly in Rust code.
+/// Not part of the public Rust API — use [`RenderOptions`] directly in Rust code.
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -706,9 +707,9 @@ pub struct TjsonConfig {
     pub(crate) kv_pack_multiple: Option<usize>,
 }
 
-impl From<TjsonConfig> for TjsonOptions {
+impl From<TjsonConfig> for RenderOptions {
     fn from(c: TjsonConfig) -> Self {
-        let mut opts = if c.canonical { TjsonOptions::canonical() } else { TjsonOptions::default() };
+        let mut opts = if c.canonical { RenderOptions::canonical() } else { RenderOptions::default() };
         if let Some(v) = c.force_markers      { opts = opts.force_markers(v); }
         if let Some(w) = c.wrap_width         { opts = opts.wrap_width(if w == 0 { None } else { Some(w) }); }
         if let Some(v) = c.bare_strings       { opts = opts.bare_strings(v); }

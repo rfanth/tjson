@@ -1,5 +1,5 @@
 use std::path::Path;
-use tjson::{TjsonConfig, TjsonOptions, TjsonValue};
+use tjson::{TjsonConfig, RenderOptions, Value};
 
 fn tests_dir() -> std::path::PathBuf {
     let pathbuf = if let Ok(p) = std::env::var("TJSON_TESTS_DIR") {
@@ -50,7 +50,7 @@ fn parse_valid() {
             }
         };
 
-        let parsed: TjsonValue = match tjson_src.parse() {
+        let parsed: Value = match tjson_src.parse() {
             Ok(v) => v,
             Err(e) => {
                 failures.push(format!("{}: parse error: {}", stem, e));
@@ -74,13 +74,7 @@ fn parse_valid() {
             }
         };
 
-        let actual_json = match parsed.to_json() {
-            Ok(v) => v,
-            Err(e) => {
-                failures.push(format!("{}: to_json error: {}", stem, e));
-                continue;
-            }
-        };
+        let actual_json: serde_json::Value = serde_json::from_str(&parsed.to_json()).unwrap();
 
         if actual_json != expected_json {
             failures.push(format!(
@@ -131,7 +125,7 @@ fn parse_invalid() {
             }
         };
 
-        match tjson_src.parse::<TjsonValue>() {
+        match tjson_src.parse::<Value>() {
             Ok(v) => {
                 failures.push(format!(
                     "{}: expected parse error but got: {:?}",
@@ -186,7 +180,7 @@ fn roundtrip() {
         };
 
         // parse
-        let parsed: TjsonValue = match tjson_src.parse() {
+        let parsed: Value = match tjson_src.parse() {
             Ok(v) => v,
             Err(e) => {
                 failures.push(format!("{}: parse error: {}", stem, e));
@@ -194,25 +188,13 @@ fn roundtrip() {
             }
         };
 
-        let original_json = match parsed.to_json() {
-            Ok(v) => v,
-            Err(e) => {
-                failures.push(format!("{}: to_json error: {}", stem, e));
-                continue;
-            }
-        };
+        let original_json: serde_json::Value = serde_json::from_str(&parsed.to_json()).unwrap();
 
         // render
-        let rendered = match parsed.to_tjson_with(TjsonOptions::default()) {
-            Ok(s) => s,
-            Err(e) => {
-                failures.push(format!("{}: render error: {}", stem, e));
-                continue;
-            }
-        };
+        let rendered = parsed.to_tjson_with(RenderOptions::default());
 
         // reparse
-        let reparsed: TjsonValue = match rendered.parse() {
+        let reparsed: Value = match rendered.parse() {
             Ok(v) => v,
             Err(e) => {
                 failures.push(format!("{}: reparse error: {}", stem, e));
@@ -220,13 +202,7 @@ fn roundtrip() {
             }
         };
 
-        let reparsed_json = match reparsed.to_json() {
-            Ok(v) => v,
-            Err(e) => {
-                failures.push(format!("{}: reparsed to_json error: {}", stem, e));
-                continue;
-            }
-        };
+        let reparsed_json: serde_json::Value = serde_json::from_str(&reparsed.to_json()).unwrap();
 
         if original_json != reparsed_json {
             failures.push(format!(
@@ -279,7 +255,7 @@ fn render() {
                 continue;
             }
         };
-        let options: TjsonOptions = config.into();
+        let options: RenderOptions = config.into();
 
         let json_entries: Vec<_> = std::fs::read_dir(&subdir)
             .expect("cannot read subdir")
@@ -314,15 +290,9 @@ fn render() {
                 }
             };
 
-            let tjson_val = TjsonValue::from(json_val);
+            let tjson_val = Value::from(json_val);
 
-            let rendered = match tjson_val.to_tjson_with(options.clone()) {
-                Ok(s) => s,
-                Err(e) => {
-                    failures.push(format!("{}: render error: {}", test_name, e));
-                    continue;
-                }
-            };
+            let rendered = tjson_val.to_tjson_with(options.clone());
 
             let expected_raw = match std::fs::read_to_string(&tjson_path) {
                 Ok(s) => s,
