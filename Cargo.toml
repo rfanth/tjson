@@ -1,6 +1,6 @@
 [package]
 name = "tjson-rs"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
 description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"

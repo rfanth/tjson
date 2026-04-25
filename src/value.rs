@@ -3,8 +3,133 @@ use std::fmt;
 use crate::error::{Error, Result};
 use crate::number::Number;
 use crate::options::RenderOptions;
-use crate::parse::ParseOptions;
+use crate::parse::{MultilineLocalEol, ParseOptions};
 use crate::render::Renderer;
+use crate::util::{
+    is_allowed_bare_string, /*is_comma_like,*/ is_forbidden_literal_tjson_char, is_pipe_like,
+    is_reserved_word, parse_bare_key_prefix,
+};
+
+/// Single-pass string classifier. Carries the original `&str` plus all renderer-relevant
+/// boolean flags so callers can classify once and branch without re-scanning.
+#[derive(Clone, Copy)]
+pub(crate) struct StrMeta<'a> {
+    pub(crate) s: &'a str,
+    /// `true` when the string contains at least one `\n` (covers both LF and CRLF lines).
+    pub(crate) has_eol: bool,
+    /// `Some(Lf)` / `Some(CrLf)` when newlines are uniform; `None` when mixed or absent.
+    pub(crate) eol_type: Option<MultilineLocalEol>,
+    /// `true` when the string contains any char that is forbidden in literal TJSON strings.
+    pub(crate) has_forbidden_literal: bool,
+    /// `true` when `is_allowed_bare_string` would return `true`.
+    pub(crate) is_bare_eligible: bool,
+    /// `true` when the string matches a reserved word ("true", "false", "null", "[]", "{}", "\"\"").
+    pub(crate) is_reserved_word: bool,
+    /// `true` when the string contains at least one pipe-like character.
+    pub(crate) has_pipe_like: bool,
+    // /// `true` when the string contains at least one comma-like character.
+    //pub(crate) has_comma_like: bool,
+}
+
+impl<'a> StrMeta<'a> {
+    pub(crate) fn new(s: &'a str) -> Self {
+        let has_eol = s.as_bytes().contains(&b'\n');
+        let eol_type = if has_eol { detect_multiline_local_eol(s) } else { Some(MultilineLocalEol::default()) };
+        let has_forbidden_literal = s.chars().any(is_forbidden_literal_tjson_char);
+        let is_bare_eligible = is_allowed_bare_string(s);
+        let is_reserved_word = is_reserved_word(s);
+        let has_pipe_like = s.chars().any(is_pipe_like);
+        // let has_comma_like = s.chars().any(is_comma_like);
+        StrMeta { s, has_eol, eol_type, has_forbidden_literal, is_bare_eligible, is_reserved_word, has_pipe_like/*, has_comma_like*/ }
+    }
+}
+
+/// A `&str` guaranteed to satisfy the TJSON bare-string rules (rendereable without quoting).
+#[allow(dead_code)]
+pub(crate) struct BareString<'a>(StrMeta<'a>);
+
+#[allow(dead_code)]
+impl<'a> BareString<'a> {
+    pub(crate) fn new(s: &'a str) -> Option<Self> {
+        let meta = StrMeta::new(s);
+        if meta.is_bare_eligible { Some(BareString(meta)) } else { None }
+    }
+
+    pub(crate) fn meta(&self) -> &StrMeta<'a> { &self.0 }
+}
+
+impl<'a> std::ops::Deref for BareString<'a> {
+    type Target = str;
+    fn deref(&self) -> &str { self.0.s }
+}
+
+/// A `BareString` that is also safe in table cells: not a reserved word, no pipe-like chars.
+///
+/// `TableBareString` is a strict subtype of `BareString` — it can always be used anywhere
+/// a `BareString` is accepted via `Deref`.
+#[allow(dead_code)]
+pub(crate) struct TableBareString<'a>(BareString<'a>);
+
+#[allow(dead_code)]
+impl<'a> TableBareString<'a> {
+    pub(crate) fn new(s: &'a str) -> Option<Self> {
+        let meta = StrMeta::new(s);
+        if meta.is_bare_eligible && !meta.is_reserved_word && !meta.has_pipe_like {
+            Some(TableBareString(BareString(meta)))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for TableBareString<'a> {
+    type Target = BareString<'a>;
+    fn deref(&self) -> &BareString<'a> { &self.0 }
+}
+
+/// A `&str` that can be rendered as a TJSON multiline string: contains newlines (uniform
+/// LF or uniform CRLF) and no forbidden literal characters.
+#[allow(dead_code)]
+pub(crate) struct MultilineString<'a>(StrMeta<'a>);
+
+#[allow(dead_code)]
+impl<'a> MultilineString<'a> {
+    pub(crate) fn new(s: &'a str) -> Option<Self> {
+        let meta = StrMeta::new(s);
+        if meta.has_eol && meta.eol_type.is_some() && !meta.has_forbidden_literal {
+            Some(MultilineString(meta))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn eol(&self) -> MultilineLocalEol { self.0.eol_type.unwrap() }
+}
+
+impl<'a> std::ops::Deref for MultilineString<'a> {
+    type Target = str;
+    fn deref(&self) -> &str { self.0.s }
+}
+
+/// A `&str` guaranteed to satisfy the TJSON bare-key rules.
+#[allow(dead_code)]
+pub(crate) struct BareKey<'a>(&'a str);
+
+#[allow(dead_code)]
+impl<'a> BareKey<'a> {
+    pub(crate) fn new(s: &'a str) -> Option<Self> {
+        if parse_bare_key_prefix(s).is_some_and(|end| end == s.len()) {
+            Some(BareKey(s))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for BareKey<'a> {
+    type Target = str;
+    fn deref(&self) -> &str { self.0 }
+}
 
 /// A single key-value entry in a TJSON object.
 ///
@@ -105,7 +230,7 @@ impl Value {
     /// assert_eq!(s, "  name: Alice\n  age:30");
     /// ```
     pub fn to_tjson_with(&self, options: RenderOptions) -> String {
-        Renderer::render(self, &options).expect("render is infallible")
+        Renderer::render(self, &options)
     }
 
     /// Serialize this value to a JSON string.
@@ -194,5 +319,37 @@ impl std::str::FromStr for Value {
 
     fn from_str(s: &str) -> Result<Self> {
         Self::parse_with(s, ParseOptions::default())
+    }
+}
+
+pub(crate) fn detect_multiline_local_eol(value: &str) -> Option<MultilineLocalEol> {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    let mut saw_lf = false;
+    let mut saw_crlf = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    saw_crlf = true;
+                    index += 2;
+                } else {
+                    return None;
+                }
+            }
+            b'\n' => {
+                saw_lf = true;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    match (saw_lf, saw_crlf) {
+        (false, false) => None,
+        (true, false) => Some(MultilineLocalEol::Lf),
+        (false, true) => Some(MultilineLocalEol::CrLf),
+        (true, true) => None,
     }
 }

@@ -29,8 +29,9 @@ pub(crate) enum ContainerKind {
     Object,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum MultilineLocalEol {
+    #[default]
     Lf,
     CrLf,
 }
@@ -1430,37 +1431,5 @@ fn simple_token_end(content: &str, context: ArrayLineValueContext) -> usize {
         }
         ArrayLineValueContext::ObjectValue => content.find("  ").unwrap_or(content.len()),
         ArrayLineValueContext::SingleValue => content.len(),
-    }
-}
-
-pub(crate) fn detect_multiline_local_eol(value: &str) -> Option<MultilineLocalEol> {
-    let bytes = value.as_bytes();
-    let mut index = 0usize;
-    let mut saw_lf = false;
-    let mut saw_crlf = false;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\r' => {
-                if bytes.get(index + 1) == Some(&b'\n') {
-                    saw_crlf = true;
-                    index += 2;
-                } else {
-                    return None;
-                }
-            }
-            b'\n' => {
-                saw_lf = true;
-                index += 1;
-            }
-            _ => index += 1,
-        }
-    }
-
-    match (saw_lf, saw_crlf) {
-        (false, false) => None,
-        (true, false) => Some(MultilineLocalEol::Lf),
-        (false, true) => Some(MultilineLocalEol::CrLf),
-        (true, true) => None,
     }
 }
