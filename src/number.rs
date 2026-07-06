@@ -12,7 +12,7 @@ use std::str::FromStr;
 /// use tjson::Number;
 ///
 /// let n: Number = "42".parse().unwrap();
-/// let n: Number = "-3.14".parse().unwrap();
+/// let n: Number = "-3.45".parse().unwrap();
 /// let n: Number = "1e100".parse().unwrap();
 ///
 /// assert!(Number::try_from(f64::NAN).is_err());
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn parse_valid() {
-        for s in ["0", "-0", "1", "-1", "42", "3.14", "-3.14", "1e10", "1E10",
+        for s in ["0", "-0", "1", "-1", "42", "3.45", "-3.45", "1e10", "1E10",
                   "1.5e-3", "1.5E+3", "0.0", "99999999999999999999"] {
             assert!(s.parse::<Number>().is_ok(), "expected valid: {s}");
         }
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn roundtrip_string() {
-        for s in ["42", "-3.14", "1e100", "1E10", "99999999999999999999"] {
+        for s in ["42", "-3.45", "1e100", "1E10", "99999999999999999999"] {
             let n: Number = s.parse().unwrap();
             assert_eq!(n.as_str(), s, "roundtrip failed for {s}");
         }
@@ -164,8 +164,8 @@ mod tests {
 
     #[test]
     fn from_f64_finite() {
-        let n = Number::try_from(3.14_f64).unwrap();
-        assert_eq!(n.as_str(), "3.14");
+        let n = Number::try_from(3.45_f64).unwrap();
+        assert_eq!(n.as_str(), "3.45");
     }
 
     #[test]
@@ -185,15 +185,15 @@ mod tests {
         assert_eq!(n.as_i64(), Some(-5));
         assert_eq!(n.as_u64(), None);
 
-        let n: Number = "3.14".parse().unwrap();
+        let n: Number = "3.45".parse().unwrap();
         assert_eq!(n.as_i64(), None);
-        assert!((n.as_f64().unwrap() - 3.14).abs() < 1e-10);
+        assert!((n.as_f64().unwrap() - 3.45).abs() < 1e-10);
     }
 
     #[test]
     fn is_integer() {
         assert!("42".parse::<Number>().unwrap().is_integer());
-        assert!(!"3.14".parse::<Number>().unwrap().is_integer());
+        assert!(!"3.45".parse::<Number>().unwrap().is_integer());
         assert!(!"1e10".parse::<Number>().unwrap().is_integer());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tjson-rs"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
 description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"
@@ -19,6 +19,17 @@ crate-type = ["rlib", "cdylib"]
 [[bin]]
 name = "tjson"
 path = "src/bin/tjson.rs"
+# The CLI converts through the public From<serde_json::Value> impls (both
+# directions) and pretty-prints via serde_json, so it needs the feature.
+# Library consumers with default-features = false never build this target.
+required-features = ["serde_json"]
+
+# The C ABI smoke test (clang + AddressSanitizer against the real cdylib).
+# Gated so plain `cargo test` ignores it; `cargo test --features capi` runs
+# the whole battery including this.
+[[test]]
+name = "capi_smoke"
+required-features = ["capi"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -31,13 +42,16 @@ terminal_size = "0.4"
 [features]
 default = ["serde_json"]
 serde_json = []
-
-[lints.rust]
-unsafe_code = "forbid"
+# C ABI (FFI) bindings — see src/ffi.rs. Off by default. When off, the whole
+# crate keeps #![forbid(unsafe_code)] (enforced in lib.rs, not here, so it can
+# be made conditional on this feature). serde_ignored is used only by the C ABI
+# to reject unknown option fields; it is not compiled into any other build.
+capi = ["dep:serde_ignored"]
 
 [dependencies]
 pico-args = { version = "0.5", features = ["eq-separator"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precision"] }
+serde_ignored = { version = "0.1", optional = true }
 unicode-general-category = "1.0"
 

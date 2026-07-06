@@ -120,14 +120,13 @@ pub(crate) struct LineSpan {
 pub(crate) fn scan_lines(input: &str) -> std::result::Result<Vec<LineSpan>, ParseError> {
     let mut offsets = Vec::new();
     let mut pos = 0usize;
-    let mut line_num = 1usize;
-    for raw in input.split('\n') {
+    for (line_index, raw) in input.split('\n').enumerate() {
         let len = if raw.ends_with('\r') { raw.len() - 1 } else { raw.len() };
         let content = &raw[..len];
         for (col, ch) in content.chars().enumerate() {
             if is_forbidden_literal_tjson_char(ch) {
                 return Err(ParseError::new(
-                    line_num,
+                    line_index + 1,
                     col + 1,
                     format!("forbidden character U+{:04X} must be escaped", ch as u32),
                     None,
@@ -136,7 +135,6 @@ pub(crate) fn scan_lines(input: &str) -> std::result::Result<Vec<LineSpan>, Pars
         }
         offsets.push(LineSpan { start: pos, len });
         pos += raw.len() + 1; // +1 for the '\n'
-        line_num += 1;
     }
     Ok(offsets)
 }
@@ -299,8 +297,7 @@ impl<'a> Parser<'a> {
             loop {
                 // Peek past ignorable lines to find the next meaningful line.
                 let mut offset = 1usize;
-                loop {
-                    let Some(peek) = self.line_str(self.line + offset) else { break; };
+                while let Some(peek) = self.line_str(self.line + offset) {
                     let trimmed = peek.trim_start_matches(' ');
                     if trimmed.starts_with("//") {
                         offset += 1;
@@ -904,10 +901,7 @@ impl<'a> Parser<'a> {
         if content.starts_with('"') && parse_json_string_prefix(content).is_none() {
             let mut json_acc = content.to_owned();
             let mut next = self.line + 1;
-            loop {
-                let Some(fold_line) = self.line_str(next) else {
-                    break;
-                };
+            while let Some(fold_line) = self.line_str(next) {
                 let fi = count_leading_spaces(fold_line);
                 if fi != fold_indent {
                     break;
@@ -969,10 +963,7 @@ impl<'a> Parser<'a> {
                     let mut acc = value.to_owned();
                     let mut next = self.line + 1;
                     let mut fold_count = 0usize;
-                    loop {
-                        let Some(fold_line) = self.line_str(next) else {
-                            break;
-                        };
+                    while let Some(fold_line) = self.line_str(next) {
                         let raw_fi = count_leading_spaces(fold_line);
                         if self.idt.logical(raw_fi) != line_indent {
                             break;
@@ -1030,8 +1021,7 @@ impl<'a> Parser<'a> {
                     let mut acc = token.to_owned();
                     let mut next = self.line + 1;
                     let mut fold_count = 0usize;
-                    loop {
-                        let Some(fold_line) = self.line_str(next) else { break; };
+                    while let Some(fold_line) = self.line_str(next) {
                         let raw_fi = count_leading_spaces(fold_line);
                         if self.idt.logical(raw_fi) != line_indent { break; }
                         let rest = &fold_line[raw_fi..];
@@ -1302,7 +1292,10 @@ impl<'a> Parser<'a> {
             let col = error.column();
             self.error_at_line(self.line, col, format!("minimal JSON error: {error}"))
         })?;
-        Ok(Value::from(value))
+        // Value::from_serde_json, not Value::from: the From impl is public
+        // API gated behind the serde_json feature, while this inherent
+        // conversion is always available for internal use.
+        Ok(Value::from_serde_json(value))
     }
 
     fn line_str(&self, index: usize) -> Option<&str> {

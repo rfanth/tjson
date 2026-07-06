@@ -197,6 +197,10 @@ impl Value {
         }
     }
 
+    /// Convert to a `serde_json::Value`. Only consumed by the feature-gated
+    /// `From<Value> for serde_json::Value` impl above, so it carries the same
+    /// gate (internal code goes through the JSON string form instead).
+    #[cfg(feature = "serde_json")]
     pub(crate) fn to_serde_json(&self) -> serde_json::Value {
         match self {
             Self::Null => serde_json::Value::Null,

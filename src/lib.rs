@@ -20,8 +20,18 @@
 //!   [`From<Value>`] for `serde_json::Value`. Disable if you don't use serde_json directly
 //!   and want to avoid pulling its `arbitrary_precision` feature into your build.
 
+// The core library contains no `unsafe` and enforces it. The optional `capi`
+// feature (src/ffi.rs, the C ABI) is the sole exception: for that build we relax
+// to `deny` and scope a single `#[allow(unsafe_code)]` to the ffi module. Every
+// build that is not the C ABI therefore stays provably unsafe-free.
+#![cfg_attr(not(feature = "capi"), forbid(unsafe_code))]
+#![cfg_attr(feature = "capi", deny(unsafe_code))]
+
 #[cfg(target_arch = "wasm32")]
 mod wasm;
+
+#[cfg(feature = "capi")]
+mod ffi;
 
 mod error;
 mod number;

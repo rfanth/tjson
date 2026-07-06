@@ -4,7 +4,7 @@ A Rust library and CLI tool for [TJSON](https://textjson.com)
 
 TJSON is a hyper-readable, round trip safe and data preserving substitute for JSON that feels like text and represents the same data while looking quite different and allowing different generator rules to optimize readability.  It is not a superset or a subset of JSON, but it does represent the same underlying data in a different format.  It's position based to emphasize locality of meaning, and adds bare strings, pipe tables, comments, multiline string literals, and line folding to make the contained data easier to read while remaining fully convertible to and from standard JSON while retaining exactly the same data.  TJSON is optimized for reading and deterministic data, not human editing.
 
-Usage as a binary, library (including WASM too), and through serde Serialize are all fully supported.
+Usage as a binary, library (including WASM too), through serde Serialize, and from other languages via a C API are all fully supported.
 
 **Input JSON**
 ```json
@@ -176,6 +176,29 @@ tjson --canonical -i data.json
 ## WASM / JavaScript
 
 This crate also compiles to WebAssembly. The npm package `@rfanth/tjson` wraps it with a JavaScript/TypeScript API (camelCase options, full TypeScript types). See the [npm README](npm-README.md) for usage and options.
+
+## C API (other languages)
+
+The library can be built as a shared library exporting a small C API, callable
+from any language with a C FFI — C, C++, Delphi, C#, Python via `ctypes`, Go,
+Lua, and more:
+
+```sh
+cargo build --release --features capi
+```
+
+```c
+#include "tjson.h"
+
+TjsonError err = { 0, 0, 0, NULL };
+char *json = tjson_to_json("  name: Alice  city: London", &err);
+/* ... use json ... */
+tjson_free_string(json);
+```
+
+The header is [`include/tjson.h`](include/tjson.h); the full reference —
+memory ownership, error codes, and the options object — is in
+[`docs/c-api.md`](docs/c-api.md).
 
 ## Resources
 

@@ -1,4 +1,5 @@
 // created by R.F. Anthracite <rfa@rfanth.com>
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::io::{self, Read};
