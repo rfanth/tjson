@@ -52,13 +52,21 @@ changes.
 ### Prebuilt binaries
 
 If you don't want a Rust toolchain, each tagged
-[GitHub Release](https://github.com/rfanth/tjson/releases) attaches:
+[GitHub Release](https://github.com/rfanth/tjson/releases) attaches artifacts
+named `tjson-<role>-<os>-<arch>`, where the role is `cli` (the standalone
+command-line tool) or `lib` (the C API package):
 
-- **Windows** — `tjson.dll` (native MSVC build; this is the file the Delphi
-  binding loads).
-- **macOS** — `libtjson.dylib` (Apple Silicon).
-- **Linux** — a static-musl `tjson` CLI that runs on any Linux with no
-  dependencies. (This is the command-line tool, not the shared library.)
+| Asset | Contents |
+|-------|----------|
+| `tjson-lib-windows-x64.zip` | `tjson.dll` (64-bit, self-contained: static C runtime) + `tjson.dll.lib` + `include/tjson.h` + LICENSE |
+| `tjson-lib-windows-x86.zip` | the same, 32-bit — for Win32 apps (common with legacy Delphi) |
+| `tjson-lib-macos-arm64.zip` | `libtjson.dylib` (Apple Silicon) + `include/tjson.h` + LICENSE |
+| `tjson-cli-linux-x86_64` | static-musl CLI, runs on any x86-64 Linux |
+| `tjson-cli-linux-aarch64` | static-musl CLI for ARM64 Linux (Raspberry Pi, Graviton, Docker on Apple Silicon) |
+| `tjson-cli-macos-arm64` | CLI, Apple Silicon |
+| `tjson-cli-windows-x64.exe` | CLI, self-contained (static C runtime) |
+
+Every CLI binary is executed as part of the release build before it ships.
 
 There is deliberately **no prebuilt Linux `libtjson.so`**: a prebuilt shared
 library would be pinned to the build machine's glibc version and could fail to

@@ -182,6 +182,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_crlf_framed_documents() {
+        // Windows-authored files: CRLF line endings must parse identically
+        // to LF. (Framing only — CRLF *content* is the multiline-EOL
+        // indicator feature, tested separately.)
+        let unix = "  a:1\n  b: two\n  c:\n    [ 1, 2";
+        let dos = unix.replace('\n', "\r\n");
+        assert_eq!(
+            to_json_value(parse_str(&dos).unwrap()),
+            to_json_value(parse_str(unix).unwrap())
+        );
+    }
+
+    #[test]
+    fn renderer_never_emits_carriage_returns() {
+        // Output framing is \n on every platform — byte-identical output is
+        // part of being a deterministic data format. CRLF string content is
+        // carried as escaped indicators, never literal \r bytes.
+        let value = tjson_value(
+            r#"{"note":"first\r\nsecond","list":[1,2,3],"x":{"y":"z"}}"#,
+        );
+        let rendered = render_string(&value);
+        assert!(!rendered.contains('\r'), "framing must be LF-only: {rendered:?}");
+    }
+
+    #[test]
     fn parses_comments_and_marker_examples() {
         let input = "// comment\n  a:5\n// comment\n  x:\n    [ [ 1\n      { b: text";
         let expected = json("{\"a\":5,\"x\":[[1],{\"b\":\"text\"}]}");

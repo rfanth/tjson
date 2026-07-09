@@ -1,19 +1,29 @@
 name: Release
 
-# Fires when you push a version tag (e.g. v0.6.3). Builds the C API shared
-# library natively where users can't easily build it themselves — Windows
-# (a real MSVC tjson.dll) and macOS (a real .dylib) — plus the static musl
-# CLI, then publishes a GitHub Release with them attached. Cut a release with:
+# Fires when you push a version tag (e.g. v0.6.3) and publishes a GitHub
+# Release with prebuilt artifacts. Naming grammar: tjson-<role>-<os>-<arch>,
+# where role is `cli` (standalone executable) or `lib` (C API package: the
+# shared library + include/tjson.h + LICENSE, zipped). Arch vocabulary is
+# platform-native: x64/x86 on Windows, x86_64/aarch64 on Linux, arm64 on mac.
 #
-# No prebuilt Linux .so: it would be glibc-version-coupled to the runner (a
-# footgun on older systems) and Linux users build it trivially with
-# `cargo build --release --features capi`, linked against their own glibc.
-# The musl CLI below is the zero-dependency "runs anywhere on Linux" artifact.
+#   tjson-cli-linux-x86_64        static musl CLI
+#   tjson-cli-linux-aarch64       static musl CLI (built and run on a native
+#                                 arm64 runner — every CLI is executed before
+#                                 it ships)
+#   tjson-cli-macos-arm64         CLI (Apple Silicon)
+#   tjson-cli-windows-x64.exe     CLI (static C runtime: self-contained)
+#   tjson-lib-macos-arm64.zip     libtjson.dylib + include/tjson.h + LICENSE
+#   tjson-lib-windows-x64.zip     tjson.dll (64-bit) + tjson.dll.lib +
+#                                 include/tjson.h + LICENSE
+#   tjson-lib-windows-x86.zip     same, 32-bit (legacy Delphi/Win32 apps)
 #
+# No prebuilt Linux .so: it would be glibc-coupled to the build machine;
+# Linux users build it with `cargo build --release --features capi` against
+# their own glibc. The musl CLIs are the zero-dependency Linux artifacts.
+#
+# Cut a release:
 #     git tag -a v0.6.3 -m "v0.6.3 - <summary>"
 #     git push origin v0.6.3
-#
-# You never touch a Windows or Mac machine; GitHub's runners do the building.
 on:
   push:
     tags:
@@ -23,32 +33,8 @@ permissions:
   contents: write   # required for the GITHUB_TOKEN to create the Release
 
 jobs:
-  capi-lib:
-    name: C API library (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: tjson.dll
-            path: target/release/tjson.dll
-          - os: macos-latest        # Apple Silicon (arm64) runner
-            artifact: libtjson.dylib
-            path: target/release/libtjson.dylib
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build the C API shared library
-        run: cargo build --release --features capi
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.path }}
-          if-no-files-found: error
-
-  musl-cli:
-    name: Static CLI (musl)
+  linux-x86_64:
+    name: CLI linux-x86_64 (musl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -59,17 +45,139 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build the static CLI
         run: cargo build --release --target x86_64-unknown-linux-musl
-      - name: Name it for the release
-        run: cp target/x86_64-unknown-linux-musl/release/tjson tjson-linux-musl
+      - name: Run it before shipping it
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/tjson tjson-cli-linux-x86_64
+          ./tjson-cli-linux-x86_64 --version
+          echo '{"a":1}' | ./tjson-cli-linux-x86_64
       - uses: actions/upload-artifact@v7
         with:
-          name: tjson-linux-musl
-          path: tjson-linux-musl
+          name: tjson-cli-linux-x86_64
+          path: tjson-cli-linux-x86_64
+          if-no-files-found: error
+
+  linux-aarch64:
+    name: CLI linux-aarch64 (musl)
+    runs-on: ubuntu-24.04-arm   # native arm64: the binary is run, not just built
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install the musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build the static CLI
+        run: cargo build --release --target aarch64-unknown-linux-musl
+      - name: Run it before shipping it
+        run: |
+          cp target/aarch64-unknown-linux-musl/release/tjson tjson-cli-linux-aarch64
+          ./tjson-cli-linux-aarch64 --version
+          echo '{"a":1}' | ./tjson-cli-linux-aarch64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tjson-cli-linux-aarch64
+          path: tjson-cli-linux-aarch64
+          if-no-files-found: error
+
+  macos:
+    name: CLI + lib macos-arm64
+    runs-on: macos-latest   # Apple Silicon
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and run the CLI
+        run: |
+          cargo build --release
+          cp target/release/tjson tjson-cli-macos-arm64
+          ./tjson-cli-macos-arm64 --version
+          echo '{"a":1}' | ./tjson-cli-macos-arm64
+      - name: Build the C API library and assemble the zip
+        run: |
+          cargo build --release --features capi
+          mkdir -p stage/include
+          cp target/release/libtjson.dylib stage/
+          cp include/tjson.h stage/include/
+          cp LICENSE stage/
+          (cd stage && zip -r ../tjson-lib-macos-arm64.zip .)
+          unzip -l tjson-lib-macos-arm64.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tjson-cli-macos-arm64
+          path: tjson-cli-macos-arm64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tjson-lib-macos-arm64.zip
+          path: tjson-lib-macos-arm64.zip
+          if-no-files-found: error
+
+  windows:
+    name: CLI + libs windows (x64 exe, x64 + x86 dll zips)
+    runs-on: windows-latest
+    # Static C runtime for every Windows artifact: the default dynamic CRT
+    # depends on vcruntime140.dll, which is NOT part of Windows (it comes
+    # from the VC++ Redistributable) — a fresh machine would fail to load
+    # our artifacts. Static linking makes them all self-contained. The usual
+    # warning against static-CRT DLLs (two CRTs in one process sharing heap
+    # state) does not apply to tjson.dll: the C API's allocator boundary is
+    # sealed by design — nothing CRT-owned ever crosses it; callers free
+    # only through tjson_free_string. License-wise this is fine: static
+    # linking is one of Microsoft's three documented deployment methods
+    # for the C++ runtime. The trade-off is servicing: CRT security fixes
+    # reach users only through our next release, not Windows Update — the
+    # same trade-off as the static-musl Linux CLIs.
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+      - name: Build and run the CLI (static C runtime)
+        run: |
+          cargo build --release
+          copy target\release\tjson.exe tjson-cli-windows-x64.exe
+          .\tjson-cli-windows-x64.exe --version
+          echo {"a":1} | .\tjson-cli-windows-x64.exe
+      - name: Build the C API libraries (64- and 32-bit)
+        run: |
+          cargo build --release --features capi
+          cargo build --release --features capi --target i686-pc-windows-msvc
+      - name: Assemble the lib zips
+        shell: pwsh
+        run: |
+          foreach ($t in @(
+            @{arch='x64'; dir='target\release'},
+            @{arch='x86'; dir='target\i686-pc-windows-msvc\release'}
+          )) {
+            $stage = "stage-$($t.arch)"
+            New-Item -ItemType Directory -Path "$stage\include" -Force | Out-Null
+            Copy-Item "$($t.dir)\tjson.dll" $stage
+            Copy-Item "$($t.dir)\tjson.dll.lib" $stage
+            Copy-Item "include\tjson.h" "$stage\include"
+            Copy-Item "LICENSE" $stage
+            Compress-Archive -Path "$stage\*" -DestinationPath "tjson-lib-windows-$($t.arch).zip"
+          }
+          Get-ChildItem tjson-lib-windows-*.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tjson-cli-windows-x64.exe
+          path: tjson-cli-windows-x64.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tjson-lib-windows-x64.zip
+          path: tjson-lib-windows-x64.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tjson-lib-windows-x86.zip
+          path: tjson-lib-windows-x86.zip
           if-no-files-found: error
 
   publish:
     name: Publish GitHub Release
-    needs: [capi-lib, musl-cli]
+    needs: [linux-x86_64, linux-aarch64, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - name: Collect all built artifacts
