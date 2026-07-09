@@ -1,0 +1,76 @@
+name: CI
+
+# Two jobs that together enforce CONTRIBUTING.md's "Supported Build Targets"
+# table on a clean machine, on every push and PR, plus a weekly run to catch
+# toolchain/ecosystem drift even when nobody touches the repo:
+#
+#   test  — ./test-all.sh (the one source of truth for "does tjson pass"):
+#           native test build, C API + C smoke test under ASan, wasm lib check,
+#           wasm boundary tests, no-default-features check — plus the bundler
+#           build that produces the npm package.
+#   build — the release binaries build cleanly: the host default (normally gnu)
+#           that `cargo build` gives every user, plus the musl static target.
+#           musl is a supported target, not the project default; CI checks it
+#           because the committed repo builds for the host and nothing else
+#           would catch musl breakage.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+
+jobs:
+  test:
+    name: Full battery (test-all.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with fixtures submodule)
+        uses: actions/checkout@v4
+        with:
+          # tests/fixtures (the tjson-tests repo) is a submodule the suite reads.
+          submodules: true
+      - name: Install Rust + wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack (for the wasm boundary tests + bundler build)
+        uses: jetli/wasm-pack-action@v0.4.0
+      # Stage 1's C smoke test compiles roundtrip.c with clang under
+      # AddressSanitizer; clang and Node (for wasm-pack --node) are preinstalled
+      # on ubuntu-latest.
+      - name: Run the full test battery
+        run: ./test-all.sh
+      # CONTRIBUTING "WASM" row: the actual npm artifact build (test-all.sh only
+      # checks/tests the wasm lib, it does not package it).
+      - name: Build the wasm/npm package
+        run: wasm-pack build --target bundler
+
+  build:
+    name: Release binaries (gnu + musl)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No submodules: this job only builds, it does not run the fixture suite.
+      - name: Install Rust + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Install the musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # CONTRIBUTING "Native (default)" row — the host-default release binary +
+      # lib, i.e. what `cargo build` produces for any user.
+      - name: Build the host-default release binary
+        run: cargo build --release
+      # CONTRIBUTING "musl (static binary)" row — a supported target, not the
+      # project default. The committed repo builds for the host target, so this
+      # is the only thing that exercises musl; the point is just to keep it
+      # working. The cdylib crate-type is unsupported on musl and is harmlessly
+      # dropped with a warning; the rlib and the static CLI binary still build.
+      - name: Build the static (musl) release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl

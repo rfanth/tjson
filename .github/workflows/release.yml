@@ -1,0 +1,83 @@
+name: Release
+
+# Fires when you push a version tag (e.g. v0.6.3). Builds the C API shared
+# library natively where users can't easily build it themselves — Windows
+# (a real MSVC tjson.dll) and macOS (a real .dylib) — plus the static musl
+# CLI, then publishes a GitHub Release with them attached. Cut a release with:
+#
+# No prebuilt Linux .so: it would be glibc-version-coupled to the runner (a
+# footgun on older systems) and Linux users build it trivially with
+# `cargo build --release --features capi`, linked against their own glibc.
+# The musl CLI below is the zero-dependency "runs anywhere on Linux" artifact.
+#
+#     git tag -a v0.6.3 -m "v0.6.3 - <summary>"
+#     git push origin v0.6.3
+#
+# You never touch a Windows or Mac machine; GitHub's runners do the building.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required for the GITHUB_TOKEN to create the Release
+
+jobs:
+  capi-lib:
+    name: C API library (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: tjson.dll
+            path: target/release/tjson.dll
+          - os: macos-latest        # Apple Silicon (arm64) runner
+            artifact: libtjson.dylib
+            path: target/release/libtjson.dylib
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the C API shared library
+        run: cargo build --release --features capi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+
+  musl-cli:
+    name: Static CLI (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install the musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build the static CLI
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Name it for the release
+        run: cp target/x86_64-unknown-linux-musl/release/tjson tjson-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tjson-linux-musl
+          path: tjson-linux-musl
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [capi-lib, musl-cli]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create the Release and attach the binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
