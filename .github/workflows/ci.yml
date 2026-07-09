@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (with fixtures submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # tests/fixtures (the tjson-tests repo) is a submodule the suite reads.
           submodules: true
@@ -36,8 +36,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
+      # Official installer rather than a third-party action: one less thing
+      # to deprecate, and less supply-chain surface.
       - name: Install wasm-pack (for the wasm boundary tests + bundler build)
-        uses: jetli/wasm-pack-action@v0.4.0
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       # Stage 1's C smoke test compiles roundtrip.c with clang under
       # AddressSanitizer; clang and Node (for wasm-pack --node) are preinstalled
       # on ubuntu-latest.
@@ -53,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         # No submodules: this job only builds, it does not run the fixture suite.
       - name: Install Rust + musl target
         uses: dtolnay/rust-toolchain@stable

@@ -37,7 +37,7 @@ jobs:
             artifact: libtjson.dylib
             path: target/release/libtjson.dylib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Build the C API shared library
         run: cargo build --release --features capi
@@ -51,7 +51,7 @@ jobs:
     name: Static CLI (musl)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
