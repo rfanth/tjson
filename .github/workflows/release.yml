@@ -41,7 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build the C API shared library
         run: cargo build --release --features capi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
@@ -61,7 +61,7 @@ jobs:
         run: cargo build --release --target x86_64-unknown-linux-musl
       - name: Name it for the release
         run: cp target/x86_64-unknown-linux-musl/release/tjson tjson-linux-musl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tjson-linux-musl
           path: tjson-linux-musl
@@ -73,11 +73,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Collect all built artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Create the Release and attach the binaries
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*
           generate_release_notes: true
