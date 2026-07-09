@@ -81,6 +81,8 @@ All four functions throw an `Error` on invalid input.
 
 Options use **camelCase** in JavaScript. The underlying library's Rust API uses snake_case and idiomatic Rust, but exposes the same options.
 
+Options must be a plain object; `null`/`undefined` mean defaults, and anything else (an array, a number) throws. Unknown fields are ignored — TypeScript catches misspelled names at compile time — except option names that were renamed or removed in a past release, which throw with a hint pointing at the replacement.
+
 **Key options:**
 
 | Option | Default | Description |

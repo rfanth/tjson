@@ -167,8 +167,21 @@ fn parse_options(options: JsValue) -> Result<crate::RenderOptions, JsValue> {
         // serde_json::Value avoids this bug in serde_wasm_bindgen.
         let json: serde_json::Value = serde_wasm_bindgen::from_value(options)
             .map_err(|e| err(format!("invalid option value (see StringifyOptions for valid values): {e}")))?;
-        if json.get("tableMinCols").is_some() {
-            return Err(err("tableMinCols has been renamed to tableMinColumns — please update your code"));
+        // Options must be a plain object. Without this check, serde accepts a
+        // JS array positionally as struct fields ([true] would silently mean
+        // {canonical: true}) and bare scalars produce an error that leaks the
+        // Rust struct name. null/undefined were already handled above and
+        // keep meaning "defaults".
+        let Some(object) = json.as_object() else {
+            return Err(err("options must be an object (or null/undefined for defaults)"));
+        };
+        // Unknown fields are tolerated (idiomatic JS options bag; TypeScript
+        // checks names at compile time), except retired names from the shared
+        // table, which get a migration hint instead of silently no-opping.
+        for retired in crate::options::RETIRED_OPTIONS {
+            if object.contains_key(retired.name) {
+                return Err(err(format!("{} — please update your code", retired.hint)));
+            }
         }
         let config: crate::TjsonConfig = serde_json::from_value(json)
             .map_err(|e| err(format!("invalid option value (see StringifyOptions for valid values): {e}")))?;

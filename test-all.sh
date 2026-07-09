@@ -15,19 +15,25 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "=== 1/3 cargo test --features capi (core + FFI + C smoke test) ==="
+echo "=== 1/4 cargo test --features capi (core + FFI + C smoke test) ==="
 cargo test --features capi
 
-echo "=== 2/3 WASM compile check ==="
+echo "=== 2/4 WASM compile check ==="
 # --lib: only the library compiles to wasm (the CLI's terminal_size
 # dependency is desktop-only, and wasm-pack builds the lib alone anyway).
 cargo check --lib --target wasm32-unknown-unknown
 
-echo "=== 3/3 no-default-features compile check ==="
+echo "=== 3/4 no-default-features compile check ==="
 # The lib docs advertise `default-features = false` (drops the serde_json
 # From impls); make sure that config keeps compiling. The CLI is skipped
 # automatically (required-features in Cargo.toml).
 cargo check --no-default-features
+
+echo "=== 4/4 WASM boundary tests (node) ==="
+# Runs tests/wasm_boundary.rs in a real JS engine: the JS-side decisions
+# (null/undefined options, tolerance of unknown fields, non-object and
+# retired-name rejection) execute only on wasm32.
+wasm-pack test --node -- --test wasm_boundary
 
 echo
 echo "all test stages passed"

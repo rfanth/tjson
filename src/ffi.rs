@@ -226,6 +226,20 @@ fn parse_options(options_json: &str) -> Result<crate::RenderOptions, FfiError> {
         FfiError::at(TJSON_ERR_OPTIONS, e.line(), e.column(), format!("invalid options JSON: {e}"))
     };
 
+    // serde's derived Deserialize accepts a JSON array as positional struct
+    // fields — a deliberate serde_json feature for compact wire formats
+    // (rows-as-arrays). Options are never wire data here, so enforce the
+    // documented "options object" contract before serde can misread the
+    // shape: without this, [true] silently means {"canonical":true} and a
+    // bare scalar errors with a leaked "expected struct TjsonConfig".
+    // A document whose first non-space byte is not '{' cannot be an object.
+    if options_json.trim_start().as_bytes().first() != Some(&b'{') {
+        return Err(FfiError::new(
+            TJSON_ERR_OPTIONS,
+            "options must be a JSON object, e.g. {\"wrapWidth\":40}",
+        ));
+    }
+
     // Strictness has to be imposed *here*, not on TjsonConfig: that struct is
     // shared with the JS/WASM binding, whose users rely on the tolerant
     // options-bag behavior, so adding #[serde(deny_unknown_fields)] to it
@@ -247,8 +261,13 @@ fn parse_options(options_json: &str) -> Result<crate::RenderOptions, FfiError> {
 
     if !unknown_fields.is_empty() {
         let mut message = format!("unknown option field(s): {}", unknown_fields.join(", "));
-        if unknown_fields.iter().any(|field| field == "tableMinCols") {
-            message.push_str("; tableMinCols has been renamed to tableMinColumns");
+        // Retired names (renamed/removed options) get a migration hint from
+        // the shared table in options.rs, same as every other surface.
+        for field in &unknown_fields {
+            if let Some(hint) = crate::options::retired_option_hint(field) {
+                message.push_str("; ");
+                message.push_str(hint);
+            }
         }
         return Err(FfiError::new(TJSON_ERR_OPTIONS, message));
     }
@@ -501,6 +520,48 @@ mod tests {
     }
 
     #[test]
+    fn non_object_options_are_rejected() {
+        let input = CString::new(r#"{"a":1}"#).unwrap();
+        // Without the shape guard, serde accepts [true] positionally as
+        // {"canonical":true} and leaks "expected struct TjsonConfig" for
+        // bare scalars.
+        for bad in ["[true]", "[]", "[40]", "40", "\"canonical\"", "null", ""] {
+            let options = CString::new(bad).unwrap();
+            let mut err = new_err();
+            let out = tjson_from_json(input.as_ptr(), options.as_ptr(), &mut err);
+            assert!(out.is_null(), "options {bad:?} must be rejected");
+            assert_eq!(err.code, TJSON_ERR_OPTIONS, "options {bad:?}");
+            assert!(
+                take_error(&mut err).contains("JSON object"),
+                "options {bad:?} should get the shape message"
+            );
+        }
+    }
+
+    #[test]
+    fn options_with_leading_whitespace_are_accepted() {
+        let input = CString::new(r#"{"a":1}"#).unwrap();
+        // The object-shape guard trims before peeking; whitespace before
+        // the brace must stay legal.
+        let options = CString::new("  \n {\"canonical\":true}").unwrap();
+        let mut err = new_err();
+        let out = tjson_from_json(input.as_ptr(), options.as_ptr(), &mut err);
+        assert_eq!(err.code, TJSON_OK, "whitespace before the brace must stay legal");
+        take(out);
+    }
+
+    #[test]
+    fn trailing_garbage_after_options_is_rejected() {
+        let input = CString::new(r#"{"a":1}"#).unwrap();
+        let options = CString::new("{\"tables\":true} extra").unwrap();
+        let mut err = new_err();
+        let out = tjson_from_json(input.as_ptr(), options.as_ptr(), &mut err);
+        assert!(out.is_null());
+        assert_eq!(err.code, TJSON_ERR_OPTIONS);
+        assert!(take_error(&mut err).contains("trailing"));
+    }
+
+    #[test]
     fn null_input_reports_null_error() {
         let mut err = new_err();
         let out = tjson_to_json(ptr::null(), &mut err);
@@ -543,6 +604,47 @@ mod tests {
     #[test]
     fn free_string_is_null_safe() {
         tjson_free_string(ptr::null_mut());
+    }
+
+    #[test]
+    fn success_resets_a_reused_error_struct() {
+        // Fail first, populating every field of the out-param.
+        let bad = CString::new("  ok: yes\n  key: \u{0007}").unwrap();
+        let mut err = new_err();
+        let out = tjson_to_json(bad.as_ptr(), &mut err);
+        assert!(out.is_null());
+        take_error(&mut err); // frees + nulls message; code/line/column stay stale
+        assert_ne!(err.code, TJSON_OK);
+        assert_ne!(err.line, 0);
+        // A subsequent success with the same struct must reset every field.
+        let good = CString::new("  ok: yes").unwrap();
+        let out = tjson_to_json(good.as_ptr(), &mut err);
+        assert_eq!(err.code, TJSON_OK);
+        assert_eq!(err.line, 0);
+        assert_eq!(err.column, 0);
+        assert!(err.message.is_null());
+        take(out);
+    }
+
+    #[test]
+    fn a_new_error_fully_overwrites_a_previous_one() {
+        // First error carries a position...
+        let bad_parse = CString::new("  ok: yes\n  key: \u{0007}").unwrap();
+        let mut err = new_err();
+        let out = tjson_to_json(bad_parse.as_ptr(), &mut err);
+        assert!(out.is_null());
+        assert_eq!(err.code, TJSON_ERR_PARSE);
+        assert_ne!(err.line, 0);
+        take_error(&mut err);
+        // ...the next error has none. Every field must come from the new
+        // error alone — a positionless failure must report 0/0, not the
+        // previous failure's line and column (no franken-errors).
+        let out = tjson_to_json(ptr::null(), &mut err);
+        assert!(out.is_null());
+        assert_eq!(err.code, TJSON_ERR_NULL);
+        assert_eq!(err.line, 0, "line must not leak from the previous error");
+        assert_eq!(err.column, 0, "column must not leak from the previous error");
+        take_error(&mut err);
     }
 
     #[test]

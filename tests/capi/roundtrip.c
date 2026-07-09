@@ -75,6 +75,16 @@ int main(void) {
     tjson_free_string(err.message);
     err.message = NULL;
 
+    /* error path: options must be a JSON object — without the shape guard,
+     * [true] would be accepted positionally as {"canonical":true} */
+    bad = tjson_from_json("{\"a\":1}", "[true]", &err);
+    check(bad == NULL, "array options returns NULL");
+    check(err.code == TJSON_ERR_OPTIONS, "array options sets TJSON_ERR_OPTIONS");
+    check(err.message != NULL && strstr(err.message, "JSON object") != NULL,
+          "array options message names the required shape");
+    tjson_free_string(err.message);
+    err.message = NULL;
+
     /* error path: a bad option value is also TJSON_ERR_OPTIONS */
     bad = tjson_from_json("{\"a\":1}", "{\"wrapWidth\":\"wide\"}", &err);
     check(bad == NULL, "invalid option value returns NULL");
@@ -82,10 +92,14 @@ int main(void) {
     tjson_free_string(err.message);
     err.message = NULL;
 
-    /* error path: NULL input pointer is distinguished from bad encoding */
+    /* error path: NULL input pointer is distinguished from bad encoding.
+     * The previous error carried a position; this one has none — its 0/0
+     * must come from this error, not leak from the last (no franken-errors) */
     bad = tjson_to_json(NULL, &err);
     check(bad == NULL, "NULL input returns NULL");
     check(err.code == TJSON_ERR_NULL, "NULL input sets TJSON_ERR_NULL");
+    check(err.line == 0 && err.column == 0,
+          "positionless error does not inherit the previous error's position");
     tjson_free_string(err.message);
     err.message = NULL;
 
@@ -96,6 +110,14 @@ int main(void) {
     check(err.code == TJSON_ERR_UTF8, "non-UTF-8 input sets TJSON_ERR_UTF8");
     tjson_free_string(err.message);
     err.message = NULL;
+
+    /* success with a reused err must reset every field the last error set
+     * (err.code is stale TJSON_ERR_UTF8 here from the block above) */
+    char *reused = tjson_to_json("  ok: yes", &err);
+    check(reused != NULL, "success after a prior error works");
+    check(err.code == TJSON_OK && err.line == 0 && err.column == 0 && err.message == NULL,
+          "success resets a reused error struct");
+    tjson_free_string(reused);
 
     /* null-safety and opt-out of the error out-param */
     tjson_free_string(NULL);

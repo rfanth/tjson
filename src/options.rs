@@ -660,8 +660,17 @@ mod camel_de {
     );
 }
 
-/// A camelCase-deserializable options bag for WASM/JS and test configs.
-/// Not part of the public Rust API — use [`RenderOptions`] directly in Rust code.
+/// The camelCase-deserializable options bag shared by every non-Rust surface:
+/// the WASM/JS binding (`src/wasm.rs`), the C API (`src/ffi.rs`), the SQL UDF
+/// (the `tjson-udf` crate, via the doc-hidden re-export), and fixture test
+/// configs. Not part of the public Rust API — use [`RenderOptions`] directly
+/// in Rust code.
+///
+/// Deliberately tolerant: unknown fields are ignored here (the JS binding's
+/// documented options-bag behavior, pinned by test), and `derive(Deserialize)`
+/// keeps the positional/seq form available to direct trait users. Surfaces
+/// that want strictness (C, SQL) layer it on at their own boundaries with
+/// serde_ignored and an object-shape guard — never on this type.
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -737,6 +746,91 @@ impl From<TjsonConfig> for RenderOptions {
         if let Some(v) = c.indent_glyph_marker_style { opts = opts.indent_glyph_marker_style(v); }
         if let Some(v) = c.kv_pack_multiple { opts = opts.kv_pack_multiple_clamped(v); }
         opts
+    }
+}
+
+/// Options that existed in a previous release and were renamed or removed,
+/// paired with a migration hint. Every surface that reports on option fields
+/// (the C API and SQL UDF strict parsers, the JS binding's curated check)
+/// consults this table so they all give the same guidance. Retiring an
+/// option means adding one entry here.
+pub(crate) struct RetiredOption {
+    /// The camelCase field name as it appeared in the release that had it.
+    pub(crate) name: &'static str,
+    /// Full migration sentence, e.g. "x has been renamed to y".
+    pub(crate) hint: &'static str,
+}
+
+pub(crate) const RETIRED_OPTIONS: &[RetiredOption] = &[
+    RetiredOption {
+        name: "tableMinCols",
+        hint: "tableMinCols has been renamed to tableMinColumns",
+    },
+];
+
+/// Look up the migration hint for a retired option field name.
+///
+/// Not part of the public Rust API — this exists for tjson's own language
+/// bindings; the SQL UDF crate consumes it from outside this crate.
+#[doc(hidden)]
+pub fn retired_option_hint(field: &str) -> Option<&'static str> {
+    RETIRED_OPTIONS
+        .iter()
+        .find(|retired| retired.name == field)
+        .map(|retired| retired.hint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_option_lookup_finds_hint() {
+        let hint = retired_option_hint("tableMinCols").expect("tableMinCols is retired");
+        assert!(hint.contains("tableMinColumns"), "hint must name the replacement: {hint}");
+    }
+
+    #[test]
+    fn current_option_names_are_not_retired() {
+        // The replacement name must never trigger a hint.
+        assert_eq!(retired_option_hint("tableMinColumns"), None);
+        assert_eq!(retired_option_hint("wrapWidth"), None);
+    }
+
+    /// TjsonConfig itself must stay tolerant of unknown fields — the JS
+    /// binding's documented options-bag behavior depends on it (strictness
+    /// for C and SQL is layered on at those boundaries, never here). If this
+    /// fails, someone added deny_unknown_fields to the shared type and broke
+    /// the JS contract.
+    #[test]
+    fn config_tolerates_unknown_fields_and_still_applies_known_ones() {
+        let config: TjsonConfig =
+            serde_json::from_str(r#"{"notAnOptionAtAll":1,"wrapWidth":40}"#)
+                .expect("unknown fields must not fail TjsonConfig itself");
+        let options = RenderOptions::from(config);
+        assert_eq!(options.wrap_width, Some(40), "known fields must still apply");
+    }
+
+    /// Every name in RETIRED_OPTIONS must actually be gone from TjsonConfig —
+    /// a name that is both "retired" and still accepted would hint users away
+    /// from an option that works. Detecting "still accepted" needs
+    /// serde_ignored, which is only compiled with the capi feature, so this
+    /// consistency check runs in the full battery (cargo test --features capi).
+    #[cfg(feature = "capi")]
+    #[test]
+    fn retired_names_are_actually_removed_from_config() {
+        for retired in RETIRED_OPTIONS {
+            let name = retired.name;
+            let probe = format!("{{\"{name}\":1}}");
+            let mut unknown: Vec<String> = Vec::new();
+            let mut de = serde_json::Deserializer::from_str(&probe);
+            let parsed: Result<TjsonConfig, _> =
+                serde_ignored::deserialize(&mut de, |path| unknown.push(path.to_string()));
+            assert!(
+                parsed.is_err() || unknown.iter().any(|field| field == name),
+                "{name} is in RETIRED_OPTIONS but TjsonConfig still accepts it"
+            );
+        }
     }
 }
 

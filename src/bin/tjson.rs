@@ -7,6 +7,20 @@ use std::str::FromStr;
 
 use pico_args::Arguments;
 
+/// Width of the attached terminal, if any.
+#[cfg(not(target_arch = "wasm32"))]
+fn terminal_width() -> Option<usize> {
+    terminal_size::terminal_size().map(|(terminal_size::Width(w), _)| w as usize)
+}
+
+/// wasm32 has no terminal (and no terminal_size dependency). The CLI is
+/// meaningless there, but cargo builds bin targets whenever integration
+/// tests build — including tests/wasm_boundary.rs — so it must compile.
+#[cfg(target_arch = "wasm32")]
+fn terminal_width() -> Option<usize> {
+    None
+}
+
 fn help_text() -> String {
     format!("\
 Usage: tjson [OPTIONS] [-i FILE] [-o FILE]
@@ -120,12 +134,10 @@ fn main() {
         .or_else(|| parse_val(&mut args, "-w"));
     let opt_wrap: Option<usize> = match opt_wrap_str.as_deref() {
         None => None,
-        Some("term") => Some(terminal_size::terminal_size()
-            .map(|(terminal_size::Width(w), _)| w as usize)
-            .unwrap_or_else(|| {
-                eprintln!("tjson: --width term: no terminal detected, using 80 columns");
-                80
-            })),
+        Some("term") => Some(terminal_width().unwrap_or_else(|| {
+            eprintln!("tjson: --width term: no terminal detected, using 80 columns");
+            80
+        })),
         Some(s) => Some(s.parse::<usize>().unwrap_or_else(|_| {
             eprintln!("tjson: --width: invalid value '{s}' (expected a number or 'term')");
             std::process::exit(1);
@@ -199,12 +211,10 @@ fn main() {
 
         // -T: terminal width baseline — applied first so explicit flags override
         if flag_term {
-            let tw = terminal_size::terminal_size()
-                .map(|(terminal_size::Width(w), _)| w as usize)
-                .unwrap_or_else(|| {
-                    eprintln!("tjson: -T: no terminal detected, using 80 columns");
-                    80
-                });
+            let tw = terminal_width().unwrap_or_else(|| {
+                eprintln!("tjson: -T: no terminal detected, using 80 columns");
+                80
+            });
             opts = opts.wrap_width(Some(tw));
             if tw / 2 > 40 {
                 opts = opts.table_column_max_width(Some(tw / 2));

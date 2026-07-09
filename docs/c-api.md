@@ -49,6 +49,22 @@ against the header and the built library under AddressSanitizer. The header
 deliberately carries no release version — it only changes when the ABI
 changes.
 
+### Prebuilt binaries
+
+If you don't want a Rust toolchain, each tagged
+[GitHub Release](https://github.com/rfanth/tjson/releases) attaches:
+
+- **Windows** — `tjson.dll` (native MSVC build; this is the file the Delphi
+  binding loads).
+- **macOS** — `libtjson.dylib` (Apple Silicon).
+- **Linux** — a static-musl `tjson` CLI that runs on any Linux with no
+  dependencies. (This is the command-line tool, not the shared library.)
+
+There is deliberately **no prebuilt Linux `libtjson.so`**: a prebuilt shared
+library would be pinned to the build machine's glibc version and could fail to
+load on older systems. On Linux, build it yourself with the command above — it
+is a one-liner and links against your own glibc.
+
 > **Note:** a `cdylib` cannot be produced for targets that don't support
 > dynamic libraries (e.g. `x86_64-unknown-linux-musl`). If your default target
 > is one of those, build for a dynamic-capable target explicitly, e.g.
@@ -197,7 +213,7 @@ for (size_t i = 0; i < n; i++) {
     if (json == NULL) {
         log_error(err.message);
         tjson_free_string(err.message);   /* <-- required before the next call */
-        err.message = NULL;               /* optional, but keeps it tidy */
+        err.message = NULL;               /* keeps the struct honest */
         continue;
     }
     consume(json);
@@ -287,6 +303,9 @@ What differs in C is only how the object is delivered and policed:
 
 - It is passed as a JSON **string**, e.g. `"{\"wrapWidth\":40}"`, not a live
   object.
+- The string must be a JSON **object**. Arrays, bare scalars, and `null` are
+  rejected with `TJSON_ERR_OPTIONS` (pass a NULL *pointer*, not the JSON
+  text `null`, for defaults).
 - Unknown fields are **rejected** with `TJSON_ERR_OPTIONS`, and the error
   message names the offending field. (The JS binding tolerates unknown keys,
   as is idiomatic there — TypeScript catches typos at compile time. A C

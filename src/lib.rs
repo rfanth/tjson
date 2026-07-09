@@ -27,8 +27,11 @@
 #![cfg_attr(not(feature = "capi"), forbid(unsafe_code))]
 #![cfg_attr(feature = "capi", deny(unsafe_code))]
 
+// pub (but doc-hidden) so tests/wasm_boundary.rs can drive the JS boundary;
+// JS consumers only ever see the wasm-bindgen exports, not this Rust path.
 #[cfg(target_arch = "wasm32")]
-mod wasm;
+#[doc(hidden)]
+pub mod wasm;
 
 #[cfg(feature = "capi")]
 mod ffi;
@@ -48,8 +51,19 @@ pub use options::{
 };
 pub use number::{InvalidNumber, Number};
 pub use value::{Entry, Value};
+// Binding-facing surface: doc-hidden and NOT covered by semver. These items
+// exist so tjson's own language bindings share one options vocabulary — the
+// wasm/JS binding (src/wasm.rs) and C API (src/ffi.rs) in this crate, and the
+// SQL UDF (the separate tjson-udf crate) from outside it. They are `pub` only
+// because tjson-udf is a different crate; a breaking change here is a
+// release-coordinated change to those bindings, not a public API break.
+// Membership rule: only pure, stable helpers belong here. Anything genuinely
+// internal stays `pub(crate)` — e.g. the RETIRED_OPTIONS table itself, which
+// the in-crate surfaces read directly and outside crates cannot see.
 #[doc(hidden)]
 pub use options::TjsonConfig;
+#[doc(hidden)]
+pub use options::retired_option_hint;
 
 pub const MIN_WRAP_WIDTH: usize = options::MIN_WRAP_WIDTH;
 pub const DEFAULT_WRAP_WIDTH: usize = options::DEFAULT_WRAP_WIDTH;
