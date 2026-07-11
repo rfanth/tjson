@@ -138,7 +138,7 @@ jobs:
           cargo build --release
           copy target\release\tjson.exe tjson-cli-windows-x64.exe
           .\tjson-cli-windows-x64.exe --version
-          echo {"a":1} | .\tjson-cli-windows-x64.exe
+          echo '{"a":1}' | .\tjson-cli-windows-x64.exe
       - name: Build the C API libraries (64- and 32-bit)
         run: |
           cargo build --release --features capi
