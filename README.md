@@ -203,10 +203,13 @@ memory ownership, error codes, and the options object — is in
 ## Resources
 
 - **Website and live demo**: [textjson.com](https://textjson.com)
-- **Specification**: [tjson-specification.md](https://github.com/rfanth/tjson-spec/blob/master/tjson-specification.md)
 - **Test suite**: [tjson-tests](https://github.com/rfanth/tjson-tests)
 - **npm package**: [@rfanth/tjson](https://www.npmjs.com/package/@rfanth/tjson) — JavaScript/TypeScript bindings
 - **MariaDB/MySQL UDF**: [tjson-udf](https://github.com/rfanth/tjson-udf) — same options in SQL
+- **Specification**: [tjson-specification.md](https://github.com/rfanth/tjson-spec/blob/master/tjson-specification.md) —
+  The spec is versioned independently from this implementation: each release
+  is written against the spec as published at release time (the two are
+  typically released together when the spec behavior changes).
 
 ## License
 

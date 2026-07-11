@@ -81,7 +81,27 @@ All four functions throw an `Error` on invalid input.
 
 Options use **camelCase** in JavaScript. The underlying library's Rust API uses snake_case and idiomatic Rust, but exposes the same options.
 
-Options must be a plain object; `null`/`undefined` mean defaults, and anything else (an array, a number) throws. Unknown fields are ignored — TypeScript catches misspelled names at compile time — except option names that were renamed or removed in a past release, which throw with a hint pointing at the replacement.
+Options must be a plain object; `null`/`undefined` mean defaults, and anything else (an array, a number, a class instance) throws. Note that the options bag rides the same value pipeline as data, so an options object with a `toJSON()` method is converted by it first — pass a plain literal. Unknown fields are ignored — TypeScript catches misspelled names at compile time — except option names that were renamed or removed in a past release, which throw with a hint pointing at the replacement.
+
+## Value handling
+
+`stringify` follows `JSON.stringify` semantics: `toJSON()` methods are honored
+(a `Date` serializes as its ISO string), object keys with `undefined` values
+are omitted, and key order is preserved. Values with **no** JSON form fail
+loudly instead of silently serializing as junk: `Map`, `Set`, class instances
+without `toJSON`, `NaN`/`Infinity`, and strings
+containing unpaired surrogates (usually a sign of a string truncated
+mid-character).
+
+**Exact big integers.** `BigInt` values serialize as exact JSON numbers
+(requires `JSON.rawJSON` — Node 21+ / modern browsers; older runtimes throw
+rather than corrupt). On the way back, integers beyond
+`Number.MAX_SAFE_INTEGER` throw by default — a plain JS number cannot hold
+them exactly — or are revived as `BigInt` from the exact source digits with
+`parse(text, { bigints: true })`. The string-to-string functions (`toJson`,
+`fromJson`) carry numbers of any size exactly with no options needed. Note
+that JS has no exact decimal type, so non-integer numbers are always `number`
+(f64) on the JS side.
 
 **Key options:**
 
@@ -130,10 +150,13 @@ Full option reference with inline documentation is in the TypeScript types bundl
 ## Resources
 
 - **Website and live demo**: [textjson.com](https://textjson.com)
-- **Specification**: [tjson-specification.md](https://github.com/rfanth/tjson-spec/blob/master/tjson-specification.md)
 - **Test suite**: [tjson-tests](https://github.com/rfanth/tjson-tests)
 - **Rust/WASM crate**: [tjson-rs](https://crates.io/crates/tjson-rs) — same options, snake_case API
 - **MariaDB/MySQL UDF**: [tjson-udf](https://github.com/rfanth/tjson-udf) — same options in SQL
+- **Specification**: [tjson-specification.md](https://github.com/rfanth/tjson-spec/blob/master/tjson-specification.md) —
+  The spec is versioned independently from this implementation: each release
+  is written against the spec as published at release time (the two are
+  typically released together when the spec behavior changes).
 
 ## License
 

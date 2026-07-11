@@ -182,6 +182,20 @@ mod tests {
     }
 
     #[test]
+    fn preserves_big_integer_digits_exactly() {
+        // Exact numbers are a data-model invariant, not a feature: tjson's
+        // Number stores the original digit string, and every serde_json hop
+        // relies on arbitrary_precision to keep it intact. If this test goes
+        // red, someone has made precision conditional and forked the format's
+        // semantics per-build.
+        let digits = "123456789012345678901234567890123456789";
+        let input = format!("  n:{digits}");
+        let value = parse_str(&input).unwrap();
+        assert!(value.to_json().contains(digits), "to_json must be exact");
+        assert!(render_string(&value).contains(digits), "render must be exact");
+    }
+
+    #[test]
     fn parses_crlf_framed_documents() {
         // Windows-authored files: CRLF line endings must parse identically
         // to LF. (Framing only — CRLF *content* is the multiline-EOL

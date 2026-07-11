@@ -1,6 +1,6 @@
 [package]
 name = "tjson-rs"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
 description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"
@@ -33,7 +33,6 @@ required-features = ["capi"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
-serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 
 # For tests/wasm_boundary.rs, run by `wasm-pack test --node` (test-all.sh
