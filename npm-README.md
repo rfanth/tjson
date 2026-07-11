@@ -43,10 +43,12 @@ TJSON represents the same data model as JSON but renders it in a way that feels 
 npm install @rfanth/tjson
 ```
 
-Or via CDN (no bundler needed):
+Or with no build step at all — the `/web` entry is self-contained (wasm
+inlined, initialized during import, nothing to call or configure) and works
+from any CDN that serves npm packages as files:
 
 ```js
-import { parse, stringify, fromJson, toJson } from 'https://esm.sh/@rfanth/tjson';
+import { parse, stringify, fromJson, toJson } from 'https://unpkg.com/@rfanth/tjson/web/index.js';
 ```
 
 ## Usage
@@ -74,6 +76,19 @@ const json   = toJson(tjson2);
 `fromJson`/`toJson` are the string-in/string-out variants for JSON string pipelines.
 
 All four functions throw an `Error` on invalid input.
+
+### Two entries, same API
+
+- **`@rfanth/tjson`** (the package root) — the lean build for bundlers
+  (webpack, Vite with a wasm plugin) and Node. The wasm ships as a separate
+  file and is instantiated by your toolchain.
+- **`@rfanth/tjson/web`** — the zero-setup build: wasm inlined, initialized
+  by top-level await during import. Works in browsers straight off a CDN,
+  in bundlers without wasm plugins, and in server runtimes — at the cost of
+  a larger payload and no streaming instantiation. If the root entry fights
+  your toolchain, this one won't.
+
+Both expose the identical four functions with identical behavior.
 
 ## Options
 
