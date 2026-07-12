@@ -619,6 +619,16 @@ impl RenderOptions {
 }
 
 impl Default for RenderOptions {
+    // SYNC: several numeric literals below are echoed BY HAND in multiple docs as
+    // "(default: N)" / "Default: `N`" — the CLI --help (`help_text()` in src/bin/tjson.rs),
+    // the builder-method rustdoc above, the TS types (`StringifyOptions` in src/wasm.rs), and
+    // the option tables in README.md, npm-README.md, and ../tjson-udf/README.md. They are
+    // deliberately NOT shared via public constants: constants would reach only the Rust code,
+    // not the markdown/doc-comment prose, so those docs would drift anyway — a false "no-drift"
+    // guarantee bought with permanent public API and slightly ossified tuning knobs. So if you
+    // change table_min_rows, table_min_columns, table_min_similarity, table_column_max_width,
+    // kv_pack_multiple, multiline_min_lines, or multiline_max_lines, update all of those sites
+    // by hand. (wrap_width is the exception: shared via DEFAULT_WRAP_WIDTH, pulled live.)
     fn default() -> Self {
         Self {
             start_indent: 0,

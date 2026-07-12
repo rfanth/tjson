@@ -28,18 +28,27 @@ Usage: tjson [OPTIONS] [-i FILE] [-o FILE]
 Convert JSON to TJSON or TJSON to JSON.
 
 Options:
-  -V, --version               Show program version and exit
-  -j, --json                  Output JSON from TJSON input
   -t, --tjson                 Output TJSON from JSON input (default)
-  -C, --canonical             One key-value pair per line, no inline packing,
-                                no multiline strings, no tables, infinite width
-  -T                          Set wrap width and table widths to terminal width
-  -w, --width N               Wrap column, 0=unlimited, term=terminal width
-                                (default: {})
+  -j, --json                  Output pretty JSON from TJSON input
   -i, --input FILE            Read from file instead of stdin
   -o, --output FILE           Write to file instead of stdout
+      --[no-]final-newline    Enable/disable final newline (default: on)
+  -V, --version               Show program version and exit
 
-Formatting:
+TJSON Output Formatting Options (for output TJSON only, not help/errors/JSON):
+  General:
+  -C, --canonical             One key-value pair per line, no inline packing,
+                                no multiline strings, no tables, inf width,
+                                otherwise default, other options can override
+  -T                          Set wrap and table widths to terminal width
+  -w, --width N               Wrap column, 0=unlimited, term=terminal width
+                                (default: {})
+      --eol VALUE             Output line ending: lf (default), crlf. Prefer lf,
+                                use crlf only when a consumer truly requires it.
+                                This option may become library-only not cli in
+                                favor of platform tools like unix2dos.
+
+  Value formatting:
       --force-markers         Force single-level [ and {{ markers for
                                 nonempty arrays/objects (default: off)
       --[no-]inline           Enable/disable all inline packing (default: on)
@@ -49,19 +58,17 @@ Formatting:
       --bare-keys VALUE       Bare key policy: prefer, none (default: prefer)
       --string-array-style STYLE  String array packing: none, comma, spaces,
                                 prefer-spaces, prefer-comma(default)
-      --[no-]final-newline    Enable/disable final newline (default: on)
-      --eol VALUE             Output line ending: lf (default), crlf. Prefer lf,
-                                use crlf only when a consumer truly requires it
   -k, --kv-pack-multiple N    Spacing multiplier between packed KV pairs,
                                 1-4, spaces = N*2 (default: 2) [experimental]
 
-Tables:
+  Tables:
       --[no-]tables           Enable/disable pipe table rendering (default: on)
       --table-min-rows N      Minimum rows for a table (default: 3)
       --table-min-columns N   Minimum columns for a table (default: 3)
       --table-similarity N    Minimum key-similarity fraction (default: 0.8)
       --table-column-max-width N  Maximum column width in tables (default: 40)
-      --table-fold            Enable / fold continuations for wide table rows [experimental]
+      --table-fold            Enable / fold continuations for wide table rows
+                                [experimental]
       --table-unindent-style STYLE
                                 Table repositioning: left, auto, floating, none
                                 (default: auto)
@@ -69,16 +76,16 @@ Tables:
                                 When to use /< /> indent-offset glyphs:
                                 auto, fixed, none (default: auto)
 
-Multiline strings:
+  Multiline strings:
       --[no-]multiline        Enable/disable multiline string rendering
                                 (default: on)
-      --multiline-style STYLE Style: bold, floating, bold-floating, light,
+      --multiline-style STYLE  Style: bold, floating, bold-floating, light,
                                 transparent, folding-quotes (default: bold)
       --multiline-min-lines N  Minimum EOL count for multiline (default: 1)
       --multiline-max-lines N  Maximum lines before floating falls back to bold,
                                  0=unlimited (default: 10)
 
-Folding:
+  Folding:
       --fold STYLE            Set all fold styles: auto, fixed, none
                                 (does not affect --table-fold)
       --fold-bare STYLE       Fold style for bare strings (default: auto)
@@ -186,8 +193,29 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Output line ending. Applies to the line endings between TJSON output lines and the
-    // trailing newline; JSON output (-j) is unaffected. Defaults to LF.
+    // --eol governs TJSON output line endings. On the CLI we deliberately keep JSON output at
+    // LF (matching the library and canonical JSON) instead of applying --eol to it — the
+    // pretty-printed JSON *has* line endings we could touch, we just choose not to. So pairing
+    // --eol with JSON output is rejected loudly rather than silently ignored or emitting mixed
+    // endings (see the note on finalize_output). --help/--version short-circuit above and never
+    // reach here, so they ignore --eol like every other flag.
+    //
+    // TODO(0.7.0, breaking): the same logic applies to EVERY TJSON-output option (--width,
+    // --bare-strings, --tables, --multiline-*, --fold-*, -C, -T, …): they shape TJSON rendering
+    // and do nothing for JSON output, so they should all be rejected with -j and grouped under a
+    // "TJSON OUTPUT OPTIONS" help heading. That flip is a breaking change — today those flags
+    // accept-and-ignore *correctly* with -j — so batch it into a breaking release. --eol is
+    // different: its only prior behavior with -j (in 0.6.6, hours old) was the buggy mixed-ending
+    // output, so rejecting it is a bugfix that breaks nobody, not the loss of relied-upon behavior.
+    if opt_eol.is_some() && flag_json {
+        eprintln!(
+            "tjson: --eol sets TJSON output line endings only; JSON output is always LF. \
+             To change JSON line endings, use a line-ending conversion tool for your platform"
+        );
+        std::process::exit(1);
+    }
+
+    // Output line ending between TJSON output lines and the trailing newline. Defaults to LF.
     let eol: tjson::Eol = match opt_eol.as_deref() {
         None => tjson::Eol::Lf,
         Some(s) => s.parse().unwrap_or_else(|e| {
@@ -336,6 +364,12 @@ fn main() {
     }
 }
 
+// Appends the trailing newline — the "additional" line ending after the last content line.
+// This terminator MUST match the line endings already in `output`'s body, or the document
+// ends with mixed endings. TJSON output is rendered with this same `eol`, so they agree.
+// JSON output is always LF-bodied (serde_json), which is exactly why `--eol` is rejected for
+// JSON upstream: if that guard is ever loosened, appending a CRLF terminator onto an LF JSON
+// body here is the mixed-ending bug. Keep body-eol and this trailing-eol in agreement.
 fn finalize_output(mut output: String, add_final_newline: bool, eol: tjson::Eol) -> String {
     if add_final_newline && !output.ends_with('\n') {
         output.push_str(eol.as_str());
