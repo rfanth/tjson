@@ -151,6 +151,7 @@ that JS has no exact decimal type, so non-integer numbers are always `number`
 | `stringBareFoldStyle` | `"auto"` | How to fold long bare strings |
 | `stringQuotedFoldStyle` | `"auto"` | How to fold long quoted strings |
 | `stringMultilineFoldStyle` | `"none"` | How to fold multiline block continuation lines |
+| `eol` | `"lf"` | Line ending between output lines (`"lf"` or `"crlf"`) |
 
 **Experimental options** (may change or be removed in a future version):
 

@@ -50,6 +50,8 @@ Formatting:
       --string-array-style STYLE  String array packing: none, comma, spaces,
                                 prefer-spaces, prefer-comma(default)
       --[no-]final-newline    Enable/disable final newline (default: on)
+      --eol VALUE             Output line ending: lf (default), crlf. Prefer lf,
+                                use crlf only when a consumer truly requires it
   -k, --kv-pack-multiple N    Spacing multiplier between packed KV pairs,
                                 1-4, spaces = N*2 (default: 2) [experimental]
 
@@ -168,6 +170,7 @@ fn main() {
     let opt_fold_quoted:     Option<String> = parse_val(&mut args, "--fold-quoted");
     let opt_fold_multiline:  Option<String> = parse_val(&mut args, "--fold-multiline");
     let opt_fold_number:     Option<String> = parse_val(&mut args, "--fold-number");
+    let opt_eol:             Option<String> = parse_val(&mut args, "--eol");
 
     // Check for unrecognised arguments
     let remaining = args.finish();
@@ -182,6 +185,16 @@ fn main() {
         eprintln!("tjson: --json and --tjson are mutually exclusive");
         std::process::exit(1);
     }
+
+    // Output line ending. Applies to the line endings between TJSON output lines and the
+    // trailing newline; JSON output (-j) is unaffected. Defaults to LF.
+    let eol: tjson::Eol = match opt_eol.as_deref() {
+        None => tjson::Eol::Lf,
+        Some(s) => s.parse().unwrap_or_else(|e| {
+            eprintln!("tjson: --eol: {e}");
+            std::process::exit(1);
+        }),
+    };
 
     let input = match &opt_input {
         Some(path) => fs::read_to_string(path).unwrap_or_else(|e| {
@@ -287,6 +300,7 @@ fn main() {
         if let Some(v) = opt_fold_number.as_deref().map(|s| s.parse::<tjson::FoldStyle>().unwrap_or_else(|e| { eprintln!("tjson: --fold-number: {e}"); std::process::exit(1); })) {
             opts = opts.number_fold_style(v);
         }
+        opts = opts.eol(eol);
 
         // JSON -> TJSON (default)
         serde_json::from_str::<serde_json::Value>(&input)
@@ -302,7 +316,7 @@ fn main() {
 
     // --final-newline overrides --no-final-newline (more specific wins)
     let add_final_newline = if flag_final_newline { true } else { !flag_no_final_newline };
-    let output_str = finalize_output(output_str, add_final_newline);
+    let output_str = finalize_output(output_str, add_final_newline, eol);
 
     match &opt_output {
         Some(path) => fs::write(path, output_str).unwrap_or_else(|e| {
@@ -322,9 +336,9 @@ fn main() {
     }
 }
 
-fn finalize_output(mut output: String, add_final_newline: bool) -> String {
+fn finalize_output(mut output: String, add_final_newline: bool, eol: tjson::Eol) -> String {
     if add_final_newline && !output.ends_with('\n') {
-        output.push('\n');
+        output.push_str(eol.as_str());
     }
     output
 }
@@ -336,20 +350,26 @@ fn version_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{finalize_output, version_text};
+    use tjson::Eol;
 
     #[test]
     fn adds_final_newline_by_default() {
-        assert_eq!(finalize_output("abc".to_string(), true), "abc\n");
+        assert_eq!(finalize_output("abc".to_string(), true, Eol::Lf), "abc\n");
     }
 
     #[test]
     fn does_not_double_existing_final_newline() {
-        assert_eq!(finalize_output("abc\n".to_string(), true), "abc\n");
+        assert_eq!(finalize_output("abc\n".to_string(), true, Eol::Lf), "abc\n");
     }
 
     #[test]
     fn can_suppress_final_newline() {
-        assert_eq!(finalize_output("abc".to_string(), false), "abc");
+        assert_eq!(finalize_output("abc".to_string(), false, Eol::Lf), "abc");
+    }
+
+    #[test]
+    fn adds_crlf_final_newline_when_eol_is_crlf() {
+        assert_eq!(finalize_output("abc".to_string(), true, Eol::CrLf), "abc\r\n");
     }
 
     #[test]

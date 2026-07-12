@@ -657,7 +657,7 @@ pub(crate) struct Renderer;
 impl Renderer {
     pub(crate) fn render(value: &Value, options: &RenderOptions) -> String {
         let lines = Self::render_root(value, options, options.start_indent);
-        lines.join("\n")
+        lines.join(options.eol.as_str())
     }
 
     fn render_root(

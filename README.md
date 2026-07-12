@@ -147,6 +147,7 @@ let tjson = tjson::to_string_with(&value, opts)?;
 | `string_bare_fold_style(FoldStyle)` | `Auto` | How to fold long bare strings |
 | `string_quoted_fold_style(FoldStyle)` | `Auto` | How to fold long quoted strings |
 | `string_multiline_fold_style(FoldStyle)` | `None` | How to fold multiline block continuation lines |
+| `eol(Eol)` | `Lf` | Line ending between output lines (`Lf` or `CrLf`) |
 
 **Experimental options** (may change or be removed in a future version):
 

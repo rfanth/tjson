@@ -304,8 +304,12 @@ fn render() {
                 }
             };
 
-            // Strip single trailing newline from expected file
-            let expected = expected_raw.strip_suffix('\n').unwrap_or(&expected_raw);
+            // Strip a single trailing line ending (CRLF or LF) from the expected file,
+            // so fixtures with `eol: "crlf"` can be authored with a natural trailing newline.
+            let expected = expected_raw
+                .strip_suffix("\r\n")
+                .or_else(|| expected_raw.strip_suffix('\n'))
+                .unwrap_or(&expected_raw);
 
             if rendered != expected {
                 failures.push(format!(

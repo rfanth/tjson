@@ -164,6 +164,7 @@ pub struct RenderOptions {
     pub(crate) multiline_style: MultilineStyle,
     pub(crate) multiline_min_lines: usize,
     pub(crate) multiline_max_lines: usize,
+    pub(crate) eol: Eol,
 }
 
 /// Controls how long strings are folded across lines using `/ ` continuation markers.
@@ -318,6 +319,60 @@ impl FromStr for StringArrayStyle {
             "none" => Ok(Self::None),
             _ => Err(format!(
                 "invalid string array style '{input}' (expected one of: spaces, prefer-spaces, comma, prefer-comma, none)"
+            )),
+        }
+    }
+}
+
+/// The end-of-line sequence written between output lines.
+///
+/// Prefer `Lf`. It is the default on every platform, keeps output byte-identical and
+/// canonical, and — per the spec's LF↔CRLF round-trip guarantee — survives conversion to
+/// CRLF and back without data loss, so a consumer that wants CRLF can almost always convert
+/// at its own boundary. Being on Windows is not itself a reason to switch: modern Windows
+/// tooling is largely LF-tolerant. Reach for `CrLf` only when a specific consumer genuinely
+/// requires CRLF and cannot convert on its own — for instance a CRLF-native text pipeline
+/// that would otherwise rewrite the bytes and break a byte-exact comparison against what was
+/// emitted. Choosing `CrLf` gives up canonical, cross-platform-identical output.
+///
+/// This sets the output's line endings, including those between the lines of a multiline
+/// string block. It does not change what that data *means*: a multiline string's local EOL
+/// indicator (the human-readable `\n` / `\r\n` marker) records the data's own line ending and
+/// is preserved regardless of this setting.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Eol {
+    /// Separate output lines with `\n` (line feed). Default, canonical, and the right choice
+    /// in nearly all cases.
+    #[default]
+    Lf,
+    /// Separate output lines with `\r\n` (carriage return + line feed). Non-canonical; use
+    /// only when a specific consumer genuinely requires CRLF — not merely because the platform
+    /// is Windows, which mostly tolerates LF.
+    CrLf,
+}
+
+impl Eol {
+    /// The line-terminator bytes written between output lines (`"\n"` for `Lf`,
+    /// `"\r\n"` for `CrLf`). Useful when appending your own trailing newline in the
+    /// same style as the rendered output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::CrLf => "\r\n",
+        }
+    }
+}
+
+impl FromStr for Eol {
+    type Err = String;
+
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        match input {
+            "lf" => Ok(Self::Lf),
+            "crlf" => Ok(Self::CrLf),
+            _ => Err(format!(
+                "invalid eol '{input}' (expected one of: lf, crlf)"
             )),
         }
     }
@@ -553,6 +608,14 @@ impl RenderOptions {
         self.multiline_max_lines = multiline_max_lines;
         self
     }
+
+    /// Sets the end-of-line sequence written between output lines. `Lf` (default) uses `\n`;
+    /// `CrLf` uses `\r\n`. This affects the output's line endings only — it does not change
+    /// the local EOL indicator carried by multiline string data. Default is `Lf`.
+    pub fn eol(mut self, eol: Eol) -> Self {
+        self.eol = eol;
+        self
+    }
 }
 
 impl Default for RenderOptions {
@@ -584,6 +647,7 @@ impl Default for RenderOptions {
             multiline_style: MultilineStyle::Bold,
             multiline_min_lines: 1,
             multiline_max_lines: 10,
+            eol: Eol::Lf,
         }
     }
 }
@@ -658,6 +722,11 @@ mod camel_de {
         "preferComma"  => super::StringArrayStyle::PreferComma,
         "none"         => super::StringArrayStyle::None,
     );
+
+    camel_option_de!(eol, super::Eol,
+        "lf"   => super::Eol::Lf,
+        "crlf" => super::Eol::CrLf,
+    );
 }
 
 /// The camelCase-deserializable options bag shared by every non-Rust surface:
@@ -714,6 +783,8 @@ pub struct TjsonConfig {
     #[serde(deserialize_with = "camel_de::indent_glyph_marker_style")]
     pub(crate) indent_glyph_marker_style: Option<IndentGlyphMarkerStyle>,
     pub(crate) kv_pack_multiple: Option<usize>,
+    #[serde(deserialize_with = "camel_de::eol")]
+    pub(crate) eol: Option<Eol>,
 }
 
 impl From<TjsonConfig> for RenderOptions {
@@ -745,6 +816,7 @@ impl From<TjsonConfig> for RenderOptions {
         if let Some(v) = c.indent_glyph_style { opts = opts.indent_glyph_style(v); }
         if let Some(v) = c.indent_glyph_marker_style { opts = opts.indent_glyph_marker_style(v); }
         if let Some(v) = c.kv_pack_multiple { opts = opts.kv_pack_multiple_clamped(v); }
+        if let Some(v) = c.eol                { opts = opts.eol(v); }
         opts
     }
 }
@@ -809,6 +881,33 @@ mod tests {
                 .expect("unknown fields must not fail TjsonConfig itself");
         let options = RenderOptions::from(config);
         assert_eq!(options.wrap_width, Some(40), "known fields must still apply");
+    }
+
+    #[test]
+    fn config_eol_maps_through_to_render_options() {
+        // The shared options bag (every non-Rust surface) carries eol as a camelCase
+        // string; it must map to RenderOptions.eol. Absent means the LF default.
+        let default_opts = RenderOptions::from(
+            serde_json::from_str::<TjsonConfig>(r#"{"wrapWidth":40}"#).unwrap(),
+        );
+        assert_eq!(default_opts.eol, Eol::Lf, "eol must default to Lf when absent");
+
+        let crlf_opts = RenderOptions::from(
+            serde_json::from_str::<TjsonConfig>(r#"{"eol":"crlf"}"#).unwrap(),
+        );
+        assert_eq!(crlf_opts.eol, Eol::CrLf, "eol:\"crlf\" must map to Eol::CrLf");
+
+        let lf_opts = RenderOptions::from(
+            serde_json::from_str::<TjsonConfig>(r#"{"eol":"lf"}"#).unwrap(),
+        );
+        assert_eq!(lf_opts.eol, Eol::Lf, "eol:\"lf\" must map to Eol::Lf");
+    }
+
+    #[test]
+    fn eol_from_str_rejects_unknown() {
+        assert_eq!("lf".parse::<Eol>(), Ok(Eol::Lf));
+        assert_eq!("crlf".parse::<Eol>(), Ok(Eol::CrLf));
+        assert!("cr".parse::<Eol>().is_err(), "bare CR is not a supported output eol");
     }
 
     /// Every name in RETIRED_OPTIONS must actually be gone from TjsonConfig —

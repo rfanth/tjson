@@ -46,7 +46,7 @@ mod value;
 
 pub use error::{Error, ParseError, Result};
 pub use options::{
-    BareStyle, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphStyle, MultilineStyle,
+    BareStyle, Eol, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphStyle, MultilineStyle,
     StringArrayStyle, TableUnindentStyle, RenderOptions,
 };
 pub use number::{InvalidNumber, Number};
@@ -210,14 +210,45 @@ mod tests {
 
     #[test]
     fn renderer_never_emits_carriage_returns() {
-        // Output framing is \n on every platform — byte-identical output is
-        // part of being a deterministic data format. CRLF string content is
-        // carried as escaped indicators, never literal \r bytes.
+        // Under the default (LF) output, line endings are \n on every platform —
+        // byte-identical output is part of being a deterministic data format. CRLF
+        // string content is carried as escaped indicators, never literal \r bytes.
+        // (Opting into Eol::CrLf output is covered separately below.)
         let value = tjson_value(
             r#"{"note":"first\r\nsecond","list":[1,2,3],"x":{"y":"z"}}"#,
         );
         let rendered = render_string(&value);
-        assert!(!rendered.contains('\r'), "framing must be LF-only: {rendered:?}");
+        assert!(!rendered.contains('\r'), "default line endings must be LF-only: {rendered:?}");
+    }
+
+    #[test]
+    fn crlf_eol_matches_lf_output_with_replaced_newlines() {
+        // The output line ending is pure post-join line separation: CRLF output must be
+        // byte-identical to LF output with every line-ending \n rewritten to \r\n. The
+        // value exercises structural lines, an inline array, a nested object, and a
+        // multiline string body so the guarantee is checked across all of them.
+        let value = tjson_value(
+            r#"{"a":1,"b":[1,2,3],"c":{"d":"e"},"note":"first\nsecond\nthird"}"#,
+        );
+        let lf = value.to_tjson_with(RenderOptions::default());
+        let crlf = value.to_tjson_with(RenderOptions::default().eol(Eol::CrLf));
+        assert!(
+            lf.contains('\n') && !lf.contains('\r'),
+            "LF baseline must be multi-line and LF-only: {lf:?}"
+        );
+        assert_eq!(
+            crlf,
+            lf.replace('\n', "\r\n"),
+            "CRLF output must equal LF output with every \\n rewritten to \\r\\n"
+        );
+    }
+
+    #[test]
+    fn default_eol_is_lf() {
+        // The default must be LF on every platform — no CRLF creeps in by default.
+        let value = tjson_value(r#"{"a":1,"b":2}"#);
+        let rendered = value.to_tjson_with(RenderOptions::default());
+        assert!(!rendered.contains('\r'), "default output must be LF-only: {rendered:?}");
     }
 
     #[test]

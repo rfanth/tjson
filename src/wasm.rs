@@ -54,6 +54,7 @@ export type TableUnindentStyle = "left" | "auto" | "floating" | "none";
 export type StringArrayStyle = "spaces" | "preferSpaces" | "comma" | "preferComma" | "none";
 export type IndentGlyphStyle = "auto" | "fixed" | "none";
 export type IndentGlyphMarkerStyle = "compact" | "separate";
+export type Eol = "lf" | "crlf";
 
 export interface StringifyOptions {
     /** Start from a preset canonical configuration (one pair per line, no packing, no tables). */
@@ -110,6 +111,8 @@ export interface StringifyOptions {
     indentGlyphMarkerStyle?: IndentGlyphMarkerStyle;
     /** @experimental Spacing multiplier between packed key-value pairs. Valid values: 1–4 (clamped); actual spaces = value × 2. Default: `2` (4 spaces). May be changed or removed in a future version. */
     kvPackMultiple?: number;
+    /** Line ending used between output lines. `"lf"` (default) keeps output canonical and byte-identical across platforms; `"crlf"` is for a consumer that genuinely requires CRLF. Being on Windows is not itself a reason, as most Windows tooling handles LF, and TJSON survives whole-file LF↔CRLF conversion, so a consumer can usually convert on its own. Default: `"lf"`. */
+    eol?: Eol;
 }
 
 export interface ParseOptions {
