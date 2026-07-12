@@ -21,9 +21,13 @@ name: Release
 # Linux users build it with `cargo build --release --features capi` against
 # their own glibc. The musl CLIs are the zero-dependency Linux artifacts.
 #
-# Cut a release:
-#     git tag -a v0.6.3 -m "v0.6.3 - <summary>"
+# Cut a release (annotated tag message becomes the GitHub Release body):
+#     git tag -a v0.6.3 -m "<summary — no need to repeat the version>"
 #     git push origin v0.6.3
+# Prefer `git tag -a` (not a lightweight tag): the annotation is what users
+# see on the Releases page. Skip the version in the message — the tag name
+# already is the version. If the tag has no message, the version-bump commit
+# message is used instead.
 on:
   push:
     tags:
@@ -180,12 +184,47 @@ jobs:
     needs: [linux-x86_64, linux-aarch64, macos, windows]
     runs-on: ubuntu-latest
     steps:
+      # Need the tag object so we can read the annotated message written at
+      # `git tag -a` time. That message is the release notes.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+      # Insurance, not always required: checkout usually brings the annotation
+      # object, but can peel to the tagged commit instead. This re-fetch
+      # guarantees `git tag -l --format='%(contents)'` sees the annotation —
+      # keep it unless you confirm checkout always includes the tag object.
+      - name: Fetch the annotated tag object
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
       - name: Collect all built artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
+      - name: Release notes from the annotated tag message
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Full annotation text (subject + body). Empty for lightweight tags.
+          # Assignment RHS is not word-split, so $(...) needs no quotes here;
+          # quoted anyway for uniformity. $(...) also strips trailing newlines.
+          BODY="$(git tag -l --format='%(contents)' "$TAG")"
+          if [ -z "$BODY" ]; then
+            echo "No annotated tag message on $TAG; using the tagged commit message."
+            BODY="$(git log -1 --format=%B "$TAG")"
+          fi
+          if [ -z "$BODY" ]; then
+            echo "error: no tag annotation and no commit message for $TAG" >&2
+            exit 1
+          fi
+          printf '%s\n' "$BODY" > release-notes.md
+          echo "Release notes for $TAG:"
+          cat release-notes.md
       - name: Create the Release and attach the binaries
         uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*
+          # Our annotated-tag notes on top; GitHub appends its auto-generated
+          # "What's Changed" list and the "Full Changelog" compare link below.
+          # (The REST API pre-pends a supplied body to the generated notes.)
+          body_path: release-notes.md
           generate_release_notes: true
