@@ -4,7 +4,8 @@
 //! # Quick start
 //!
 //! ```
-//! // Deserialize TJSON directly into any serde type
+//! // Deserialize TJSON directly into any serde type. Type mismatches report the
+//! // real source line and column, with a caret excerpt like parse errors.
 //! #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
 //! struct Person { name: String, age: u32 }
 //!
@@ -12,6 +13,11 @@
 //!
 //! // Serialize any serde type to TJSON
 //! let s = tjson::to_string(&p).unwrap();
+//!
+//! // Parse as a Document to preserve comments and presentation (bare vs quoted,
+//! // multiline flavor, table-ness) through a reformat; Value keeps data only.
+//! let doc: tjson::Document = "// header\n  a:1".parse().unwrap();
+//! assert!(doc.to_tjson_with(tjson::RenderOptions::default()).starts_with("// header"));
 //! ```
 //!
 //! # Features
@@ -36,15 +42,21 @@ pub mod wasm;
 #[cfg(feature = "capi")]
 mod ffi;
 
+mod de;
+mod document;
 mod error;
 mod number;
 mod options;
 mod parse;
 mod render;
+mod spanned;
+mod tree;
 mod util;
 mod value;
 
-pub use error::{Error, ParseError, Result};
+pub use document::{Comment, DocEntry, DocNode, Document, Placement};
+pub use error::{DeserializeError, Error, ParseError, Result};
+pub use tree::{KeyForm, MultilineFlavor, StringForm};
 pub use options::{
     BareStyle, Eol, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphStyle, MultilineStyle,
     StringArrayStyle, TableUnindentStyle, RenderOptions,
@@ -74,10 +86,6 @@ use serde::de::DeserializeOwned;
 use parse::ParseOptions;
 
 
-fn parse_str_with_options(input: &str, options: ParseOptions) -> Result<Value> {
-    parse::Parser::parse_document(input, options.start_indent).map_err(Error::Parse)
-}
-
 #[cfg(test)]
 fn render_string(value: &Value) -> String {
     value.to_tjson_with(RenderOptions::default())
@@ -89,6 +97,9 @@ fn render_string_with_options(value: &Value, options: RenderOptions) -> String {
 }
 
 /// Parse a TJSON string and deserialize it into `T` using serde.
+///
+/// Type mismatches report real source locations: the field path, line, column, and the
+/// offending source line with a caret, in the same format as parse errors.
 ///
 /// ```
 /// #[derive(serde::Deserialize, PartialEq, Debug)]
@@ -105,8 +116,27 @@ fn from_tjson_str_with_options<T: DeserializeOwned>(
     input: &str,
     options: ParseOptions,
 ) -> Result<T> {
-    let value = parse_str_with_options(input, options)?;
-    Ok(serde_json::from_str(&value.to_json())?)
+    let tree = parse::Parser::<spanned::SpannedValue>::parse_document(input, options.start_indent)
+        .map_err(Error::Parse)?;
+    de::deserialize_from_tree(&tree, Some(input)).map_err(Error::Deserialize)
+}
+
+/// Deserialize `T` from an already-parsed [`Value`] using serde.
+///
+/// A `Value` has no source text, so type-mismatch errors carry the field path but no
+/// line or column — never fabricated coordinates. Deserialize with [`from_str`] when
+/// source locations matter.
+///
+/// ```
+/// #[derive(serde::Deserialize, PartialEq, Debug)]
+/// struct Person { name: String }
+///
+/// let v: tjson::Value = "  name: Alice".parse().unwrap();
+/// let p: Person = tjson::from_value(&v).unwrap();
+/// assert_eq!(p, Person { name: "Alice".into() });
+/// ```
+pub fn from_value<'de, T: serde::Deserialize<'de>>(value: &'de Value) -> Result<T> {
+    de::deserialize_from_tree(value, None).map_err(Error::Deserialize)
 }
 
 /// Serialize `value` to a TJSON string using default options.

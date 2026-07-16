@@ -1,6 +1,6 @@
 [package]
 name = "tjson-rs"
-version = "0.6.7"
+version = "0.7.0"
 edition = "2024"
 authors = ["R.F. Anthracite <rfa@rfanth.com>"]
 description = "Text JSON (TJSON) - a readability optimized, round trip compatible alternative to JSON"
@@ -55,10 +55,25 @@ serde_json = []
 # to reject unknown option fields; it is not compiled into any other build.
 capi = ["dep:serde_ignored"]
 
+# Fat LTO + single codegen unit: maximum cross-crate optimization for release
+# artifacts (CLI, C ABI cdylib, npm wasm). The cost is release link time only —
+# dev builds and `cargo test` are unaffected. Runtime gains are modest; the real
+# win is wasm size, which is download + instantiation time for the npm package
+# (and is base64-inflated 4/3 in the zero-setup ./web entry).
+[profile.release]
+lto = true
+codegen-units = 1
+
 [dependencies]
 pico-args = { version = "0.5", features = ["eq-separator"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precision"] }
 serde_ignored = { version = "0.1", optional = true }
 unicode-general-category = "1.0"
+
+# For tests/deserialize.rs: the differential rig drives serde derive and the
+# serde_json oracle from an integration-test crate, which only sees dev-dependencies.
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 

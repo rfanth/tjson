@@ -165,6 +165,16 @@ pub struct RenderOptions {
     pub(crate) multiline_min_lines: usize,
     pub(crate) multiline_max_lines: usize,
     pub(crate) eol: Eol,
+    // ---- Annotation policy (Document rendering) ----
+    // Recording is mechanism, normalizing is policy: these flags decide whether the
+    // renderer honors presentation facts recorded on Document nodes. They have no
+    // effect when rendering a plain Value, which carries no facts.
+    pub(crate) honor_string_forms: bool,
+    pub(crate) honor_key_forms: bool,
+    pub(crate) honor_tables: bool,
+    /// Comments are content, not presentation: they get their own switch, and presets
+    /// that normalize layout (canonical) still keep them by default.
+    pub(crate) render_comments: bool,
 }
 
 /// Controls how long strings are folded across lines using `/ ` continuation markers.
@@ -393,8 +403,45 @@ impl RenderOptions {
             string_quoted_fold_style: FoldStyle::None,
             string_multiline_fold_style: FoldStyle::None,
             indent_glyph_style: IndentGlyphStyle::None,
+            // Canonical output is a deterministic function of data plus retained
+            // content: presentation facts are ignored, comments are kept (strip them
+            // with `render_comments(false)` for data-only bytes, e.g. hashing).
+            honor_string_forms: false,
+            honor_key_forms: false,
+            honor_tables: false,
             ..Self::default()
         }
+    }
+
+    /// When true (default), honor per-node string forms recorded on a [`crate::Document`]
+    /// (bare vs quoted vs which multiline flavor), subject to the usual safety fallbacks.
+    /// When false, the global options decide everywhere. No effect on plain [`crate::Value`]s.
+    pub fn honor_string_forms(mut self, honor: bool) -> Self {
+        self.honor_string_forms = honor;
+        self
+    }
+
+    /// When true (default), honor per-entry key forms (bare vs quoted) recorded on a
+    /// [`crate::Document`]. When false, the global `bare_keys` policy decides everywhere.
+    pub fn honor_key_forms(mut self, honor: bool) -> Self {
+        self.honor_key_forms = honor;
+        self
+    }
+
+    /// When true (default), honor per-array table opinions recorded on a
+    /// [`crate::Document`]: an array written as a table renders as one (bypassing the
+    /// size/similarity heuristics, though not physical impossibility), and an array
+    /// written vertically is never table-ified. When false, the table heuristics decide.
+    pub fn honor_tables(mut self, honor: bool) -> Self {
+        self.honor_tables = honor;
+        self
+    }
+
+    /// When true (default), emit comments carried by a [`crate::Document`]. When false,
+    /// strip them — e.g. for canonical data-only bytes to hash or sign.
+    pub fn render_comments(mut self, render: bool) -> Self {
+        self.render_comments = render;
+        self
     }
 
     /// When true, force explicit `[` / `{` indent markers even for a only a single n+2
@@ -658,6 +705,10 @@ impl Default for RenderOptions {
             multiline_min_lines: 1,
             multiline_max_lines: 10,
             eol: Eol::Lf,
+            honor_string_forms: true,
+            honor_key_forms: true,
+            honor_tables: true,
+            render_comments: true,
         }
     }
 }

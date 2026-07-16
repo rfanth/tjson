@@ -221,7 +221,8 @@ impl Value {
     }
 
     pub(crate) fn parse_with(input: &str, options: ParseOptions) -> Result<Self> {
-        crate::parse::Parser::parse_document(input, options.start_indent).map_err(Error::Parse)
+        crate::parse::Parser::<Self>::parse_document(input, options.start_indent)
+            .map_err(Error::Parse)
     }
 
     /// Render this value as a TJSON string using the given options.
@@ -305,6 +306,108 @@ impl serde::Serialize for Value {
                 map.end()
             }
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct ValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("any valid TJSON value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<Value, E> {
+                Ok(Value::Bool(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Value, E> {
+                Ok(Value::Number(Number::from(v)))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Value, E> {
+                Ok(Value::Number(Number::from(v)))
+            }
+
+            fn visit_i128<E: serde::de::Error>(self, v: i128) -> std::result::Result<Value, E> {
+                Ok(Value::Number(Number(v.to_string())))
+            }
+
+            fn visit_u128<E: serde::de::Error>(self, v: u128) -> std::result::Result<Value, E> {
+                Ok(Value::Number(Number(v.to_string())))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Value, E> {
+                Number::try_from(v)
+                    .map(Value::Number)
+                    .map_err(|_| E::custom("NaN and infinity are not valid TJSON numbers"))
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Value, E> {
+                Ok(Value::String(v.to_owned()))
+            }
+
+            fn visit_string<E>(self, v: String) -> std::result::Result<Value, E> {
+                Ok(Value::String(v))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> std::result::Result<Value, D::Error> {
+                serde::Deserialize::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Value::Array(items))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Value, A::Error> {
+                use serde::de::Error;
+                let Some(first_key) = map.next_key::<String>()? else {
+                    return Ok(Value::Object(Vec::new()));
+                };
+                // Numbers that can't ride a primitive visit arrive as serde_json's
+                // token map; capture the exact digits instead of building an object.
+                if Number::is_number_token_key(&first_key) {
+                    let digits: String = map.next_value()?;
+                    let number = digits
+                        .parse::<Number>()
+                        .map_err(|invalid| A::Error::custom(invalid.to_string()))?;
+                    return Ok(Value::Number(number));
+                }
+                let mut entries = vec![Entry { key: first_key, value: map.next_value()? }];
+                while let Some((key, value)) = map.next_entry()? {
+                    entries.push(Entry { key, value });
+                }
+                Ok(Value::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(ValueVisitor)
     }
 }
 

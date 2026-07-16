@@ -1,10 +1,15 @@
+use std::marker::PhantomData;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::number::Number;
 
 use crate::error::ParseError;
-use crate::value::{Entry, Value};
+use crate::tree::{
+    ContainerFacts, EntryFacts, KeyForm, MultilineFlavor, RawComment, ScalarFacts, Span,
+    StringFacts, StringForm, Tree,
+};
 use crate::util::*;
 
 #[non_exhaustive]
@@ -102,12 +107,17 @@ impl IndentTracker {
     }
 }
 
-pub(crate) struct Parser<'a> {
+pub(crate) struct Parser<'a, T: Tree> {
     input: &'a str,
     line_offsets: Vec<LineSpan>,
     line: usize,
     start_indent: usize,
     idt: IndentTracker,
+    /// Comment lines seen but not yet attached to a node. Only populated when
+    /// `T::KEEPS_COMMENTS`; drained at the next node-creating site, so a comment
+    /// always attaches to the next structural thing after it.
+    pending_comments: Vec<RawComment>,
+    target: PhantomData<T>,
 }
 
 pub(crate) struct LineSpan {
@@ -139,24 +149,41 @@ pub(crate) fn scan_lines(input: &str) -> std::result::Result<Vec<LineSpan>, Pars
     Ok(offsets)
 }
 
-impl<'a> Parser<'a> {
+impl<'a, T: Tree> Parser<'a, T> {
     pub(crate) fn parse_document(
         input: &'a str,
         start_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
+        // Span offsets are stored as u32 (see tree::Span); bound the input before any
+        // are produced so an oversized document fails loudly instead of mis-spanning.
+        if input.len() > u32::MAX as usize {
+            return Err(ParseError::new(1, 1, "input larger than 4 GiB is not supported", None));
+        }
         let mut parser = Self {
             input,
             line_offsets: scan_lines(input)?,
             line: 0,
             start_indent,
             idt: IndentTracker::new(),
+            pending_comments: Vec::new(),
+            target: PhantomData,
         };
         parser.skip_ignorable_lines()?;
         if parser.line >= parser.line_offsets.len() {
             return Err(ParseError::new(1, 1, "empty input", None));
         }
-        let value = parser.parse_root_value()?;
+        let root_pending = parser.take_pending_comments();
+        let mut value = parser.parse_root_value()?;
+        if T::KEEPS_COMMENTS && !root_pending.is_empty() {
+            T::attach_comments_before(&mut value, root_pending, start_indent);
+        }
         parser.skip_ignorable_lines()?;
+        if T::KEEPS_COMMENTS {
+            let trailing = parser.take_pending_comments();
+            if !trailing.is_empty() {
+                T::attach_trailing_comments(&mut value, trailing);
+            }
+        }
         if parser.line < parser.line_offsets.len() {
             let current = parser.current_line().unwrap_or("").trim_start();
             let msg = if current.starts_with("/>") {
@@ -171,7 +198,58 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn parse_root_value(&mut self) -> std::result::Result<Value, ParseError> {
+    // ---- Facts plumbing ----
+    //
+    // Spans handed to Tree constructors cover the token's bytes in the original input
+    // when the parser can compute them cheaply (single-line tokens with a known column),
+    // and degrade to the whole current line otherwise (fold continuations, folded table
+    // rows — anything reassembled across lines). Columns threaded through the inline
+    // consumption loops are raw byte offsets within the physical line, NOT logical
+    // indents: spans always address real input bytes.
+
+    fn line_span(&self, index: usize) -> Span {
+        match self.line_offsets.get(index) {
+            Some(line) => Span::new(line.start, line.len),
+            None => Span::default(),
+        }
+    }
+
+    fn current_span(&self) -> Span {
+        self.line_span(self.line)
+    }
+
+    /// Span of `len` bytes at byte column `col` of the current line; the whole current
+    /// line when the caller lost column tracking (`col == None`).
+    fn span_at(&self, col: Option<usize>, len: usize) -> Span {
+        match (col, self.line_offsets.get(self.line)) {
+            (Some(col), Some(line)) if col <= line.len => {
+                Span::new(line.start + col, len.min(line.len - col))
+            }
+            _ => self.current_span(),
+        }
+    }
+
+    fn scalar_facts_at(&self, col: Option<usize>, len: usize) -> ScalarFacts {
+        ScalarFacts { span: self.span_at(col, len) }
+    }
+
+    fn string_facts_at(&self, form: StringForm, col: Option<usize>, len: usize) -> StringFacts {
+        StringFacts { form, span: self.span_at(col, len) }
+    }
+
+    fn container_facts_from(&self, span: Span) -> ContainerFacts {
+        ContainerFacts { span, table: false }
+    }
+
+    fn container_facts(&self) -> ContainerFacts {
+        ContainerFacts { span: self.current_span(), table: false }
+    }
+
+    fn entry_facts(&self, key_form: KeyForm) -> EntryFacts {
+        EntryFacts { key_form, key_span: self.current_span() }
+    }
+
+    fn parse_root_value(&mut self) -> std::result::Result<T, ParseError> {
         let line = self
             .current_line()
             .ok_or_else(|| ParseError::new(1, 1, "empty input", None))?
@@ -215,19 +293,22 @@ impl<'a> Parser<'a> {
     fn parse_implicit_object(
         &mut self,
         parent_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
+        // Implicit containers have no opener token; their span is the line their first
+        // entry starts on, captured before parsing moves past it.
+        let open_span = self.current_span();
         let mut entries = Vec::new();
         self.parse_object_tail(parent_indent + 2, &mut entries)?;
         if entries.is_empty() {
             return Err(self.error_current("expected at least one object entry"));
         }
-        Ok(Value::Object(entries))
+        Ok(T::new_object(entries, self.container_facts_from(open_span)))
     }
 
     fn parse_implicit_array(
         &mut self,
         parent_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
         self.skip_ignorable_lines()?;
         let elem_indent = parent_indent + 2;
         let line = self
@@ -244,18 +325,19 @@ impl<'a> Parser<'a> {
         if content.starts_with('|') {
             return self.parse_table_array(elem_indent);
         }
+        let open_span = self.current_span();
         let mut elements = Vec::new();
         self.parse_array_tail(parent_indent, &mut elements)?;
         if elements.is_empty() {
             return Err(self.error_current("expected at least one array element"));
         }
-        Ok(Value::Array(elements))
+        Ok(T::new_array(elements, self.container_facts_from(open_span)))
     }
 
     fn parse_table_array(
         &mut self,
         elem_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
         let header_line = self
             .current_line()
             .ok_or_else(|| self.error_current("expected a table header"))?
@@ -263,6 +345,7 @@ impl<'a> Parser<'a> {
         self.ensure_line_has_no_tabs(self.line)?;
         let header_file_indent = elem_indent.saturating_sub(self.idt.offset());
         let header = &header_line[header_file_indent..];
+        let header_span = self.current_span();
         let columns = self.parse_table_header(header, elem_indent)?;
         self.line += 1;
         let mut rows = Vec::new();
@@ -328,16 +411,21 @@ impl<'a> Parser<'a> {
                 self.ensure_line_has_no_tabs(self.line)?;
                 row_owned.push_str(&cont_suffix);
             }
-            rows.push(self.parse_table_row(&columns, &row_owned, elem_indent)?);
+            let pending = self.take_pending_comments();
+            let mut parsed_row = self.parse_table_row(&columns, &row_owned, elem_indent)?;
+            if T::KEEPS_COMMENTS && !pending.is_empty() {
+                T::attach_comments_before(&mut parsed_row, pending, elem_indent);
+            }
+            rows.push(parsed_row);
             self.line += 1;
         }
         if rows.is_empty() {
             return Err(self.error_current("table arrays must contain at least one row"));
         }
-        Ok(Value::Array(rows))
+        Ok(T::new_array(rows, ContainerFacts { span: header_span, table: true }))
     }
 
-    fn parse_table_header(&self, row: &str, indent: usize) -> std::result::Result<Vec<String>, ParseError> {
+    fn parse_table_header(&self, row: &str, indent: usize) -> std::result::Result<Vec<(String, KeyForm)>, ParseError> {
         let mut cells = split_pipe_cells(row)
             .ok_or_else(|| self.error_at_line(self.line, indent + 1, "invalid table header"))?;
         if cells.first().is_some_and(String::is_empty) {
@@ -361,24 +449,24 @@ impl<'a> Parser<'a> {
             .collect()
     }
 
-    fn parse_table_header_key(&self, cell: &str, col: usize) -> std::result::Result<String, ParseError> {
+    fn parse_table_header_key(&self, cell: &str, col: usize) -> std::result::Result<(String, KeyForm), ParseError> {
         if let Some(end) = parse_bare_key_prefix(cell)
             && end == cell.len() {
-                return Ok(cell.to_owned());
+                return Ok((cell.to_owned(), KeyForm::Bare));
             }
         if let Some((value, end)) = parse_json_string_prefix(cell)
             && end == cell.len() {
-                return Ok(value);
+                return Ok((value, KeyForm::Quoted));
             }
         Err(self.error_at_line(self.line, col, "invalid table header key"))
     }
 
     fn parse_table_row(
         &self,
-        columns: &[String],
+        columns: &[(String, KeyForm)],
         row: &str,
         indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
         let mut cells = split_pipe_cells(row)
             .ok_or_else(|| self.error_at_line(self.line, indent + 1, "invalid table row"))?;
         if cells.first().is_some_and(String::is_empty) {
@@ -396,17 +484,18 @@ impl<'a> Parser<'a> {
             ));
         }
         let mut entries = Vec::new();
-        for (index, key) in columns.iter().enumerate() {
+        for (index, (key, key_form)) in columns.iter().enumerate() {
             let cell = cells[index].trim_end();
             if cell.is_empty() {
                 continue;
             }
-            entries.push(Entry { key: key.clone(), value: self.parse_table_cell_value(cell)? });
+            let value = self.parse_table_cell_value(cell)?;
+            entries.push(T::new_entry(key.clone(), value, self.entry_facts(*key_form)));
         }
-        Ok(Value::Object(entries))
+        Ok(T::new_object(entries, self.container_facts()))
     }
 
-    fn parse_table_cell_value(&self, cell: &str) -> std::result::Result<Value, ParseError> {
+    fn parse_table_cell_value(&self, cell: &str) -> std::result::Result<T, ParseError> {
         if cell.is_empty() {
             return Err(self.error_at_line(
                 self.line,
@@ -414,33 +503,37 @@ impl<'a> Parser<'a> {
                 "empty table cells mean the key is absent",
             ));
         }
+        // Cell facts carry row-line spans: folded rows are reassembled strings, so
+        // per-cell byte columns are not reliably recoverable from the physical line.
         if let Some(value) = cell.strip_prefix(' ') {
             if !is_allowed_bare_string(value) {
                 return Err(self.error_at_line(self.line, 1, "invalid bare string in table cell"));
             }
-            return Ok(Value::String(value.to_owned()));
+            let facts = self.string_facts_at(StringForm::Bare, None, 0);
+            return Ok(T::new_string(value.to_owned(), facts));
         }
         if let Some((value, end)) = parse_json_string_prefix(cell)
             && end == cell.len() {
-                return Ok(Value::String(value));
+                let facts = self.string_facts_at(StringForm::Quoted, None, 0);
+                return Ok(T::new_string(value, facts));
             }
         if cell == "true" {
-            return Ok(Value::Bool(true));
+            return Ok(T::new_bool(true, self.scalar_facts_at(None, 0)));
         }
         if cell == "false" {
-            return Ok(Value::Bool(false));
+            return Ok(T::new_bool(false, self.scalar_facts_at(None, 0)));
         }
         if cell == "null" {
-            return Ok(Value::Null);
+            return Ok(T::new_null(self.scalar_facts_at(None, 0)));
         }
         if cell == "[]" {
-            return Ok(Value::Array(Vec::new()));
+            return Ok(T::new_array(Vec::new(), self.container_facts()));
         }
         if cell == "{}" {
-            return Ok(Value::Object(Vec::new()));
+            return Ok(T::new_object(Vec::new(), self.container_facts()));
         }
         if let Ok(n) = cell.parse::<Number>() {
-            return Ok(Value::Number(n));
+            return Ok(T::new_number(n, self.scalar_facts_at(None, 0)));
         }
         Err(self.error_at_line(self.line, 1, "invalid table cell value"))
     }
@@ -448,7 +541,7 @@ impl<'a> Parser<'a> {
     fn parse_object_tail(
         &mut self,
         pair_indent: usize,
-        entries: &mut Vec<Entry>,
+        entries: &mut Vec<T::Entry>,
     ) -> std::result::Result<(), ParseError> {
         loop {
             self.skip_ignorable_lines()?;
@@ -481,7 +574,17 @@ impl<'a> Parser<'a> {
             if content.is_empty() {
                 return Err(self.error_current("blank lines are not valid inside objects"));
             }
-            let line_entries = self.parse_object_line_content(content, pair_indent)?;
+            // Comments preceding this line attach to the line's first entry; comments
+            // captured while parsing nested values drain at deeper sites.
+            let pending = self.take_pending_comments();
+            let mut line_entries =
+                self.parse_object_line_content(content, pair_indent, Some(file_indent))?;
+            if T::KEEPS_COMMENTS
+                && !pending.is_empty()
+                && let Some(first) = line_entries.first_mut()
+            {
+                T::attach_entry_comments(first, pending, pair_indent);
+            }
             entries.extend(line_entries);
         }
         Ok(())
@@ -491,17 +594,30 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         pair_indent: usize,
-    ) -> std::result::Result<Vec<Entry>, ParseError> {
+        col0: Option<usize>,
+    ) -> std::result::Result<Vec<T::Entry>, ParseError> {
         let mut rest = content.to_owned();
+        // Byte column of `rest`'s first byte within the current physical line. Lost
+        // (None) once a fold continuation moves part of the entry to another line.
+        let mut col = col0;
         let mut entries = Vec::new();
         loop {
-            let (key, after_colon) = self.parse_key(&rest, pair_indent)?;
+            let key_line = self.line;
+            let prev_len = rest.len();
+            let (key, key_form, after_colon) = self.parse_key(&rest, pair_indent)?;
+            if self.line != key_line {
+                col = None;
+            }
+            // Raw source extent of the key: everything before the colon, quotes included.
+            let key_raw_len = prev_len - after_colon.len() - 1;
+            let key_facts = EntryFacts { key_form, key_span: self.span_at(col, key_raw_len) };
             rest = after_colon;
+            col = col.map(|c| c + key_raw_len + 1);
 
             if rest.is_empty() {
                 self.line += 1;
                 let value = self.parse_value_after_key(pair_indent)?;
-                entries.push(Entry { key, value });
+                entries.push(T::new_entry(key, value, key_facts));
                 return Ok(entries);
             }
 
@@ -511,13 +627,13 @@ impl<'a> Parser<'a> {
                 self.idt.push_glyph(glyph_file_indent);
                 self.line += 1;
                 let value = self.parse_value_after_key(pair_indent)?;
-                entries.push(Entry { key, value });
+                entries.push(T::new_entry(key, value, key_facts));
                 return Ok(entries);
             }
 
             let (value, consumed) =
-                self.parse_inline_value(&rest, pair_indent, ArrayLineValueContext::ObjectValue)?;
-            entries.push(Entry { key, value });
+                self.parse_inline_value(&rest, pair_indent, ArrayLineValueContext::ObjectValue, col)?;
+            entries.push(T::new_entry(key, value, key_facts));
 
             let Some(consumed) = consumed else {
                 return Ok(entries);
@@ -536,6 +652,7 @@ impl<'a> Parser<'a> {
             // a parser would be within its rights to reject an odd number of spaces here.
             let space_count = rest.bytes().take_while(|&b| b == b' ').count();
             rest = rest[space_count..].to_owned();
+            col = col.map(|c| c + consumed + space_count);
             if rest.is_empty() {
                 return Err(self.error_current("object lines cannot end with a separator"));
             }
@@ -545,7 +662,7 @@ impl<'a> Parser<'a> {
     fn parse_value_after_key(
         &mut self,
         pair_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
         self.skip_ignorable_lines()?;
         let child_indent = pair_indent + 2;
         let line = self
@@ -565,7 +682,10 @@ impl<'a> Parser<'a> {
         if indent == pair_indent && content.starts_with("/ ") {
             let continuation_content = &content[2..];
             let (value, consumed) = self.parse_inline_value(
-                continuation_content, pair_indent, ArrayLineValueContext::ObjectValue,
+                continuation_content,
+                pair_indent,
+                ArrayLineValueContext::ObjectValue,
+                Some(file_indent + 2),
             )?;
             if consumed.is_some() {
                 self.line += 1;
@@ -596,14 +716,19 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         line_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
         if is_minimal_json_candidate(content) {
-            let value = self.parse_minimal_json_line(content)?;
+            let span = self.span_at(Some(self.start_indent), content.len());
+            let value = self.parse_minimal_json_line(content, span)?;
             self.line += 1;
             return Ok(value);
         }
-        let (value, consumed) =
-            self.parse_inline_value(content, line_indent, ArrayLineValueContext::SingleValue)?;
+        let (value, consumed) = self.parse_inline_value(
+            content,
+            line_indent,
+            ArrayLineValueContext::SingleValue,
+            Some(self.start_indent),
+        )?;
         if let Some(consumed) = consumed {
             if consumed != content.len() {
                 return Err(self.error_current("only one value may appear here"));
@@ -616,7 +741,7 @@ impl<'a> Parser<'a> {
     fn parse_array_tail(
         &mut self,
         parent_indent: usize,
-        elements: &mut Vec<Value>,
+        elements: &mut Vec<T>,
     ) -> std::result::Result<(), ParseError> {
         let elem_indent = parent_indent + 2;
         loop {
@@ -653,17 +778,36 @@ impl<'a> Parser<'a> {
                     self.line += 1;
                     continue;
                 }
-                self.parse_array_line_content(&line[elem_struct_pos..], elem_indent, elements)?;
+                let pending = self.take_pending_comments();
+                let first_new = elements.len();
+                self.parse_array_line_content(
+                    &line[elem_struct_pos..],
+                    elem_indent,
+                    elements,
+                    Some(elem_struct_pos),
+                )?;
+                if T::KEEPS_COMMENTS
+                    && !pending.is_empty()
+                    && let Some(first) = elements.get_mut(first_new)
+                {
+                    T::attach_comments_before(first, pending, elem_indent);
+                }
                 continue;
             }
             // Standalone glyph at structural indent elem_indent+2: introduces a nested sub-array.
             let sub_glyph_struct = (elem_indent + 2).saturating_sub(self.idt.offset());
             if file_indent == sub_glyph_struct + 1 && content == "/<" {
                 self.idt.push_glyph(sub_glyph_struct);
+                let open_span = self.current_span();
+                let pending = self.take_pending_comments();
                 self.line += 1;
                 let mut sub_elements = Vec::new();
                 self.parse_array_tail(elem_indent, &mut sub_elements)?;
-                elements.push(Value::Array(sub_elements));
+                let mut sub_array = T::new_array(sub_elements, self.container_facts_from(open_span));
+                if T::KEEPS_COMMENTS && !pending.is_empty() {
+                    T::attach_comments_before(&mut sub_array, pending, elem_indent);
+                }
+                elements.push(sub_array);
                 continue;
             }
             if indent != elem_indent {
@@ -676,12 +820,22 @@ impl<'a> Parser<'a> {
             if content.starts_with('|') {
                 return Err(self.error_current("table arrays are only valid as the entire array"));
             }
+            let pending = self.take_pending_comments();
+            let first_new = elements.len();
             if is_minimal_json_candidate(content) {
-                elements.push(self.parse_minimal_json_line(content)?);
+                let span = self.span_at(Some(file_indent), content.len());
+                elements.push(self.parse_minimal_json_line(content, span)?);
                 self.line += 1;
-                continue;
+            } else {
+                self.parse_array_line_content(content, elem_indent, elements, Some(file_indent))?;
             }
-            self.parse_array_line_content(content, elem_indent, elements)?;
+            // Comments preceding this line attach to the line's first element.
+            if T::KEEPS_COMMENTS
+                && !pending.is_empty()
+                && let Some(first) = elements.get_mut(first_new)
+            {
+                T::attach_comments_before(first, pending, elem_indent);
+            }
         }
         Ok(())
     }
@@ -690,14 +844,18 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         elem_indent: usize,
-        elements: &mut Vec<Value>,
+        elements: &mut Vec<T>,
+        col0: Option<usize>,
     ) -> std::result::Result<(), ParseError> {
         let mut rest = content;
         let mut string_only_mode = false;
         loop {
+            // `rest` is always a suffix of `content`, so the element's byte column is
+            // recoverable from how much has been consumed.
+            let col = col0.map(|c| c + (content.len() - rest.len()));
             let (value, consumed) =
-                self.parse_inline_value(rest, elem_indent, ArrayLineValueContext::ArrayLine)?;
-            let is_string = matches!(value, Value::String(_));
+                self.parse_inline_value(rest, elem_indent, ArrayLineValueContext::ArrayLine, col)?;
+            let is_string = value.is_string();
             if string_only_mode && !is_string {
                 return Err(self.error_current(
                     "two-space array packing is only allowed when all values are strings",
@@ -742,7 +900,13 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         line_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+    ) -> std::result::Result<T, ParseError> {
+        // Every container introduced by this marker line carries the marker line's span.
+        let open_span = self.current_span();
+        // Comments preceding a marker line attach to the container it introduces.
+        let pending = self.take_pending_comments();
+        // `line_indent` is logical; spans need the raw byte column of `content`'s start.
+        let base_col = line_indent.saturating_sub(self.idt.offset());
         let mut rest = content;
         let mut markers = Vec::new();
         loop {
@@ -784,7 +948,7 @@ impl<'a> Parser<'a> {
                     if elements.is_empty() {
                         return Err(self.error_current("expected at least one array element after indent glyph"));
                     }
-                    Value::Array(elements)
+                    T::new_array(elements, self.container_facts_from(open_span))
                 }
                 ContainerKind::Object => {
                     let pair_indent = deepest_parent_indent + 2;
@@ -793,14 +957,17 @@ impl<'a> Parser<'a> {
                     if entries.is_empty() {
                         return Err(self.error_current("expected at least one object entry after indent glyph"));
                     }
-                    Value::Object(entries)
+                    T::new_object(entries, self.container_facts_from(open_span))
                 }
             };
             for level in (0..markers.len().saturating_sub(1)).rev() {
                 let parent_indent = line_indent + 2 * level;
                 let mut wrapped = vec![value];
                 self.parse_array_tail(parent_indent, &mut wrapped)?;
-                value = Value::Array(wrapped);
+                value = T::new_array(wrapped, self.container_facts_from(open_span));
+            }
+            if T::KEEPS_COMMENTS && !pending.is_empty() {
+                T::attach_comments_before(&mut value, pending, line_indent);
             }
             return Ok(value);
         }
@@ -821,52 +988,70 @@ impl<'a> Parser<'a> {
                     let parent_indent = line_indent + 2 * level;
                     let mut wrapped = vec![value];
                     self.parse_array_tail(parent_indent, &mut wrapped)?;
-                    value = Value::Array(wrapped);
+                    value = T::new_array(wrapped, self.container_facts_from(open_span));
+                }
+                if T::KEEPS_COMMENTS && !pending.is_empty() {
+                    T::attach_comments_before(&mut value, pending, line_indent);
                 }
                 return Ok(value);
             }
         }
 
+        let rest_col = base_col + (content.len() - rest.len());
         let mut value = match *markers.last().unwrap() {
             ContainerKind::Array => {
                 let mut elements = Vec::new();
                 if is_minimal_json_candidate(rest) {
-                    elements.push(self.parse_minimal_json_line(rest)?);
+                    let span = self.span_at(Some(rest_col), rest.len());
+                    elements.push(self.parse_minimal_json_line(rest, span)?);
                     self.line += 1;
                     self.parse_array_tail(deepest_parent_indent, &mut elements)?;
                 } else {
-                    self.parse_array_line_content(rest, deepest_parent_indent + 2, &mut elements)?;
+                    self.parse_array_line_content(
+                        rest,
+                        deepest_parent_indent + 2,
+                        &mut elements,
+                        Some(rest_col),
+                    )?;
                     self.parse_array_tail(deepest_parent_indent, &mut elements)?;
                 }
-                Value::Array(elements)
+                T::new_array(elements, self.container_facts_from(open_span))
             }
             ContainerKind::Object => {
                 let pair_indent = line_indent + 2 * markers.len();
-                let mut entries = self.parse_object_line_content(rest, pair_indent)?;
+                let mut entries =
+                    self.parse_object_line_content(rest, pair_indent, Some(rest_col))?;
                 self.parse_object_tail(pair_indent, &mut entries)?;
-                Value::Object(entries)
+                T::new_object(entries, self.container_facts_from(open_span))
             }
         };
         for level in (0..markers.len().saturating_sub(1)).rev() {
             let parent_indent = line_indent + 2 * level;
             let mut wrapped = vec![value];
             self.parse_array_tail(parent_indent, &mut wrapped)?;
-            value = Value::Array(wrapped);
+            value = T::new_array(wrapped, self.container_facts_from(open_span));
+        }
+        if T::KEEPS_COMMENTS && !pending.is_empty() {
+            T::attach_comments_before(&mut value, pending, line_indent);
         }
         Ok(value)
     }
 
-    /// Parse an object key, returning `(key_string, rest_after_colon)`.
+    /// Parse an object key, returning `(key_string, key_form, rest_after_colon)`.
     /// Handles fold continuations (`/ `) for both bare keys and JSON string keys.
     fn parse_key(
         &mut self,
         content: &str,
         fold_indent: usize,
-    ) -> std::result::Result<(String, String), ParseError> {
+    ) -> std::result::Result<(String, KeyForm, String), ParseError> {
         // Bare key on this line
         if let Some(end) = parse_bare_key_prefix(content) {
             if content.get(end..).is_some_and(|rest| rest.starts_with(':')) {
-                return Ok((content[..end].to_owned(), content[end + ':'.len_utf8()..].to_owned()));
+                return Ok((
+                    content[..end].to_owned(),
+                    KeyForm::Bare,
+                    content[end + ':'.len_utf8()..].to_owned(),
+                ));
             }
             // Bare key fills the whole line — look for fold continuations
             if end == content.len() {
@@ -886,7 +1071,11 @@ impl<'a> Parser<'a> {
                     if let Some(colon_pos) = colon_pos {
                         key_acc.push_str(&cont_owned[..colon_pos]);
                         self.line = next - 1; // point to last fold line; caller will +1
-                        return Ok((key_acc, cont_owned[colon_pos + ':'.len_utf8()..].to_owned()));
+                        return Ok((
+                            key_acc,
+                            KeyForm::Bare,
+                            cont_owned[colon_pos + ':'.len_utf8()..].to_owned(),
+                        ));
                     }
                     key_acc.push_str(&cont_owned);
                 }
@@ -895,7 +1084,7 @@ impl<'a> Parser<'a> {
         // JSON string key on this line
         if let Some((value, end)) = parse_json_string_prefix(content)
             && content.get(end..).is_some_and(|rest| rest.starts_with(':')) {
-                return Ok((value, content[end + ':'.len_utf8()..].to_owned()));
+                return Ok((value, KeyForm::Quoted, content[end + ':'.len_utf8()..].to_owned()));
             }
         // JSON string key that doesn't close on this line — look for fold continuations
         if content.starts_with('"') && parse_json_string_prefix(content).is_none() {
@@ -915,7 +1104,11 @@ impl<'a> Parser<'a> {
                 if let Some((value, end)) = parse_json_string_prefix(&json_acc)
                     && json_acc.get(end..).is_some_and(|rest| rest.starts_with(':')) {
                         self.line = next - 1; // point to last fold line; caller will +1
-                        return Ok((value, json_acc[end + ':'.len_utf8()..].to_owned()));
+                        return Ok((
+                            value,
+                            KeyForm::Quoted,
+                            json_acc[end + ':'.len_utf8()..].to_owned(),
+                        ));
                     }
             }
         }
@@ -927,7 +1120,8 @@ impl<'a> Parser<'a> {
         content: &str,
         line_indent: usize,
         context: ArrayLineValueContext,
-    ) -> std::result::Result<(Value, Option<usize>), ParseError> {
+        col: Option<usize>,
+    ) -> std::result::Result<(T, Option<usize>), ParseError> {
         let first = content
             .chars()
             .next()
@@ -936,19 +1130,24 @@ impl<'a> Parser<'a> {
             ' ' => {
                 if context == ArrayLineValueContext::ObjectValue {
                     if content.starts_with(" []") {
-                        return Ok((Value::Array(Vec::new()), Some(3)));
+                        let facts = ContainerFacts { span: self.span_at(col.map(|c| c + 1), 2), table: false };
+                        return Ok((T::new_array(Vec::new(), facts), Some(3)));
                     }
                     if content.starts_with(" {}") {
-                        return Ok((Value::Object(Vec::new()), Some(3)));
+                        let facts = ContainerFacts { span: self.span_at(col.map(|c| c + 1), 2), table: false };
+                        return Ok((T::new_object(Vec::new(), facts), Some(3)));
                     }
                     if let Some(rest) = content.strip_prefix("  ") {
-                        let value = self.parse_inline_array(rest, line_indent)?;
+                        let value = self.parse_inline_array(rest, line_indent, col.map(|c| c + 2))?;
                         return Ok((value, None));
                     }
                 }
                 if content.starts_with(" `") {
-                    let value = self.parse_multiline_string(content, line_indent)?;
-                    return Ok((Value::String(value), None));
+                    // Opener facts are captured before the body parse moves past it.
+                    let opener_span = self.span_at(col.map(|c| c + 1), content.len().saturating_sub(1));
+                    let (value, flavor) = self.parse_multiline_string(content, line_indent)?;
+                    let facts = StringFacts { form: StringForm::Multiline(flavor), span: opener_span };
+                    return Ok((T::new_string(value, facts), None));
                 }
                 let end = bare_string_end(content, context);
                 if end == 0 {
@@ -977,42 +1176,69 @@ impl<'a> Parser<'a> {
                         fold_count += 1;
                     }
                     if fold_count > 0 {
+                        // Facts before the line advance so the span lands on the opener line.
+                        let facts = self.string_facts_at(
+                            StringForm::Bare,
+                            col.map(|c| c + 1),
+                            end.saturating_sub(1),
+                        );
                         self.line = next;
-                        return Ok((Value::String(acc), None));
+                        return Ok((T::new_string(acc, facts), None));
                     }
                 }
-                Ok((Value::String(value.to_owned()), Some(end)))
+                Ok((
+                    T::new_string(
+                        value.to_owned(),
+                        self.string_facts_at(StringForm::Bare, col.map(|c| c + 1), end.saturating_sub(1)),
+                    ),
+                    Some(end),
+                ))
             }
             '"' => {
                 if let Some((value, end)) = parse_json_string_prefix(content) {
-                    return Ok((Value::String(value), Some(end)));
+                    return Ok((
+                        T::new_string(value, self.string_facts_at(StringForm::Quoted, col, end)),
+                        Some(end),
+                    ));
                 }
+                // Facts before the fold consumption moves past the opening line.
+                let facts = self.string_facts_at(StringForm::Quoted, col, content.len());
                 let value = self.parse_folded_json_string(content, line_indent)?;
-                Ok((Value::String(value), None))
+                Ok((T::new_string(value, facts), None))
             }
             '[' => {
                 if content.starts_with("[]") {
-                    return Ok((Value::Array(Vec::new()), Some(2)));
+                    let facts = ContainerFacts { span: self.span_at(col, 2), table: false };
+                    return Ok((T::new_array(Vec::new(), facts), Some(2)));
                 }
                 if is_minimal_json_candidate(content) {
-                    let value = self.parse_minimal_json_line(content)?;
+                    let span = self.span_at(col, content.len());
+                    let value = self.parse_minimal_json_line(content, span)?;
                     return Ok((value, Some(content.len())));
                 }
                 Err(self.error_current("nonempty arrays require container context"))
             }
             '{' => {
                 if content.starts_with("{}") {
-                    return Ok((Value::Object(Vec::new()), Some(2)));
+                    let facts = ContainerFacts { span: self.span_at(col, 2), table: false };
+                    return Ok((T::new_object(Vec::new(), facts), Some(2)));
                 }
                 if is_minimal_json_candidate(content) {
-                    let value = self.parse_minimal_json_line(content)?;
+                    let span = self.span_at(col, content.len());
+                    let value = self.parse_minimal_json_line(content, span)?;
                     return Ok((value, Some(content.len())));
                 }
                 Err(self.error_current("nonempty objects require object or array context"))
             }
-            't' if content.starts_with("true") => Ok((Value::Bool(true), Some(4))),
-            'f' if content.starts_with("false") => Ok((Value::Bool(false), Some(5))),
-            'n' if content.starts_with("null") => Ok((Value::Null, Some(4))),
+            't' if content.starts_with("true") => {
+                Ok((T::new_bool(true, self.scalar_facts_at(col, 4)), Some(4)))
+            }
+            'f' if content.starts_with("false") => {
+                Ok((T::new_bool(false, self.scalar_facts_at(col, 5)), Some(5)))
+            }
+            'n' if content.starts_with("null") => {
+                Ok((T::new_null(self.scalar_facts_at(col, 4)), Some(4)))
+            }
             '-' | '0'..='9' => {
                 let end = simple_token_end(content, context);
                 let token = &content[..end];
@@ -1033,13 +1259,15 @@ impl<'a> Parser<'a> {
                     if fold_count > 0 {
                         let n = acc.parse::<Number>()
                             .map_err(|_| self.error_current(format!("invalid JSON number after folding: \"{acc}\"")))?;
+                        // Facts before the line advance so the span lands on the opener line.
+                        let facts = self.scalar_facts_at(col, end);
                         self.line = next;
-                        return Ok((Value::Number(n), None));
+                        return Ok((T::new_number(n, facts), None));
                     }
                 }
                 let n = token.parse::<Number>()
                     .map_err(|_| self.error_current(format!("invalid JSON number: \"{token}\"")))?;
-                Ok((Value::Number(n), Some(end)))
+                Ok((T::new_number(n, self.scalar_facts_at(col, end)), Some(end)))
             }
             '.' if content[1..].starts_with(|c: char| c.is_ascii_digit()) => {
                 let end = simple_token_end(content, context);
@@ -1054,18 +1282,20 @@ impl<'a> Parser<'a> {
         &mut self,
         content: &str,
         parent_indent: usize,
-    ) -> std::result::Result<Value, ParseError> {
+        col0: Option<usize>,
+    ) -> std::result::Result<T, ParseError> {
+        let open_span = self.span_at(col0, content.len());
         let mut values = Vec::new();
-        self.parse_array_line_content(content, parent_indent + 2, &mut values)?;
+        self.parse_array_line_content(content, parent_indent + 2, &mut values, col0)?;
         self.parse_array_tail(parent_indent, &mut values)?;
-        Ok(Value::Array(values))
+        Ok(T::new_array(values, self.container_facts_from(open_span)))
     }
 
     fn parse_multiline_string(
         &mut self,
         content: &str,
         line_indent: usize,
-    ) -> std::result::Result<String, ParseError> {
+    ) -> std::result::Result<(String, MultilineFlavor), ParseError> {
         let (glyph, suffix) = if let Some(rest) = content.strip_prefix(" ```") {
             ("```", rest)
         } else if let Some(rest) = content.strip_prefix(" ``") {
@@ -1091,12 +1321,22 @@ impl<'a> Parser<'a> {
         let opener_line = self.line;
         self.line += 1;
 
-        match glyph {
-            "```" => self.parse_triple_backtick_body(local_eol, &closer, opener_line),
-            "``" => self.parse_double_backtick_body(local_eol, &closer, opener_line),
-            "`" => self.parse_single_backtick_body(line_indent, local_eol, &closer, opener_line),
+        let (body, flavor) = match glyph {
+            "```" => (
+                self.parse_triple_backtick_body(local_eol, &closer, opener_line)?,
+                MultilineFlavor::Triple,
+            ),
+            "``" => (
+                self.parse_double_backtick_body(local_eol, &closer, opener_line)?,
+                MultilineFlavor::Double,
+            ),
+            "`" => (
+                self.parse_single_backtick_body(line_indent, local_eol, &closer, opener_line)?,
+                MultilineFlavor::Single,
+            ),
             _ => unreachable!(),
-        }
+        };
+        Ok((body, flavor))
     }
 
     fn parse_triple_backtick_body(
@@ -1280,7 +1520,8 @@ impl<'a> Parser<'a> {
     fn parse_minimal_json_line(
         &self,
         content: &str,
-    ) -> std::result::Result<Value, ParseError> {
+        span: Span,
+    ) -> std::result::Result<T, ParseError> {
         if let Err(col) = is_valid_minimal_json(content) {
             return Err(self.error_at_line(
                 self.line,
@@ -1292,10 +1533,10 @@ impl<'a> Parser<'a> {
             let col = error.column();
             self.error_at_line(self.line, col, format!("minimal JSON error: {error}"))
         })?;
-        // Value::from_serde_json, not Value::from: the From impl is public
-        // API gated behind the serde_json feature, while this inherent
-        // conversion is always available for internal use.
-        Ok(Value::from_serde_json(value))
+        // The target decides how source facts apply to the fragment's interior —
+        // e.g. an annotated tree marks interior strings Quoted, since that is how
+        // JSON spells strings.
+        Ok(T::from_minimal_json(value, ContainerFacts { span, table: false }))
     }
 
     fn line_str(&self, index: usize) -> Option<&str> {
@@ -1311,12 +1552,27 @@ impl<'a> Parser<'a> {
             self.ensure_line_has_no_tabs(self.line)?;
             let trimmed = line.trim_start_matches(' ');
             if line.is_empty() || trimmed.starts_with("//") {
+                if T::KEEPS_COMMENTS && trimmed.starts_with("//") {
+                    let comment = RawComment {
+                        col: line.len() - trimmed.len(),
+                        text: trimmed.to_owned(),
+                    };
+                    self.pending_comments.push(comment);
+                }
                 self.line += 1;
                 continue;
             }
             break;
         }
         Ok(())
+    }
+
+    fn take_pending_comments(&mut self) -> Vec<RawComment> {
+        if T::KEEPS_COMMENTS {
+            std::mem::take(&mut self.pending_comments)
+        } else {
+            Vec::new()
+        }
     }
 
     fn ensure_line_has_no_tabs(&self, line_index: usize) -> std::result::Result<(), ParseError> {

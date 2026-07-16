@@ -14,16 +14,17 @@ The entire surface is six symbols. If you follow the ownership rules in
 - [The API](#the-api)
 - [Memory ownership](#memory-ownership)
 - [Usage](#usage)
-  - [1. Parse TJSON, don't care why it failed](#1-parse-tjson-dont-care-why-it-failed)
-  - [2. Parse TJSON, report the error](#2-parse-tjson-report-the-error)
+  - [1. Parse TJSON, success or failure only](#1-parse-tjson-success-or-failure-only)
+  - [2. Parse TJSON, report the error on failure](#2-parse-tjson-report-the-error-on-failure)
   - [3. Render JSON as TJSON, with options](#3-render-json-as-tjson-with-options)
   - [4. Processing many inputs (the reuse pitfall)](#4-processing-many-inputs-the-reuse-pitfall)
-  - [A complete program](#a-complete-program)
+  - [5. A complete program](#5-a-complete-program)
 - [Errors](#errors)
 - [Options](#options)
 - [Encoding](#encoding)
 - [Thread safety](#thread-safety)
 - [Testing your integration](#testing-your-integration)
+- [A Note on this TJSON Rendering ABI](#a-note-on-this-tjson-rendering-abi)
 
 ## Building the shared library
 
@@ -138,7 +139,7 @@ That is the whole model. Everything below is just applying it.
 
 ## Usage
 
-### 1. Parse TJSON, don't care why it failed
+### 1. Parse TJSON, success or failure only
 
 If you only need "did it work," pass `NULL` for the error out-parameter and
 check for a `NULL` return. Nothing is allocated for the error, so there is
@@ -154,7 +155,7 @@ use(json);
 tjson_free_string(json);   /* the one allocation, freed once */
 ```
 
-### 2. Parse TJSON, report the error
+### 2. Parse TJSON, report the error on failure
 
 Pass a `TjsonError`. On failure, `err.message` is an **owned** string you must
 free, and `err.line` / `err.column` locate parse errors (see
@@ -233,7 +234,7 @@ The simplest defensive habit is to `tjson_free_string(err.message)` at the end
 of every iteration regardless of success — it is null-safe, so it costs nothing
 on the success path.
 
-### A complete program
+### 5. A complete program
 
 ```c
 #include <stdio.h>
@@ -378,3 +379,24 @@ tjson's own C ABI smoke test ([`tests/capi/`](../tests/capi/)) runs this way;
 `tests/capi/run.sh` builds the library and exercises the ABI under
 AddressSanitizer, and `cargo test --features capi` runs it automatically as
 part of the normal test suite.
+
+## A Note on this TJSON Rendering ABI
+
+The point of typing JSON->TJSON rendering options in tjson_from_json as a JSON
+string over an options struct in this C ABI is to simplify rolling your own
+interface even if your language isn't supported directly, without imposing a
+maintainance burden on either tjson-rs or you when the TJSON rendering options
+change.
+
+The ABI version from tjson_abi_version does not need to be and will not be
+bumped when TJSON rendering options change, are added, or are removed, though
+tjson_version will change.  Your glue code linking to this C FFI will not need
+to change either.
+
+This means that the calling language may not have the fine-grained compile time
+option typing that Rust or Typescript users enjoy. I have tried to compensate
+by having unusually good error messages. If you want typed structs, which would
+necessitate more frequent ABI changes as the underlying tjson rendering options
+change, feel free to build and maintain your own interface that calls directly
+into the native Rust code.
+

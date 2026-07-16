@@ -1,32 +1,94 @@
+use std::marker::PhantomData;
+
+use crate::document::{Comment, Placement};
 use crate::options::{BareStyle, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphMode, MultilineStyle, StringArrayStyle, TableUnindentStyle, RenderOptions, MIN_FOLD_CONTINUATION, indent_glyph_mode};
-use crate::value::{BareString, Entry, StrMeta, TableBareString, Value};
+use crate::tree::{KeyForm, MultilineFlavor, NodeRef, StringForm, Tree};
+use crate::value::{BareString, StrMeta, TableBareString};
 use crate::util::*;
 use crate::parse::MultilineLocalEol;
 
-/// A borrowed `Value` guaranteed to be neither a nonempty array nor a nonempty object —
+/// A borrowed node guaranteed to be neither a nonempty array nor a nonempty object —
 /// the category of values that can appear inline in TJSON (table cells, packed tokens, etc.).
+/// Strings carry their recorded form so honoring survives the flattening to a token.
 #[derive(Clone, Copy)]
 pub(crate) enum BasicValue<'a> {
     Null,
     Bool(bool),
     Number(&'a crate::number::Number),
-    String(&'a str),
+    String(&'a str, Option<StringForm>),
     EmptyArray,
     EmptyObject,
 }
 
-impl<'a> BasicValue<'a> {
-    #[allow(dead_code)]
-    pub(crate) fn new(value: &'a Value) -> Option<Self> {
-        match value {
-            Value::Null => Some(BasicValue::Null),
-            Value::Bool(b) => Some(BasicValue::Bool(*b)),
-            Value::Number(n) => Some(BasicValue::Number(n)),
-            Value::String(s) => Some(BasicValue::String(s.as_str())),
-            Value::Array(a) if a.is_empty() => Some(BasicValue::EmptyArray),
-            Value::Object(o) if o.is_empty() => Some(BasicValue::EmptyObject),
-            Value::Array(_) | Value::Object(_) => None,
+fn basic_value<T: Tree>(value: &T) -> Option<BasicValue<'_>> {
+    match value.node() {
+        NodeRef::Null => Some(BasicValue::Null),
+        NodeRef::Bool(b) => Some(BasicValue::Bool(b)),
+        NodeRef::Number(n) => Some(BasicValue::Number(n)),
+        NodeRef::String(s) => Some(BasicValue::String(s, value.string_form())),
+        NodeRef::Array([]) => Some(BasicValue::EmptyArray),
+        NodeRef::Object([]) => Some(BasicValue::EmptyObject),
+        NodeRef::Array(_) | NodeRef::Object(_) => None,
+    }
+}
+
+// ---- Fact-vs-policy resolution chokepoints ----
+//
+// Every place the renderer consults a recorded fact goes through one of these, so a
+// future per-node policy layer (if it ever earns its existence) has exactly one home
+// per decision instead of a scatter of call sites.
+
+fn resolve_string_form(form: Option<StringForm>, options: &RenderOptions) -> Option<StringForm> {
+    if options.honor_string_forms { form } else { None }
+}
+
+fn resolve_key_form(form: Option<KeyForm>, options: &RenderOptions) -> Option<KeyForm> {
+    if options.honor_key_forms { form } else { None }
+}
+
+/// `Some(forced)` when a table should be attempted (`forced` bypasses the size and
+/// similarity heuristics, never the physical checks); `None` when tables are off the
+/// table for this array.
+fn resolve_table_attempt(opinion: Option<bool>, options: &RenderOptions) -> Option<bool> {
+    let opinion = if options.honor_tables { opinion } else { None };
+    match opinion {
+        Some(false) => None,
+        Some(true) => Some(true),
+        None if options.tables => Some(false),
+        None => None,
+    }
+}
+
+/// Emit comment lines. `Left` comments pin to column 0; `AtLevel` comments sit at the
+/// subject's indent. No-op when comment rendering is off.
+fn emit_comments(
+    comments: &[Comment],
+    subject_indent: usize,
+    options: &RenderOptions,
+    out: &mut Vec<String>,
+) {
+    if !options.render_comments {
+        return;
+    }
+    for comment in comments {
+        match comment.placement() {
+            Placement::Left => out.push(comment.text().to_owned()),
+            Placement::AtLevel => out.push(format!("{}{}", spaces(subject_indent), comment.text())),
         }
+    }
+}
+
+/// Render a key honoring its recorded form when policy allows and the form is safe;
+/// the global `bare_keys` policy decides otherwise.
+pub(crate) fn render_key_form(key: &str, form: Option<KeyForm>, options: &RenderOptions) -> String {
+    match resolve_key_form(form, options) {
+        Some(KeyForm::Bare)
+            if parse_bare_key_prefix(key).is_some_and(|end| end == key.len()) =>
+        {
+            key.to_owned()
+        }
+        Some(KeyForm::Quoted) => render_json_string(key),
+        _ => render_key(key, options),
     }
 }
 
@@ -40,10 +102,6 @@ fn effective_inline_arrays(options: &RenderOptions) -> bool {
 
 fn effective_force_markers(options: &RenderOptions) -> bool {
     options.force_markers
-}
-
-fn effective_tables(options: &RenderOptions) -> bool {
-    options.tables
 }
 
 // Returns the target parent_indent to re-render the table at when /< /> glyphs should be
@@ -101,44 +159,51 @@ fn table_unindent_target(pair_indent: usize, natural_lines: &[String], options: 
 
 /// Approximate number of output lines a value will produce. Used for glyph volume estimation.
 /// Empty arrays and objects count as 1 (simple values); non-empty containers recurse.
-fn subtree_line_count(value: &Value) -> usize {
-    match value {
-        Value::Array(v) if !v.is_empty() => v.iter().map(subtree_line_count).sum::<usize>() + 1,
-        Value::Object(e) if !e.is_empty() => {
-            e.iter().map(|entry| subtree_line_count(&entry.value) + 1).sum()
+fn subtree_line_count<T: Tree>(value: &T) -> usize {
+    match value.node() {
+        NodeRef::Array(v) if !v.is_empty() => v.iter().map(subtree_line_count).sum::<usize>() + 1,
+        NodeRef::Object(e) if !e.is_empty() => {
+            e.iter().map(|entry| subtree_line_count(T::entry_value(entry)) + 1).sum()
         }
         _ => 1,
     }
 }
 
 /// Rough count of content bytes in a subtree. Used to weight volume in `ByteWeighted` mode.
-fn subtree_byte_count(value: &Value) -> usize {
-    match value {
-        Value::String(s) => s.len(),
-        Value::Number(n) => n.to_string().len(),
-        Value::Bool(b) => if *b { 4 } else { 5 },
-        Value::Null => 4,
-        Value::Array(v) => v.iter().map(subtree_byte_count).sum(),
-        Value::Object(e) => e.iter().map(|entry| entry.key.len() + subtree_byte_count(&entry.value)).sum(),
+fn subtree_byte_count<T: Tree>(value: &T) -> usize {
+    match value.node() {
+        NodeRef::String(s) => s.len(),
+        NodeRef::Number(n) => n.to_string().len(),
+        NodeRef::Bool(b) => if b { 4 } else { 5 },
+        NodeRef::Null => 4,
+        NodeRef::Array(v) => v.iter().map(subtree_byte_count).sum(),
+        NodeRef::Object(e) => e
+            .iter()
+            .map(|entry| T::entry_key(entry).len() + subtree_byte_count(T::entry_value(entry)))
+            .sum(),
     }
 }
 
 /// Maximum nesting depth of non-empty containers below this value.
 /// Empty arrays/objects count as 0 (simple values).
-fn subtree_max_depth(value: &Value) -> usize {
-    match value {
-        Value::Array(v) if !v.is_empty() => {
+fn subtree_max_depth<T: Tree>(value: &T) -> usize {
+    match value.node() {
+        NodeRef::Array(v) if !v.is_empty() => {
             1 + v.iter().map(subtree_max_depth).max().unwrap_or(0)
         }
-        Value::Object(e) if !e.is_empty() => {
-            1 + e.iter().map(|entry| subtree_max_depth(&entry.value)).max().unwrap_or(0)
+        NodeRef::Object(e) if !e.is_empty() => {
+            1 + e
+                .iter()
+                .map(|entry| subtree_max_depth(T::entry_value(entry)))
+                .max()
+                .unwrap_or(0)
         }
         _ => 0,
     }
 }
 
 /// Returns true if a `/<` indent-offset glyph should be emitted for `value` at `pair_indent`.
-fn should_use_indent_glyph(value: &Value, pair_indent: usize, options: &RenderOptions) -> bool {
+fn should_use_indent_glyph<T: Tree>(value: &T, pair_indent: usize, options: &RenderOptions) -> bool {
     let Some(w) = options.wrap_width else { return false; };
     let fold_floor = || {
         let max_depth = subtree_max_depth(value);
@@ -251,9 +316,9 @@ pub(crate) fn render_key(key: &str, options: &RenderOptions) -> String {
 }
 
 
-pub(crate) fn needs_explicit_array_marker(value: &Value) -> bool {
-    matches!(value, Value::Array(values) if !values.is_empty())
-        || matches!(value, Value::Object(entries) if !entries.is_empty())
+pub(crate) fn needs_explicit_array_marker<T: Tree>(value: &T) -> bool {
+    matches!(value.node(), NodeRef::Array(values) if !values.is_empty())
+        || matches!(value.node(), NodeRef::Object(entries) if !entries.is_empty())
 }
 
 
@@ -642,55 +707,73 @@ fn render_folding_quotes(value: &str, indent: usize, options: &RenderOptions) ->
 /// The fold must happen within a cell's string value, between the first and last
 /// data character (spec: "between the first data character... and the last data character").
 /// Returns `(before_fold, after_fold)` or `None` if no valid fold point is found.
-#[derive(Clone, Copy)]
-enum PackedToken<'a> {
+// Clone/Copy by hand: the derive would demand `T: Clone`/`T: Copy`, but the variants
+// only ever hold borrows of `T`, which are Copy for any `T`.
+enum PackedToken<'a, T: Tree> {
     /// A flat inline token (null, bool, number, short string, empty array/object).
     /// Rendered on demand from the BasicValue.
     Inline(BasicValue<'a>),
     /// A block element (multiline string, nonempty array, nonempty object) that interrupts
     /// packing. Borrows the original value; rendered lazily at the right continuation indent.
-    Block(&'a Value),
+    Block(&'a T),
 }
 
-pub(crate) struct Renderer;
+impl<'a, T: Tree> Clone for PackedToken<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
-impl Renderer {
-    pub(crate) fn render(value: &Value, options: &RenderOptions) -> String {
-        let lines = Self::render_root(value, options, options.start_indent);
+impl<'a, T: Tree> Copy for PackedToken<'a, T> {}
+
+/// Zero-sized generic renderer: every `Self::` call carries the tree type, so the
+/// walking code reads exactly as it did when it was `Value`-only.
+pub(crate) struct Renderer<T: Tree>(PhantomData<T>);
+
+impl<T: Tree> Renderer<T> {
+    pub(crate) fn render(value: &T, options: &RenderOptions) -> String {
+        let mut lines = Vec::new();
+        emit_comments(value.comments_before(), options.start_indent, options, &mut lines);
+        lines.extend(Self::render_root(value, options, options.start_indent));
+        emit_comments(value.trailing_comments(), 0, options, &mut lines);
         lines.join(options.eol.as_str())
     }
 
     fn render_root(
-        value: &Value,
+        value: &T,
         options: &RenderOptions,
         start_indent: usize,
     ) -> Vec<String> {
-        match value {
-            Value::Null => Self::render_scalar_lines(BasicValue::Null, start_indent, options),
-            Value::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(*b), start_indent, options),
-            Value::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), start_indent, options),
-            Value::String(s) => Self::render_scalar_lines(BasicValue::String(s.as_str()), start_indent, options),
-            Value::Array(values) if values.is_empty() => {
+        match value.node() {
+            NodeRef::Null => Self::render_scalar_lines(BasicValue::Null, start_indent, options),
+            NodeRef::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(b), start_indent, options),
+            NodeRef::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), start_indent, options),
+            NodeRef::String(s) => {
+                Self::render_scalar_lines(BasicValue::String(s, value.string_form()), start_indent, options)
+            }
+            NodeRef::Array([]) => {
                 Self::render_scalar_lines(BasicValue::EmptyArray, start_indent, options)
             }
-            Value::Object(entries) if entries.is_empty() => {
+            NodeRef::Object([]) => {
                 Self::render_scalar_lines(BasicValue::EmptyObject, start_indent, options)
             }
-            Value::Array(values) if effective_force_markers(options) => {
-                Self::render_explicit_array(values, start_indent, options)
+            NodeRef::Array(values) if effective_force_markers(options) => {
+                Self::render_explicit_array(values, start_indent, value.table_opinion(), options)
             }
-            Value::Array(values) => Self::render_implicit_array(values, start_indent, options),
-            Value::Object(entries) if effective_force_markers(options) => {
+            NodeRef::Array(values) => {
+                Self::render_implicit_array(values, start_indent, value.table_opinion(), options)
+            }
+            NodeRef::Object(entries) if effective_force_markers(options) => {
                 Self::render_explicit_object(entries, start_indent, options)
             }
-            Value::Object(entries) => {
+            NodeRef::Object(entries) => {
                 Self::render_implicit_object(entries, start_indent, options)
             }
         }
     }
 
     fn render_implicit_object(
-        entries: &[Entry],
+        entries: &[T::Entry],
         parent_indent: usize,
         options: &RenderOptions,
     ) -> Vec<String> {
@@ -698,9 +781,22 @@ impl Renderer {
         let mut lines = Vec::new();
         let mut packed_line = String::new();
 
-        for Entry { key, value } in entries {
+        for entry in entries {
+            let key = T::entry_key(entry);
+            let key_form = T::entry_key_form(entry);
+            let value = T::entry_value(entry);
+            // A commented entry starts a fresh line: the comment was on its own line in
+            // the source by definition, so a break existed there. Entries after it may
+            // resume packing onto the commented entry's line.
+            let entry_comments = T::entry_comments(entry);
+            if options.render_comments && !entry_comments.is_empty() {
+                if !packed_line.is_empty() {
+                    lines.push(std::mem::take(&mut packed_line));
+                }
+                emit_comments(entry_comments, pair_indent, options, &mut lines);
+            }
             if effective_inline_objects(options)
-                && let Some(token) = Self::render_inline_object_token(key, value, options) {
+                && let Some(token) = Self::render_inline_object_token(key, key_form, value, options) {
                     let candidate = if packed_line.is_empty() {
                         format!("{}{}", spaces(pair_indent), token)
                     } else {
@@ -720,7 +816,7 @@ impl Renderer {
             if !packed_line.is_empty() {
                 lines.push(std::mem::take(&mut packed_line));
             }
-            lines.extend(Self::render_object_entry(key, value, pair_indent, options));
+            lines.extend(Self::render_object_entry(key, key_form, value, pair_indent, options));
         }
 
         if !packed_line.is_empty() {
@@ -735,13 +831,15 @@ impl Renderer {
     /// key does not fold, delegates directly to `render_object_entry_body`.
     fn render_object_entry(
         key: &str,
-        value: &Value,
+        key_form: Option<KeyForm>,
+        value: &T,
         pair_indent: usize,
         options: &RenderOptions,
     ) -> Vec<String> {
-        let is_bare = options.bare_keys == BareStyle::Prefer
-            && parse_bare_key_prefix(key).is_some_and(|end| end == key.len());
-        let key_text = render_key(key, options);
+        let key_text = render_key_form(key, key_form, options);
+        // Whether the key rendered bare decides which fold machinery applies; judging
+        // the *result* keeps honored forms and global policy on one code path.
+        let is_bare = !key_text.starts_with('"');
 
         let key_fold_enabled = if is_bare {
             options.string_bare_fold_style != FoldStyle::None
@@ -784,7 +882,7 @@ impl Renderer {
                 fold_lines.extend(normal.into_iter().skip(1));
             } else {
                 // Value doesn't fit on the last key fold line — fold after colon.
-                let Some(bv) = BasicValue::new(value) else {
+                let Some(bv) = basic_value(value) else {
                     unreachable!("non-empty arrays/objects always render with empty suffix so suffix.is_empty() is true for them and this branch is unreachable")
                 };
                 let cont_lines = Self::render_scalar_value_continuation_lines(bv, pair_indent, options);
@@ -810,7 +908,7 @@ impl Renderer {
         options: &RenderOptions,
     ) -> Vec<String> {
         match value {
-            BasicValue::String(s) => Self::render_string_lines(s, pair_indent, 2, options),
+            BasicValue::String(s, form) => Self::render_string_lines(s, form, pair_indent, 2, options),
             BasicValue::Number(n) => {
                 let ns = n.to_string();
                 fold_number(&ns, pair_indent, 2, options.number_fold_style, options.wrap_width)
@@ -825,17 +923,17 @@ impl Renderer {
 
     fn render_object_entry_body(
         key_text: &str,
-        value: &Value,
+        value: &T,
         pair_indent: usize,
         key_fold_enabled: bool,
         options: &RenderOptions,
     ) -> Vec<String> {
-        match value {
-            Value::Array(values) if !values.is_empty() => {
-                if effective_tables(options)
-                    && let Some(table_lines) = Self::render_table(values, pair_indent, options) {
+        match value.node() {
+            NodeRef::Array(values) if !values.is_empty() => {
+                if let Some(forced) = resolve_table_attempt(value.table_opinion(), options)
+                    && let Some(table_lines) = Self::render_table(values, pair_indent, forced, options) {
                         if let Some(target_indent) = table_unindent_target(pair_indent, &table_lines, options) {
-                            let Some(offset_lines) = Self::render_table(values, target_indent, options) else {
+                            let Some(offset_lines) = Self::render_table(values, target_indent, forced, options) else {
                                 unreachable!("table re-render at offset indent always succeeds");
                             };
                             let key_line = format!("{}{}", spaces(pair_indent), key_text);
@@ -873,7 +971,7 @@ impl Renderer {
                     let key_line = format!("{}{}", spaces(pair_indent), key_text);
                     let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
                     if values.first().is_some_and(needs_explicit_array_marker) {
-                        lines.extend(Self::render_explicit_array(values, 2, options));
+                        lines.extend(Self::render_explicit_array(values, 2, value.table_opinion(), options));
                     } else {
                         lines.extend(Self::render_array_children(values, 2, options));
                     }
@@ -882,9 +980,9 @@ impl Renderer {
                 }
 
                 if effective_inline_arrays(options) {
-                    let all_simple = values.iter().all(|v| match v {
-                        Value::Array(a) => a.is_empty(),
-                        Value::Object(o) => o.is_empty(),
+                    let all_simple = values.iter().all(|v| match v.node() {
+                        NodeRef::Array(a) => a.is_empty(),
+                        NodeRef::Object(o) => o.is_empty(),
                         _ => true,
                     });
                     if all_simple
@@ -903,6 +1001,7 @@ impl Renderer {
                     lines.extend(Self::render_explicit_array(
                         values,
                         pair_indent,
+                        value.table_opinion(),
                         options,
                     ));
                 } else {
@@ -914,7 +1013,7 @@ impl Renderer {
                 }
                 lines
             }
-            Value::Object(entries) if !entries.is_empty() => {
+            NodeRef::Object(entries) if !entries.is_empty() => {
                 if should_use_indent_glyph(value, pair_indent, options) {
                     let key_line = format!("{}{}", spaces(pair_indent), key_text);
                     let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
@@ -932,16 +1031,18 @@ impl Renderer {
                 lines
             }
             _ => {
-                let bv = match value {
-                    Value::Null => BasicValue::Null,
-                    Value::Bool(b) => BasicValue::Bool(*b),
-                    Value::Number(n) => BasicValue::Number(n),
-                    Value::String(s) => BasicValue::String(s.as_str()),
-                    Value::Array(_) => BasicValue::EmptyArray,
-                    Value::Object(_) => BasicValue::EmptyObject,
+                let bv = match value.node() {
+                    NodeRef::Null => BasicValue::Null,
+                    NodeRef::Bool(b) => BasicValue::Bool(b),
+                    NodeRef::Number(n) => BasicValue::Number(n),
+                    NodeRef::String(s) => BasicValue::String(s, value.string_form()),
+                    NodeRef::Array(_) => BasicValue::EmptyArray,
+                    NodeRef::Object(_) => BasicValue::EmptyObject,
                 };
                 let scalar_lines = match bv {
-                    BasicValue::String(s) => Self::render_string_lines(s, pair_indent, key_text.len() + 1, options),
+                    BasicValue::String(s, form) => {
+                        Self::render_string_lines(s, form, pair_indent, key_text.len() + 1, options)
+                    }
                     _ => Self::render_scalar_lines(bv, pair_indent, options),
                 };
                 let first = scalar_lines[0].clone();
@@ -975,12 +1076,13 @@ impl Renderer {
     }
 
     fn render_implicit_array(
-        values: &[Value],
+        values: &[T],
         parent_indent: usize,
+        opinion: Option<bool>,
         options: &RenderOptions,
     ) -> Vec<String> {
-        if effective_tables(options)
-            && let Some(lines) = Self::render_table(values, parent_indent, options) {
+        if let Some(forced) = resolve_table_attempt(opinion, options)
+            && let Some(lines) = Self::render_table(values, parent_indent, forced, options) {
                 return lines;
             }
 
@@ -1001,6 +1103,7 @@ impl Renderer {
             .collect();
         if values.first().is_some_and(needs_explicit_array_marker) {
             let mut lines = Vec::new();
+            emit_comments(values[0].comments_before(), elem_indent, options, &mut lines);
             let first = &element_lines[0];
             let first_line = first.first()
                 .expect("render_array_element always returns at least one line");
@@ -1008,24 +1111,34 @@ impl Renderer {
                 .expect("array element line is indented at elem_indent");
             lines.push(format!("{}[ {}", spaces(parent_indent), stripped));
             lines.extend(first.iter().skip(1).cloned());
-            for extra in element_lines.iter().skip(1) {
+            for (value, extra) in values.iter().zip(element_lines.iter()).skip(1) {
+                emit_comments(value.comments_before(), elem_indent, options, &mut lines);
                 lines.extend(extra.clone());
             }
             lines
         } else {
-            element_lines.into_iter().flatten().collect()
+            let mut lines = Vec::new();
+            for (value, elem_lines) in values.iter().zip(element_lines) {
+                emit_comments(value.comments_before(), elem_indent, options, &mut lines);
+                lines.extend(elem_lines);
+            }
+            lines
         }
     }
 
     fn render_array_children(
-        values: &[Value],
+        values: &[T],
         elem_indent: usize,
         options: &RenderOptions,
     ) -> Vec<String> {
         let mut lines = Vec::new();
         let table_row_prefix = format!("{}|", spaces(elem_indent));
         for value in values {
+            // prev_was_table is judged before comment lines go in: comment lines are
+            // ignorable inside tables on reparse, so two tables separated only by a
+            // comment would merge without the `[ ` marker the check below forces.
             let prev_was_table = lines.last().map(|l: &String| l.starts_with(&table_row_prefix)).unwrap_or(false);
+            emit_comments(value.comments_before(), elem_indent, options, &mut lines);
             let elem_lines = Self::render_array_element(value, elem_indent, options);
             let curr_is_table = elem_lines.first().map(|l| l.starts_with(&table_row_prefix)).unwrap_or(false);
             if prev_was_table && curr_is_table {
@@ -1042,12 +1155,13 @@ impl Renderer {
     }
 
     fn render_explicit_array(
-        values: &[Value],
+        values: &[T],
         marker_indent: usize,
+        opinion: Option<bool>,
         options: &RenderOptions,
     ) -> Vec<String> {
-        if effective_tables(options)
-            && let Some(lines) = Self::render_table(values, marker_indent, options) {
+        if let Some(forced) = resolve_table_attempt(opinion, options)
+            && let Some(lines) = Self::render_table(values, marker_indent, forced, options) {
                 // Always prepend "[ " — render_explicit_array always needs its marker,
                 // whether the elements render as a table or in any other form.
                 let elem_indent = marker_indent + 2;
@@ -1081,16 +1195,21 @@ impl Renderer {
             .expect("render_array_element always returns at least one line");
         let stripped = first_line.get(elem_indent..)
             .expect("array element line is indented at elem_indent");
-        let mut lines = vec![format!("{}[ {}", spaces(marker_indent), stripped)];
+        let mut lines = Vec::new();
+        // A first element's comments precede the `[ ` line; on reparse they attach to
+        // the container, which renders in the same position.
+        emit_comments(values[0].comments_before(), elem_indent, options, &mut lines);
+        lines.push(format!("{}[ {}", spaces(marker_indent), stripped));
         lines.extend(first.iter().skip(1).cloned());
-        for extra in element_lines.iter().skip(1) {
+        for (value, extra) in values.iter().zip(element_lines.iter()).skip(1) {
+            emit_comments(value.comments_before(), elem_indent, options, &mut lines);
             lines.extend(extra.clone());
         }
         lines
     }
 
     fn render_explicit_object(
-        entries: &[Entry],
+        entries: &[T::Entry],
         marker_indent: usize,
         options: &RenderOptions,
     ) -> Vec<String> {
@@ -1106,33 +1225,35 @@ impl Renderer {
     }
 
     fn render_array_element(
-        value: &Value,
+        value: &T,
         elem_indent: usize,
         options: &RenderOptions,
     ) -> Vec<String> {
-        match value {
-            Value::Array(values) if !values.is_empty() => {
+        match value.node() {
+            NodeRef::Array(values) if !values.is_empty() => {
                 if should_use_indent_glyph(value, elem_indent, options) {
                     let mut lines = vec![format!("{} /<", spaces(elem_indent))];
-                    if values.first().is_some_and(needs_explicit_array_marker) {
-                        lines.extend(Self::render_explicit_array(values, 0, options));
+                    if values.first().is_some_and(|v| needs_explicit_array_marker(v)) {
+                        lines.extend(Self::render_explicit_array(values, 0, value.table_opinion(), options));
                     } else {
                         lines.extend(Self::render_array_children(values, 0, options));
                     }
                     lines.push(format!("{} />", spaces(elem_indent)));
                     return lines;
                 }
-                Self::render_explicit_array(values, elem_indent, options)
+                Self::render_explicit_array(values, elem_indent, value.table_opinion(), options)
             }
-            Value::Object(entries) if !entries.is_empty() => {
+            NodeRef::Object(entries) if !entries.is_empty() => {
                 Self::render_explicit_object(entries, elem_indent, options)
             }
-            Value::Null => Self::render_scalar_lines(BasicValue::Null, elem_indent, options),
-            Value::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(*b), elem_indent, options),
-            Value::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), elem_indent, options),
-            Value::String(s) => Self::render_scalar_lines(BasicValue::String(s.as_str()), elem_indent, options),
-            Value::Array(_) => Self::render_scalar_lines(BasicValue::EmptyArray, elem_indent, options),
-            Value::Object(_) => Self::render_scalar_lines(BasicValue::EmptyObject, elem_indent, options),
+            NodeRef::Null => Self::render_scalar_lines(BasicValue::Null, elem_indent, options),
+            NodeRef::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(b), elem_indent, options),
+            NodeRef::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), elem_indent, options),
+            NodeRef::String(s) => {
+                Self::render_scalar_lines(BasicValue::String(s, value.string_form()), elem_indent, options)
+            }
+            NodeRef::Array(_) => Self::render_scalar_lines(BasicValue::EmptyArray, elem_indent, options),
+            NodeRef::Object(_) => Self::render_scalar_lines(BasicValue::EmptyObject, elem_indent, options),
         }
     }
 
@@ -1155,7 +1276,7 @@ impl Renderer {
                 }
                 vec![format!("{}{}", spaces(indent), s)]
             }
-            BasicValue::String(s) => Self::render_string_lines(s, indent, 0, options),
+            BasicValue::String(s, form) => Self::render_string_lines(s, form, indent, 0, options),
             BasicValue::EmptyArray => vec![format!("{}[]", spaces(indent))],
             BasicValue::EmptyObject => vec![format!("{}{{}}", spaces(indent))],
         }
@@ -1163,6 +1284,7 @@ impl Renderer {
 
     fn render_string_lines(
         value: &str,
+        form: Option<StringForm>,
         indent: usize,
         first_line_extra: usize,
         options: &RenderOptions,
@@ -1171,6 +1293,35 @@ impl Renderer {
             return vec![format!("{}\"\"", spaces(indent))];
         }
         let meta = StrMeta::new(value);
+
+        // Honored forms take precedence over the global style selection, subject to
+        // safety: an honored form that is unsafe for this content falls through to
+        // the normal policy below.
+        match resolve_string_form(form, options) {
+            Some(StringForm::Quoted) => {
+                return Self::render_quoted_string_lines(value, indent, first_line_extra, options);
+            }
+            Some(StringForm::Bare) if meta.is_bare_eligible => {
+                if options.string_bare_fold_style != FoldStyle::None
+                    && let Some(lines) = fold_bare_string(
+                        value,
+                        indent,
+                        first_line_extra,
+                        options.string_bare_fold_style,
+                        options.wrap_width,
+                    )
+                {
+                    return lines;
+                }
+                return vec![format!("{} {}", spaces(indent), value)];
+            }
+            Some(StringForm::Multiline(flavor))
+                if meta.has_eol && meta.eol_type.is_some() && !meta.has_forbidden_literal =>
+            {
+                return Self::render_multiline_flavor(value, flavor, indent, options);
+            }
+            _ => {}
+        }
 
         // FoldingQuotes: for EOL-containing strings, always use folded JSON string —
         // checked before the multiline block so it short-circuits even if multiline_strings=false.
@@ -1268,6 +1419,16 @@ impl Renderer {
                 }
             return vec![format!("{} {}", spaces(indent), value)];
         }
+        Self::render_quoted_string_lines(value, indent, first_line_extra, options)
+    }
+
+    /// Render a string as a JSON quoted string, folding when policy and width call for it.
+    fn render_quoted_string_lines(
+        value: &str,
+        indent: usize,
+        first_line_extra: usize,
+        options: &RenderOptions,
+    ) -> Vec<String> {
         if options.string_quoted_fold_style != FoldStyle::None
             && let Some(lines) =
                 fold_json_string(value, indent, first_line_extra, options.string_quoted_fold_style, options.wrap_width)
@@ -1275,6 +1436,43 @@ impl Renderer {
                 return lines;
             }
         vec![format!("{}{}", spaces(indent), render_json_string(value))]
+    }
+
+    /// Render a multiline string in an honored concrete flavor. The content-safety
+    /// fallbacks still apply — pipe-heavy or backtick-starting bodies force the
+    /// pipe-guarded double-backtick form exactly as style-driven selection does —
+    /// but the honored flavor bypasses the width/line-count preferences: the author
+    /// chose this shape.
+    fn render_multiline_flavor(
+        value: &str,
+        flavor: MultilineFlavor,
+        indent: usize,
+        options: &RenderOptions,
+    ) -> Vec<String> {
+        let meta = StrMeta::new(value);
+        let local_eol = meta.eol_type.expect("caller verified uniform EOLs");
+        let suffix = local_eol.opener_suffix();
+        let parts: Vec<&str> = match local_eol {
+            MultilineLocalEol::Lf => value.split('\n').collect(),
+            MultilineLocalEol::CrLf => value.split("\r\n").collect(),
+        };
+        let fold_style = options.string_multiline_fold_style;
+        let wrap = options.wrap_width;
+        let pipe_heavy = {
+            let pipe_count = parts.iter().filter(|p| line_starts_with_ws_then(p, '|')).count();
+            !parts.is_empty() && pipe_count * 10 > parts.len()
+        };
+        let backtick_start = parts.iter().any(|p| line_starts_with_ws_then(p, '`'));
+        let forced_bold = pipe_heavy || backtick_start;
+        match flavor {
+            MultilineFlavor::Single if !forced_bold => {
+                Self::render_multiline_single_backtick(&parts, indent, suffix, fold_style, wrap)
+            }
+            MultilineFlavor::Triple if !forced_bold => {
+                Self::render_multiline_triple_backtick(&parts, indent, suffix)
+            }
+            _ => Self::render_multiline_double_backtick(&parts, indent, 0, suffix, fold_style, wrap),
+        }
     }
 
     /// Render a multiline string using ` (single backtick, unmarked body at indent+2).
@@ -1367,14 +1565,19 @@ impl Renderer {
 
     fn render_inline_object_token(
         key: &str,
-        value: &Value,
+        key_form: Option<KeyForm>,
+        value: &T,
         options: &RenderOptions,
     ) -> Option<String> {
-        let bv = match value {
-            Value::String(s) if s.contains('\n') || s.contains('\r') => return None,
-            _ => BasicValue::new(value)?,
+        let bv = match value.node() {
+            NodeRef::String(s) if s.contains('\n') || s.contains('\r') => return None,
+            _ => basic_value(value)?,
         };
-        Some(format!("{}:{}", render_key(key, options), Self::render_scalar_token(bv, options)))
+        Some(format!(
+            "{}:{}",
+            render_key_form(key, key_form, options),
+            Self::render_scalar_token(bv, options)
+        ))
     }
 
     fn render_scalar_token(value: BasicValue<'_>, options: &RenderOptions) -> String {
@@ -1382,20 +1585,24 @@ impl Renderer {
             BasicValue::Null => "null".to_owned(),
             BasicValue::Bool(b) => if b { "true".to_owned() } else { "false".to_owned() },
             BasicValue::Number(n) => n.to_string(),
-            BasicValue::String(s) => {
-                if options.bare_strings == BareStyle::Prefer && BareString::new(s).is_some() {
-                    format!(" {}", s)
-                } else {
-                    render_json_string(s)
+            BasicValue::String(s, form) => match resolve_string_form(form, options) {
+                Some(StringForm::Bare) if BareString::new(s).is_some() => format!(" {}", s),
+                Some(StringForm::Quoted) => render_json_string(s),
+                _ => {
+                    if options.bare_strings == BareStyle::Prefer && BareString::new(s).is_some() {
+                        format!(" {}", s)
+                    } else {
+                        render_json_string(s)
+                    }
                 }
-            }
+            },
             BasicValue::EmptyArray => "[]".to_owned(),
             BasicValue::EmptyObject => "{}".to_owned(),
         }
     }
 
     fn render_packed_array_lines(
-        values: &[Value],
+        values: &[T],
         first_prefix: String,
         continuation_indent: usize,
         options: &RenderOptions,
@@ -1406,7 +1613,7 @@ impl Renderer {
 
         if values
             .iter()
-            .all(|value| matches!(value, Value::String(_)))
+            .all(|value| value.is_string())
         {
             return Self::render_string_array_lines(
                 values,
@@ -1421,7 +1628,7 @@ impl Renderer {
     }
 
     fn render_string_array_lines(
-        values: &[Value],
+        values: &[T],
         first_prefix: String,
         continuation_indent: usize,
         options: &RenderOptions,
@@ -1487,26 +1694,26 @@ impl Renderer {
         }
     }
 
-    fn render_packed_array_tokens(values: &[Value]) -> Vec<PackedToken<'_>> {
+    fn render_packed_array_tokens(values: &[T]) -> Vec<(&[Comment], PackedToken<'_, T>)> {
         let mut tokens = Vec::new();
         for value in values {
-            let token = match value {
+            let token = match value.node() {
                 // Multiline strings are block elements — cannot be packed inline.
-                Value::String(text) if text.contains('\n') || text.contains('\r') => {
+                NodeRef::String(text) if text.contains('\n') || text.contains('\r') => {
                     PackedToken::Block(value)
                 }
                 // Nonempty arrays and objects are block elements.
-                Value::Array(vals) if !vals.is_empty() => PackedToken::Block(value),
-                Value::Object(entries) if !entries.is_empty() => PackedToken::Block(value),
+                NodeRef::Array(vals) if !vals.is_empty() => PackedToken::Block(value),
+                NodeRef::Object(entries) if !entries.is_empty() => PackedToken::Block(value),
                 // Scalars and empty containers become inline tokens.
-                Value::Null => PackedToken::Inline(BasicValue::Null),
-                Value::Bool(b) => PackedToken::Inline(BasicValue::Bool(*b)),
-                Value::Number(n) => PackedToken::Inline(BasicValue::Number(n)),
-                Value::String(s) => PackedToken::Inline(BasicValue::String(s.as_str())),
-                Value::Array(_) => PackedToken::Inline(BasicValue::EmptyArray),
-                Value::Object(_) => PackedToken::Inline(BasicValue::EmptyObject),
+                NodeRef::Null => PackedToken::Inline(BasicValue::Null),
+                NodeRef::Bool(b) => PackedToken::Inline(BasicValue::Bool(b)),
+                NodeRef::Number(n) => PackedToken::Inline(BasicValue::Number(n)),
+                NodeRef::String(s) => PackedToken::Inline(BasicValue::String(s, value.string_form())),
+                NodeRef::Array(_) => PackedToken::Inline(BasicValue::EmptyArray),
+                NodeRef::Object(_) => PackedToken::Inline(BasicValue::EmptyObject),
             };
-            tokens.push(token);
+            tokens.push((value.comments_before(), token));
         }
         tokens
     }
@@ -1521,8 +1728,8 @@ impl Renderer {
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
         match value {
-            BasicValue::String(s) => {
-                let lines = Self::render_string_lines(s, continuation_indent, first_line_extra, options);
+            BasicValue::String(s, form) => {
+                let lines = Self::render_string_lines(s, form, continuation_indent, first_line_extra, options);
                 if lines.len() > 1 { Some(lines) } else { None }
             }
             BasicValue::Number(n) => {
@@ -1541,7 +1748,7 @@ impl Renderer {
     }
 
     fn render_packed_token_lines(
-        tokens: Vec<PackedToken<'_>>,
+        tokens: Vec<(&[Comment], PackedToken<'_, T>)>,
         first_prefix: String,
         continuation_indent: usize,
         string_spaces_mode: bool,
@@ -1559,7 +1766,17 @@ impl Renderer {
         }
 
         // Spaces mode is incompatible with block elements (which are never strings).
-        if string_spaces_mode && tokens.iter().any(|t| matches!(t, PackedToken::Block(_))) {
+        if string_spaces_mode && tokens.iter().any(|(_, t)| matches!(t, PackedToken::Block(_))) {
+            return None;
+        }
+
+        // A commented first element cannot sit on a merged prefix line ("key:  " or
+        // "[ ") — its comment lines would have nowhere legal to go. Bail to block
+        // layout, which emits comments correctly.
+        if options.render_comments
+            && tokens.first().is_some_and(|(comments, _)| !comments.is_empty())
+            && !first_prefix.chars().all(|c| c == ' ')
+        {
             return None;
         }
 
@@ -1572,7 +1789,22 @@ impl Renderer {
         let mut current_is_fresh = true;
         let mut lines: Vec<String> = Vec::new();
 
-        for token in tokens {
+        for (comments, token) in tokens {
+            // A commented element starts a new packed run: flush the current line,
+            // emit the comment at the element's level, resume packing from here
+            // (Ray's ruling: never invent packing across a comment, never destroy
+            // packing elsewhere).
+            if options.render_comments && !comments.is_empty() {
+                if !current_is_fresh {
+                    if !string_spaces_mode {
+                        current.push(',');
+                    }
+                    lines.push(current);
+                    current = continuation_prefix.clone();
+                    current_is_fresh = true;
+                }
+                emit_comments(comments, continuation_indent, options, &mut lines);
+            }
             match token {
                 PackedToken::Block(value) => {
                     // Flush the current line if it has content, then render the block.
@@ -1583,14 +1815,14 @@ impl Renderer {
                         lines.push(current);
                     }
 
-                    let block_lines = match value {
-                        Value::String(s) => {
-                            Self::render_string_lines(s, continuation_indent, 0, options)
+                    let block_lines = match value.node() {
+                        NodeRef::String(s) => {
+                            Self::render_string_lines(s, value.string_form(), continuation_indent, 0, options)
                         }
-                        Value::Array(vals) if !vals.is_empty() => {
-                            Self::render_explicit_array(vals, continuation_indent, options)
+                        NodeRef::Array(vals) if !vals.is_empty() => {
+                            Self::render_explicit_array(vals, continuation_indent, value.table_opinion(), options)
                         }
-                        Value::Object(entries) if !entries.is_empty() => {
+                        NodeRef::Object(entries) if !entries.is_empty() => {
                             Self::render_explicit_object(entries, continuation_indent, options)
                         }
                         _ => unreachable!("PackedToken::Block must contain a block value"),
@@ -1618,7 +1850,7 @@ impl Renderer {
                     // Render the token string on demand. For strings, force JSON quoting if the
                     // string contains comma-like chars to avoid parse ambiguity.
                     let token_str = match bv {
-                        BasicValue::String(s) if s.chars().any(is_comma_like) => {
+                        BasicValue::String(s, _) if s.chars().any(is_comma_like) => {
                             render_json_string(s)
                         }
                         _ => Self::render_scalar_token(bv, options),
@@ -1708,15 +1940,19 @@ impl Renderer {
     }
 
     fn render_table(
-        values: &[Value],
+        values: &[T],
         parent_indent: usize,
+        forced: bool,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
-        if values.len() < options.table_min_rows {
+        // `forced` (an honored was-a-table fact) bypasses the size and similarity
+        // heuristics but never the physical checks below: content a table cannot
+        // hold still falls back to block layout.
+        if !forced && values.len() < options.table_min_rows {
             return None;
         }
 
-        let mut columns = Vec::<String>::new();
+        let mut columns = Vec::<(String, Option<KeyForm>)>::new();
         let mut present_cells = 0usize;
 
         // Build column order from the first row, then verify all rows use the same order
@@ -1725,23 +1961,25 @@ impl Renderer {
         let mut first_row_keys: Option<Vec<&str>> = None;
 
         for value in values {
-            let Value::Object(entries) = value else {
+            let NodeRef::Object(entries) = value.node() else {
                 return None;
             };
             present_cells += entries.len();
-            for Entry { key, value: cell } in entries {
-                if matches!(cell, Value::Array(inner) if !inner.is_empty())
-                    || matches!(cell, Value::Object(inner) if !inner.is_empty())
-                    || matches!(cell, Value::String(text) if text.contains('\n') || text.contains('\r'))
+            for entry in entries {
+                let key = T::entry_key(entry);
+                let cell = T::entry_value(entry);
+                if matches!(cell.node(), NodeRef::Array(inner) if !inner.is_empty())
+                    || matches!(cell.node(), NodeRef::Object(inner) if !inner.is_empty())
+                    || matches!(cell.node(), NodeRef::String(text) if text.contains('\n') || text.contains('\r'))
                 {
                     return None;
                 }
-                if !columns.iter().any(|column| column == key) {
-                    columns.push(key.clone());
+                if !columns.iter().any(|(column, _)| column == key) {
+                    columns.push((key.to_owned(), T::entry_key_form(entry)));
                 }
             }
             // Check that shared keys appear in the same relative order as in the first row.
-            let row_keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+            let row_keys: Vec<&str> = entries.iter().map(|e| T::entry_key(e)).collect();
             if let Some(ref first) = first_row_keys {
                 let shared_in_first: Vec<&str> = first.iter().copied().filter(|k| row_keys.contains(k)).collect();
                 let shared_in_row: Vec<&str> = row_keys.iter().copied().filter(|k| first.contains(k)).collect();
@@ -1753,30 +1991,31 @@ impl Renderer {
             }
         }
 
-        if columns.len() < options.table_min_columns {
+        if !forced && columns.len() < options.table_min_columns {
             return None;
         }
 
         let similarity = present_cells as f32 / (values.len() * columns.len()) as f32;
-        if similarity < options.table_min_similarity {
+        if !forced && similarity < options.table_min_similarity {
             return None;
         }
 
         let mut header_cells = Vec::new();
         let mut rows = Vec::new();
-        for column in &columns {
-            header_cells.push(render_key(column, options));
+        for (column, key_form) in &columns {
+            header_cells.push(render_key_form(column, *key_form, options));
         }
 
         for value in values {
-            let Value::Object(entries) = value else {
+            let NodeRef::Object(entries) = value.node() else {
                 return None;
             };
             let mut row: Vec<String> = Vec::new();
-            for column in &columns {
-                let token = if let Some(entry) = entries.iter().find(|e| &e.key == column) {
-                    let value = &entry.value;
-                    Self::render_table_cell_token(value, options)
+            for (column, _) in &columns {
+                let token = if let Some(entry) =
+                    entries.iter().find(|e| T::entry_key(e) == column)
+                {
+                    Self::render_table_cell_token(T::entry_value(entry), options)
                 } else {
                     None
                 };
@@ -1836,7 +2075,8 @@ impl Renderer {
         let pair_indent = parent_indent; // elem rows at parent_indent+2, fold at parent_indent
         let fold_prefix = spaces(pair_indent);
 
-        for row in rows {
+        for (row_value, row) in values.iter().zip(rows) {
+            emit_comments(row_value.comments_before(), parent_indent + 2, options, &mut lines);
             let row_line = format!(
                 "{}{}",
                 indent,
@@ -1875,30 +2115,39 @@ impl Renderer {
     }
 
     fn render_table_cell_token(
-        value: &Value,
+        value: &T,
         options: &RenderOptions,
     ) -> Option<String> {
-        match value {
-            Value::Null => Some("null".to_owned()),
-            Value::Bool(value) => Some(if *value {
+        match value.node() {
+            NodeRef::Null => Some("null".to_owned()),
+            NodeRef::Bool(value) => Some(if value {
                 "true".to_owned()
             } else {
                 "false".to_owned()
             }),
-            Value::Number(value) => Some(value.to_string()),
-            Value::String(value) => {
-                if value.contains('\n') || value.contains('\r') {
-                    None
-                } else if options.bare_strings == BareStyle::Prefer
-                    && TableBareString::new(value).is_some()
-                {
-                    Some(format!(" {}", value))
-                } else {
-                    Some(render_json_string(value))
+            NodeRef::Number(value) => Some(value.to_string()),
+            NodeRef::String(s) => {
+                if s.contains('\n') || s.contains('\r') {
+                    return None;
+                }
+                match resolve_string_form(value.string_form(), options) {
+                    Some(StringForm::Bare) if TableBareString::new(s).is_some() => {
+                        Some(format!(" {}", s))
+                    }
+                    Some(StringForm::Quoted) => Some(render_json_string(s)),
+                    _ => {
+                        if options.bare_strings == BareStyle::Prefer
+                            && TableBareString::new(s).is_some()
+                        {
+                            Some(format!(" {}", s))
+                        } else {
+                            Some(render_json_string(s))
+                        }
+                    }
                 }
             }
-            Value::Array(values) if values.is_empty() => Some("[]".to_owned()),
-            Value::Object(entries) if entries.is_empty() => Some("{}".to_owned()),
+            NodeRef::Array([]) => Some("[]".to_owned()),
+            NodeRef::Object([]) => Some("{}".to_owned()),
             _ => None,
         }
     }
