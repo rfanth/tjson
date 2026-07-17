@@ -92,7 +92,7 @@ TJSON Output Formatting Options (for output TJSON only, not help/errors/JSON):
       --fold-quoted STYLE     Fold style for quoted strings (default: auto)
       --fold-multiline STYLE  Fold style within multiline bodies (default: none)
       --fold-number STYLE     Fold style for numbers (default: auto)
-", tjson::DEFAULT_WRAP_WIDTH)
+", tjson::options::DEFAULT_WRAP_WIDTH)
 }
 
 fn parse_val<T>(args: &mut Arguments, flag: &'static str) -> Option<T>
@@ -216,8 +216,8 @@ fn main() {
     }
 
     // Output line ending between TJSON output lines and the trailing newline. Defaults to LF.
-    let eol: tjson::Eol = match opt_eol.as_deref() {
-        None => tjson::Eol::Lf,
+    let eol: tjson::options::Eol = match opt_eol.as_deref() {
+        None => tjson::options::Eol::Lf,
         Some(s) => s.parse().unwrap_or_else(|e| {
             eprintln!("tjson: --eol: {e}");
             std::process::exit(1);
@@ -281,9 +281,9 @@ fn main() {
         if let Some(w) = opt_wrap {
             if w == 0 {
                 opts = opts.wrap_width(None);
-            } else if w < tjson::MIN_WRAP_WIDTH {
-                eprintln!("tjson: --width {w} is too narrow (minimum {}); using {}", tjson::MIN_WRAP_WIDTH, tjson::MIN_WRAP_WIDTH);
-                opts = opts.wrap_width(Some(tjson::MIN_WRAP_WIDTH));
+            } else if w < tjson::options::MIN_WRAP_WIDTH {
+                eprintln!("tjson: --width {w} is too narrow (minimum {}); using {}", tjson::options::MIN_WRAP_WIDTH, tjson::options::MIN_WRAP_WIDTH);
+                opts = opts.wrap_width(Some(tjson::options::MIN_WRAP_WIDTH));
             } else {
                 opts = opts.wrap_width(Some(w));
             }
@@ -370,7 +370,7 @@ fn main() {
 // JSON output is always LF-bodied (serde_json), which is exactly why `--eol` is rejected for
 // JSON upstream: if that guard is ever loosened, appending a CRLF terminator onto an LF JSON
 // body here is the mixed-ending bug. Keep body-eol and this trailing-eol in agreement.
-fn finalize_output(mut output: String, add_final_newline: bool, eol: tjson::Eol) -> String {
+fn finalize_output(mut output: String, add_final_newline: bool, eol: tjson::options::Eol) -> String {
     if add_final_newline && !output.ends_with('\n') {
         output.push_str(eol.as_str());
     }
@@ -384,7 +384,7 @@ fn version_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{finalize_output, version_text};
-    use tjson::Eol;
+    use tjson::options::Eol;
 
     #[test]
     fn adds_final_newline_by_default() {

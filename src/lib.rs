@@ -46,7 +46,7 @@ mod de;
 pub mod document;
 mod error;
 mod number;
-mod options;
+pub mod options;
 mod parse;
 mod render;
 mod spanned;
@@ -56,9 +56,14 @@ mod value;
 
 pub use document::Document;
 pub use error::{DeserializeError, Error, ParseError, Result};
+pub use options::RenderOptions;
+// Compat shims: these names predate `pub mod options` and stay importable from the
+// root so no published consumer breaks. Hidden so documentation, completion, and new
+// code see only the canonical `tjson::options::` paths. Removable in a future major.
+#[doc(hidden)]
 pub use options::{
     BareStyle, Eol, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphStyle, MultilineStyle,
-    StringArrayStyle, TableUnindentStyle, RenderOptions,
+    StringArrayStyle, TableUnindentStyle,
 };
 pub use number::{InvalidNumber, Number};
 pub use value::{Entry, Value};
@@ -76,7 +81,9 @@ pub use options::TjsonConfig;
 #[doc(hidden)]
 pub use options::retired_option_hint;
 
+#[doc(hidden)]
 pub const MIN_WRAP_WIDTH: usize = options::MIN_WRAP_WIDTH;
+#[doc(hidden)]
 pub const DEFAULT_WRAP_WIDTH: usize = options::DEFAULT_WRAP_WIDTH;
 
 use serde::Serialize;
