@@ -248,13 +248,28 @@ fn render() {
             }
         };
 
-        let config: TjsonConfig = match serde_json::from_str(&config_src) {
-            Ok(o) => o,
-            Err(e) => {
-                failures.push(format!("{}: could not parse config.json: {}", subdir_name, e));
-                continue;
-            }
-        };
+        // TjsonConfig ignores unknown fields by design (the JS options-bag contract),
+        // which for fixtures is a trap: a typo'd key would be silently dropped and the
+        // fixture would quietly test default options. serde_ignored turns that into a
+        // loud failure naming the bad key.
+        let mut json_de = serde_json::Deserializer::from_str(&config_src);
+        let mut unknown_keys: Vec<String> = Vec::new();
+        let config: TjsonConfig =
+            match serde_ignored::deserialize(&mut json_de, |path| unknown_keys.push(path.to_string())) {
+                Ok(o) => o,
+                Err(e) => {
+                    failures.push(format!("{}: could not parse config.json: {}", subdir_name, e));
+                    continue;
+                }
+            };
+        if !unknown_keys.is_empty() {
+            failures.push(format!(
+                "{}: config.json has unknown option keys {:?} — typo'd keys are silently \
+                 ignored by TjsonConfig, so this fixture would test default options",
+                subdir_name, unknown_keys
+            ));
+            continue;
+        }
         let options: RenderOptions = config.into();
 
         let json_entries: Vec<_> = std::fs::read_dir(&subdir)

@@ -1982,10 +1982,10 @@ mod tests {
         assert_eq!(c.string_array_style, Some(StringArrayStyle::PreferSpaces));
         assert_eq!(c.multiline_style, Some(MultilineStyle::BoldFloating));
 
-        // PascalCase still works
-        let c: TjsonConfig = serde_json::from_str(r#"{"stringArrayStyle":"PreferComma","multilineStyle":"FoldingQuotes"}"#).unwrap();
-        assert_eq!(c.string_array_style, Some(StringArrayStyle::PreferComma));
-        assert_eq!(c.multiline_style, Some(MultilineStyle::FoldingQuotes));
+        // PascalCase was undocumented tolerance, removed in 0.7.0: exactly one
+        // accepted spelling per value (see options::tests for the full pin).
+        serde_json::from_str::<TjsonConfig>(r#"{"stringArrayStyle":"PreferComma"}"#)
+            .expect_err("PascalCase option values must be rejected");
 
         // single-word lowercase (BareStyle, FoldStyle, IndentGlyphStyle, TableUnindentStyle, IndentGlyphMarkerStyle)
         let c: TjsonConfig = serde_json::from_str(r#"{

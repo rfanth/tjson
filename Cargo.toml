@@ -71,9 +71,11 @@ serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precisi
 serde_ignored = { version = "0.1", optional = true }
 unicode-general-category = "1.0"
 
-# For tests/deserialize.rs: the differential rig drives serde derive and the
-# serde_json oracle from an integration-test crate, which only sees dev-dependencies.
+# For tests/deserialize.rs (differential rig: serde derive + serde_json oracle) and
+# tests/file_tests.rs (serde_ignored rejects typo'd fixture config keys, which would
+# otherwise be silently ignored and quietly test default options instead).
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_ignored = "0.1"
 

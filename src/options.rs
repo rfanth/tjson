@@ -733,13 +733,12 @@ mod camel_de {
             pub fn $fn_name<'de, D: Deserializer<'de>>(d: D) -> Result<Option<$Enum>, D::Error> {
                 let Some(s) = de_str(d)? else { return Ok(None); };
                 match s.as_str() {
-                    $($camel => return Ok(Some($variant)),)+
-                    _ => {}
+                    $($camel => Ok(Some($variant)),)+
+                    // Exactly one accepted spelling per value. A PascalCase fallback
+                    // used to be accepted here; it was undocumented tolerance (every
+                    // surface advertises camelCase only) and was removed in 0.7.0.
+                    _ => Err(serde::de::Error::unknown_variant(&s, &[$($camel),+])),
                 }
-                // Fall back to PascalCase via serde
-                serde_json::from_value(serde_json::Value::String(s.clone()))
-                    .map(Some)
-                    .map_err(|_| serde::de::Error::unknown_variant(&s, &[$($camel),+]))
             }
         };
     }
@@ -923,6 +922,31 @@ pub fn retired_option_hint(field: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_values_accept_exactly_one_case() {
+        // camelCase is the one accepted spelling for option values on every JSON
+        // surface (wasm, C FFI, UDF, fixture configs). The PascalCase fallback was
+        // removed in 0.7.0 — these assertions pin both directions.
+        let ok: TjsonConfig =
+            serde_json::from_str(r#"{"multilineStyle":"boldFloating","bareStrings":"none"}"#)
+                .expect("camelCase values parse");
+        assert_eq!(ok.multiline_style, Some(MultilineStyle::BoldFloating));
+        assert_eq!(ok.bare_strings, Some(BareStyle::None));
+
+        for rejected in [
+            r#"{"multilineStyle":"BoldFloating"}"#,
+            r#"{"bareStrings":"None"}"#,
+            r#"{"eol":"CrLf"}"#,
+        ] {
+            let err = serde_json::from_str::<TjsonConfig>(rejected)
+                .expect_err("PascalCase values must be rejected");
+            assert!(
+                err.to_string().contains("unknown variant"),
+                "error should name the bad value and list valid ones: {err}"
+            );
+        }
+    }
 
     #[test]
     fn retired_option_lookup_finds_hint() {
