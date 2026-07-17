@@ -145,6 +145,27 @@ pub fn from_value<'de, T: serde::Deserialize<'de>>(value: &'de Value) -> Result<
     de::deserialize_from_tree(value, None).map_err(Error::Deserialize)
 }
 
+/// Deserialize `T` from a parsed [`Document`] using serde.
+///
+/// Reads the typed data directly out of the document's tree — no projection to
+/// [`Value`] and no re-parse — so one parse can yield both the comments and the
+/// typed configuration. Comments and presentation facts are invisible to serde and
+/// simply pass by. Like [`from_value`], errors carry the field path but no line
+/// numbers.
+///
+/// ```
+/// #[derive(serde::Deserialize, PartialEq, Debug)]
+/// struct Config { a: u32 }
+///
+/// let doc: tjson::Document = "// keep me\n  a:1".parse().unwrap();
+/// let config: Config = tjson::from_document(&doc).unwrap();
+/// assert_eq!(config, Config { a: 1 });
+/// assert_eq!(doc.root().comments_before()[0].text(), "// keep me");
+/// ```
+pub fn from_document<'de, T: serde::Deserialize<'de>>(document: &'de Document) -> Result<T> {
+    de::deserialize_from_tree(document.root(), None).map_err(Error::Deserialize)
+}
+
 /// Serialize `value` to a TJSON string using default options.
 ///
 /// ```

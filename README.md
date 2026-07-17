@@ -110,9 +110,10 @@ line 2, column 8: age: invalid type: string "banana", expected u32
          ^
 ```
 
-If you already hold a parsed `Value`, `tjson::from_value(&value)` deserializes it
-directly; those errors name the failing field but carry no line numbers, since a
-`Value` built in code has no file behind it. And for documents that are only
+If you already hold a parsed `Value` or `Document`, `tjson::from_value(&value)`
+and `tjson::from_document(&doc)` deserialize them directly — the latter lets one
+parse yield both the comments and the typed data. Their errors name the failing
+field but carry no line numbers, since there is no source text behind them. And for documents that are only
 partly structured, a struct field can be typed as `tjson::Value` to accept any
 shape there.
 

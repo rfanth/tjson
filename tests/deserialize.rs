@@ -520,3 +520,29 @@ fn borrowed_strings_work_through_from_value() {
     let borrowed: B<'_> = tjson::from_value(&value).expect("borrowing deserialization");
     assert_eq!(borrowed.name, "Alice");
 }
+
+#[test]
+fn from_document_reads_typed_data_without_projection() {
+    // The deserializer is generic over the internal tree trait, so a Document is as
+    // valid a source as a Value: one parse yields both the comments and the typed
+    // data, with no intermediate Value copy.
+    #[derive(Deserialize, PartialEq, Debug)]
+    struct Config {
+        name: String,
+        retries: u32,
+    }
+    let doc: tjson::Document = "// prod settings\n  name: web\n  retries:3".parse().unwrap();
+    let config: Config = tjson::from_document(&doc).expect("typed data straight from Document");
+    assert_eq!(config, Config { name: "web".into(), retries: 3 });
+    assert_eq!(doc.root().comments_before()[0].text(), "// prod settings");
+
+    // Errors: field path, no coordinates (a Document in hand has no source text).
+    #[derive(Deserialize, PartialEq, Debug)]
+    struct Bad {
+        retries: bool,
+    }
+    let err = tjson::from_document::<Bad>(&doc).unwrap_err();
+    let tjson::Error::Deserialize(err) = err else { panic!("expected Deserialize error") };
+    assert_eq!(err.path(), "retries");
+    assert_eq!(err.line(), None);
+}
