@@ -101,9 +101,47 @@ let person: Person = tjson::from_str("  name: Alice\n  age:30")?;
 let tjson = tjson::to_string(&person)?;
 ```
 
+When the document doesn't match your types, the error points at the actual spot
+in the file — the field, the line, and the offending text:
+
+```text
+line 2, column 8: age: invalid type: string "banana", expected u32
+    age: banana
+         ^
+```
+
+If you already hold a parsed `Value`, `tjson::from_value(&value)` deserializes it
+directly; those errors name the failing field but carry no line numbers, since a
+`Value` built in code has no file behind it. And for documents that are only
+partly structured, a struct field can be typed as `tjson::Value` to accept any
+shape there.
+
+### Documents: comments and formatting
+
+TJSON files can contain comments. Parsing to a `Value` drops them — parse a
+`Document` instead when you want comments and formatting choices to survive
+reading and re-writing a file:
+
+```rust
+let doc: tjson::Document = "// header\n  a:1".parse()?;
+let out = doc.to_tjson_with(RenderOptions::default());
+assert!(out.starts_with("// header"));
+```
+
+The renderer still lays everything out fresh — indentation, alignment, and line
+wrapping are normalized — but what you wrote stays what you wrote: quoted strings
+stay quoted, tables stay tables, and comments come back in the right places.
+Four options control this (`honor_string_forms`, `honor_key_forms`,
+`honor_tables`, `render_comments`), all on by default; `canonical()` keeps
+comments and normalizes everything else. To build commented TJSON output from
+code, construct the tree with `tjson::document::{Node, Entry, Comment}`.
+
 ## Options
 
-`RenderOptions` is a builder. All methods take `self` and return `Self`:
+`RenderOptions` is a builder. Start from `RenderOptions::default()`, or from
+`RenderOptions::canonical()` — a preset (not a flag) that renders one key per
+line with no packing, no tables, no multiline blocks, and no folding. All
+builder methods take `self` and return `Self`:
 
 ```rust
 let opts = RenderOptions::default()
@@ -114,40 +152,45 @@ let opts = RenderOptions::default()
 let tjson = tjson::to_string_with(&value, opts)?;
 ```
 
+Option enums live in `tjson::options` (e.g. `use tjson::options::MultilineStyle;`).
+
 **Key options:**
 
 | Option | Default | Description |
 |---|---|---|
-| `canonical()` | `false` | One key per line, no packing, no tables |
 | `wrap_width(Option<usize>)` | `Some(80)` | Column wrap limit, clamped to >= 20; `None` for unlimited |
 | `tables(bool)` | `true` | Render arrays-of-objects as pipe tables |
 | `multiline_strings(bool)` | `true` | Use ` `` ` blocks for strings containing newlines |
 | `inline_objects(bool)` | `true` | Pack multiple key-value pairs onto one line |
 | `inline_arrays(bool)` | `true` | Pack multiple array items onto one line |
-| `string_array_style(StringArrayStyle)` | `PreferComma` | How to pack all-string arrays |
+| `string_array_style(StringArrayStyle)` | `PreferComma` | How to pack all-string arrays: `None`, `Spaces`, `PreferSpaces`, `Comma`, `PreferComma` |
 
 **Advanced options:**
 
 | Option | Default | Description |
 |---|---|---|
-| `bare_strings(BareStyle)` | `Prefer` | Use bare (unquoted) string values when spec permits |
-| `bare_keys(BareStyle)` | `Prefer` | Use bare (unquoted) object keys when spec permits |
+| `bare_strings(BareStyle)` | `Prefer` | Use bare (unquoted) string values when spec permits: `Prefer`, `None` |
+| `bare_keys(BareStyle)` | `Prefer` | Use bare (unquoted) object keys when spec permits: `Prefer`, `None` |
 | `force_markers(bool)` | `false` | Force explicit `[` / `{` indent markers on single-step indents |
-| `multiline_style(MultilineStyle)` | `Bold` | Multiline block style (`Bold`, `Floating`, `Light`, etc.) |
+| `multiline_style(MultilineStyle)` | `Bold` | Multiline block style: `Bold`, `Floating`, `BoldFloating`, `BoldLight`, `Light`, `Transparent`, `FoldingQuotes` |
 | `multiline_min_lines(usize)` | `1` | Min newlines in a string before using a multiline block |
-| `indent_glyph_style(IndentGlyphStyle)` | `Auto` | When to wrap deeply nested content in `/<` `/>` glyphs |
-| `indent_glyph_marker_style(IndentGlyphMarkerStyle)` | `Compact` | Where to place the opening `/<` glyph |
-| `table_unindent_style(TableUnindentStyle)` | `Auto` | How to reposition wide tables toward the left margin |
+| `indent_glyph_style(IndentGlyphStyle)` | `Auto` | When to wrap deeply nested content in `/<` `/>` glyphs: `Auto`, `Fixed`, `None` |
+| `indent_glyph_marker_style(IndentGlyphMarkerStyle)` | `Compact` | Where to place the opening `/<` glyph: `Compact`, `Separate` |
+| `table_unindent_style(TableUnindentStyle)` | `Auto` | How to reposition wide tables toward the left margin: `Left`, `Auto`, `Floating`, `None` |
 | `table_min_rows(usize)` | `3` | Min rows required to render a table |
 | `table_min_columns(usize)` | `3` | Min columns required to render a table |
 | `table_min_similarity(f32)` | `0.8` | Min fraction of rows sharing a column |
 | `table_column_max_width(Option<usize>)` | `Some(40)` | Bail on table if any column exceeds this width |
-| `fold(FoldStyle)` | — | Set all four fold styles at once; individual options override |
+| `fold(FoldStyle)` | — | Set all four fold styles at once (`Auto`, `Fixed`, `None`); individual options override |
 | `number_fold_style(FoldStyle)` | `Auto` | How to fold long numbers across lines |
 | `string_bare_fold_style(FoldStyle)` | `Auto` | How to fold long bare strings |
 | `string_quoted_fold_style(FoldStyle)` | `Auto` | How to fold long quoted strings |
 | `string_multiline_fold_style(FoldStyle)` | `None` | How to fold multiline block continuation lines |
-| `eol(Eol)` | `Lf` | Line ending between output lines (`Lf` or `CrLf`) |
+| `eol(Eol)` | `Lf` | Line ending between output lines: `Lf`, `CrLf` |
+| `honor_string_forms(bool)` | `true` | `Document` rendering: honor recorded bare/quoted/multiline string forms |
+| `honor_key_forms(bool)` | `true` | `Document` rendering: honor recorded bare/quoted key forms |
+| `honor_tables(bool)` | `true` | `Document` rendering: honor recorded was-a-table facts |
+| `render_comments(bool)` | `true` | `Document` rendering: emit carried comments |
 
 **Experimental options** (may change or be removed in a future version):
 

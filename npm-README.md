@@ -94,7 +94,7 @@ Both expose the identical four functions with identical behavior.
 
 `stringify` and `fromJson` accept an optional [`StringifyOptions`](https://github.com/rfanth/tjson/blob/master/src/wasm.rs) object. TypeScript users get full autocomplete and inline documentation for all options — hover over any field in your editor.
 
-Options use **camelCase** in JavaScript. The underlying library's Rust API uses snake_case and idiomatic Rust, but exposes the same options.
+Options use **camelCase** in JavaScript — names and values both, spelled exactly as shown (there are no alternate spellings; `"boldFloating"` works, `"BoldFloating"` throws). The underlying library's Rust API uses snake_case and idiomatic Rust, but exposes the same options.
 
 Options must be a plain object; `null`/`undefined` mean defaults, and anything else (an array, a number, a class instance) throws. Note that the options bag rides the same value pipeline as data, so an options object with a `toJSON()` method is converted by it first — pass a plain literal. Unknown fields are ignored — TypeScript catches misspelled names at compile time — except option names that were renamed or removed in a past release, which throw with a hint pointing at the replacement.
 
@@ -128,30 +128,30 @@ that JS has no exact decimal type, so non-integer numbers are always `number`
 | `multilineStrings` | `true` | Use `\`\`` blocks for strings containing newlines |
 | `inlineObjects` | `true` | Pack multiple key-value pairs onto one line |
 | `inlineArrays` | `true` | Pack multiple array items onto one line |
-| `stringArrayStyle` | `"preferComma"` | How to pack all-string arrays |
+| `stringArrayStyle` | `"preferComma"` | How to pack all-string arrays: `"none"`, `"spaces"`, `"preferSpaces"`, `"comma"`, `"preferComma"` |
 
 **Advanced options:**
 
 | Option | Default | Description |
 |---|---|---|
-| `bareStrings` | `"prefer"` | Use bare (unquoted) string values when spec permits |
-| `bareKeys` | `"prefer"` | Use bare (unquoted) object keys when spec permits |
+| `bareStrings` | `"prefer"` | Use bare (unquoted) string values when spec permits: `"prefer"`, `"none"` |
+| `bareKeys` | `"prefer"` | Use bare (unquoted) object keys when spec permits: `"prefer"`, `"none"` |
 | `forceMarkers` | `false` | Force explicit `[` / `{` indent markers on single-step indents |
-| `multilineStyle` | `"bold"` | Multiline block style (`"bold"`, `"floating"`, `"light"`, etc.) |
+| `multilineStyle` | `"bold"` | Multiline block style: `"bold"`, `"floating"`, `"boldFloating"`, `"boldLight"`, `"light"`, `"transparent"`, `"foldingQuotes"` |
 | `multilineMinLines` | `1` | Min newlines in a string before using a multiline block |
-| `indentGlyphStyle` | `"auto"` | When to wrap deeply nested content in `/<` `/>` glyphs |
-| `indentGlyphMarkerStyle` | `"compact"` | Where to place the opening `/<` glyph |
-| `tableUnindentStyle` | `"auto"` | How to reposition wide tables toward the left margin |
+| `indentGlyphStyle` | `"auto"` | When to wrap deeply nested content in `/<` `/>` glyphs: `"auto"`, `"fixed"`, `"none"` |
+| `indentGlyphMarkerStyle` | `"compact"` | Where to place the opening `/<` glyph: `"compact"`, `"separate"` |
+| `tableUnindentStyle` | `"auto"` | How to reposition wide tables toward the left margin: `"left"`, `"auto"`, `"floating"`, `"none"` |
 | `tableMinRows` | `3` | Min rows required to render a table |
 | `tableMinColumns` | `3` | Min columns required to render a table |
 | `tableMinSimilarity` | `0.8` | Min fraction of rows sharing a column |
 | `tableColumnMaxWidth` | `40` | Bail on table if any column exceeds this width |
-| `fold` | — | Set all four fold styles at once; more specific options override |
+| `fold` | — | Set all four fold styles at once (`"auto"`, `"fixed"`, `"none"`); more specific options override |
 | `numberFoldStyle` | `"auto"` | How to fold long numbers across lines |
 | `stringBareFoldStyle` | `"auto"` | How to fold long bare strings |
 | `stringQuotedFoldStyle` | `"auto"` | How to fold long quoted strings |
 | `stringMultilineFoldStyle` | `"none"` | How to fold multiline block continuation lines |
-| `eol` | `"lf"` | Line ending between output lines (`"lf"` or `"crlf"`) |
+| `eol` | `"lf"` | Line ending between output lines: `"lf"`, `"crlf"` |
 
 **Experimental options** (may change or be removed in a future version):
 
