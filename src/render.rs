@@ -1399,6 +1399,9 @@ impl<T: Tree> Renderer<T> {
                         let body = if forced_bold || overflows_at_natural { 0 } else { indent };
                         bold(body)
                     }
+                    // BoldLight never leaves the natural indent: overflow is accepted,
+                    // and the pipe-guarded body has no content unsafe at any indent.
+                    MultilineStyle::BoldLight => bold(indent),
                     MultilineStyle::Transparent => {
                         if forced_bold {
                             bold(0)

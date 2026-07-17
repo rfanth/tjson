@@ -821,6 +821,42 @@ mod tests {
     }
 
     #[test]
+    fn bold_light_floats_body_at_natural_indent() {
+        let rendered = render_string_with_options(
+            &tjson_value("{\"note\":\"line one\\nline two\"}"),
+            RenderOptions { multiline_style: MultilineStyle::BoldLight, ..RenderOptions::default() },
+        );
+        assert_eq!(rendered, "  note: ``\n  | line one\n  | line two\n   ``");
+    }
+
+    #[test]
+    fn bold_light_never_falls_back_left_on_overflow() {
+        // A body line far beyond wrap_width: BoldFloating would move the body to col 0;
+        // BoldLight accepts the overflow and stays at the natural indent.
+        let long = "x".repeat(120);
+        let rendered = render_string_with_options(
+            &tjson_value(&format!("{{\"note\":\"short\\n{long}\"}}")),
+            RenderOptions { multiline_style: MultilineStyle::BoldLight, ..RenderOptions::default() },
+        );
+        assert!(rendered.contains("\n  | short\n"), "body stays at natural indent: {rendered}");
+        assert!(!rendered.contains("\n| "), "no line may fall back to the margin: {rendered}");
+    }
+
+    #[test]
+    fn bold_light_stays_put_on_pipe_heavy_content() {
+        // Pipe-heavy content forces other styles toward the margin-pinned form; the
+        // pipe-guarded body is safe at any indent, so BoldLight does not move.
+        let rendered = render_string_with_options(
+            &tjson_value("{\"note\":\"| a\\n| b\\nplain\"}"),
+            RenderOptions { multiline_style: MultilineStyle::BoldLight, ..RenderOptions::default() },
+        );
+        assert!(rendered.contains("\n  | | a\n"), "guarded body at natural indent: {rendered}");
+        assert!(!rendered.contains("\n| "), "no margin fallback: {rendered}");
+        let reparsed = to_json_value(parse_str(&rendered).unwrap());
+        assert_eq!(reparsed, json("{\"note\":\"| a\\n| b\\nplain\"}"));
+    }
+
+    #[test]
     fn light_falls_back_to_bold_on_dangerous_content() {
         // Pipe-heavy content IS dangerous → Light falls back to ``
         let value = Value::String("| piped\n| also piped\nnormal".to_owned());

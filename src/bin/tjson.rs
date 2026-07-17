@@ -79,8 +79,8 @@ TJSON Output Formatting Options (for output TJSON only, not help/errors/JSON):
   Multiline strings:
       --[no-]multiline        Enable/disable multiline string rendering
                                 (default: on)
-      --multiline-style STYLE  Style: bold, floating, bold-floating, light,
-                                transparent, folding-quotes (default: bold)
+      --multiline-style STYLE  Style: bold, floating, bold-floating, bold-light,
+                                light, transparent, folding-quotes (default: bold)
       --multiline-min-lines N  Minimum EOL count for multiline (default: 1)
       --multiline-max-lines N  Maximum lines before floating falls back to bold,
                                  0=unlimited (default: 10)

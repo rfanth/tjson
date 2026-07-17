@@ -242,6 +242,11 @@ pub enum MultilineStyle {
     /// Same ` `` ` format as `Bold`; body at natural indent `n+2` when it fits within
     /// `wrap_width`, otherwise falls back to col 2.
     BoldFloating,
+    /// Same ` `` ` format as `BoldFloating` — body at natural indent `n+2` — but never
+    /// falls back to the left margin: width overflow does not move the body, and the
+    /// pipe-guarded body has no unsafe content to force a move. The `` `` `` analog of
+    /// `Light`.
+    BoldLight,
     /// ` ``` ` with body at col 0; falls back to `Bold` when content is pipe-heavy or
     /// starts with backtick characters. `string_multiline_fold_style` has no effect here —
     /// `/ ` continuations are not allowed inside triple-backtick blocks.
@@ -263,11 +268,12 @@ impl FromStr for MultilineStyle {
             "bold" => Ok(Self::Bold),
             "floating" => Ok(Self::Floating),
             "bold-floating" => Ok(Self::BoldFloating),
+            "bold-light" => Ok(Self::BoldLight),
             "transparent" => Ok(Self::Transparent),
             "light" => Ok(Self::Light),
             "folding-quotes" => Ok(Self::FoldingQuotes),
             _ => Err(format!(
-                "invalid multiline style '{input}' (expected one of: bold, floating, bold-floating, transparent, light, folding-quotes)"
+                "invalid multiline style '{input}' (expected one of: bold, floating, bold-floating, bold-light, transparent, light, folding-quotes)"
             )),
         }
     }
@@ -753,6 +759,7 @@ mod camel_de {
         "floating"      => super::MultilineStyle::Floating,
         "bold"          => super::MultilineStyle::Bold,
         "boldFloating"  => super::MultilineStyle::BoldFloating,
+        "boldLight"     => super::MultilineStyle::BoldLight,
         "transparent"   => super::MultilineStyle::Transparent,
         "light"         => super::MultilineStyle::Light,
         "foldingQuotes" => super::MultilineStyle::FoldingQuotes,

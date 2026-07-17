@@ -49,7 +49,7 @@ extern "C" {
 const TS_TYPES: &'static str = r#"
 export type BareStyle = "prefer" | "none";
 export type FoldStyle = "auto" | "fixed" | "none";
-export type MultilineStyle = "floating" | "bold" | "boldFloating" | "transparent" | "light" | "foldingQuotes";
+export type MultilineStyle = "floating" | "bold" | "boldFloating" | "boldLight" | "transparent" | "light" | "foldingQuotes";
 export type TableUnindentStyle = "left" | "auto" | "floating" | "none";
 export type StringArrayStyle = "spaces" | "preferSpaces" | "comma" | "preferComma" | "none";
 export type IndentGlyphStyle = "auto" | "fixed" | "none";
