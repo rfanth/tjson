@@ -43,7 +43,7 @@ pub mod wasm;
 mod ffi;
 
 mod de;
-mod document;
+pub mod document;
 mod error;
 mod number;
 mod options;
@@ -54,9 +54,8 @@ mod tree;
 mod util;
 mod value;
 
-pub use document::{Comment, DocEntry, DocNode, Document, Placement};
+pub use document::Document;
 pub use error::{DeserializeError, Error, ParseError, Result};
-pub use tree::{KeyForm, MultilineFlavor, StringForm};
 pub use options::{
     BareStyle, Eol, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphStyle, MultilineStyle,
     StringArrayStyle, TableUnindentStyle, RenderOptions,

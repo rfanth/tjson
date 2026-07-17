@@ -21,10 +21,13 @@ use std::str::FromStr;
 use crate::error::Error;
 use crate::number::Number;
 use crate::tree::{
-    ContainerFacts, EntryFacts, KeyForm, NodeRef, RawComment, ScalarFacts, StringFacts,
-    StringForm, Tree,
+    ContainerFacts, EntryFacts, NodeRef, RawComment, ScalarFacts, StringFacts, Tree,
 };
-use crate::value::{Entry, Value};
+
+// The presentation vocabulary is defined beside the Tree seam but belongs to this
+// module's public surface: these are the forms Document records and the renderer honors.
+pub use crate::tree::{KeyForm, MultilineFlavor, StringForm};
+use crate::value::Value;
 
 /// Where a comment sits horizontally when re-emitted.
 ///
@@ -93,15 +96,15 @@ impl Comment {
 /// [`Document::from_value`]; project the plain data out with [`Document::to_value`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document {
-    root: DocNode,
+    root: Node,
 }
 
 impl Document {
-    pub fn root(&self) -> &DocNode {
+    pub fn root(&self) -> &Node {
         &self.root
     }
 
-    pub fn root_mut(&mut self) -> &mut DocNode {
+    pub fn root_mut(&mut self) -> &mut Node {
         &mut self.root
     }
 
@@ -122,7 +125,7 @@ impl Document {
     /// Lift a plain [`Value`] into a `Document` with no comments and no recorded
     /// presentation facts (the renderer's normal policies apply everywhere).
     pub fn from_value(value: &Value) -> Self {
-        Self { root: DocNode::lift(value) }
+        Self { root: Node::lift(value) }
     }
 
     /// Render as TJSON. Comments are emitted and recorded presentation facts honored
@@ -144,7 +147,7 @@ impl FromStr for Document {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let root = crate::parse::Parser::<DocNode>::parse_document(s, 0).map_err(Error::Parse)?;
+        let root = crate::parse::Parser::<Node>::parse_document(s, 0).map_err(Error::Parse)?;
         Ok(Self { root })
     }
 }
@@ -152,7 +155,7 @@ impl FromStr for Document {
 /// One node of a [`Document`]: a value plus the comments and presentation facts the
 /// parser observed for it (or a generator attached to it).
 #[derive(Clone, Debug, PartialEq, Default)]
-pub struct DocNode {
+pub struct Node {
     kind: DocKind,
     comments_before: Vec<Comment>,
     /// For strings: how the string was written. `None` means "no opinion" — the
@@ -171,11 +174,11 @@ enum DocKind {
     Bool(bool),
     Number(Number),
     String(String),
-    Array(Vec<DocNode>),
-    Object(Vec<DocEntry>),
+    Array(Vec<Node>),
+    Object(Vec<Entry>),
 }
 
-impl DocNode {
+impl Node {
     fn from_kind(kind: DocKind) -> Self {
         Self { kind, ..Self::default() }
     }
@@ -196,11 +199,11 @@ impl DocNode {
         Self::from_kind(DocKind::String(value.into()))
     }
 
-    pub fn array(items: Vec<DocNode>) -> Self {
+    pub fn array(items: Vec<Node>) -> Self {
         Self::from_kind(DocKind::Array(items))
     }
 
-    pub fn object(entries: Vec<DocEntry>) -> Self {
+    pub fn object(entries: Vec<Entry>) -> Self {
         Self::from_kind(DocKind::Object(entries))
     }
 
@@ -231,28 +234,28 @@ impl DocNode {
         }
     }
 
-    pub fn items(&self) -> Option<&[DocNode]> {
+    pub fn items(&self) -> Option<&[Node]> {
         match &self.kind {
             DocKind::Array(items) => Some(items),
             _ => None,
         }
     }
 
-    pub fn items_mut(&mut self) -> Option<&mut Vec<DocNode>> {
+    pub fn items_mut(&mut self) -> Option<&mut Vec<Node>> {
         match &mut self.kind {
             DocKind::Array(items) => Some(items),
             _ => None,
         }
     }
 
-    pub fn entries(&self) -> Option<&[DocEntry]> {
+    pub fn entries(&self) -> Option<&[Entry]> {
         match &self.kind {
             DocKind::Object(entries) => Some(entries),
             _ => None,
         }
     }
 
-    pub fn entries_mut(&mut self) -> Option<&mut Vec<DocEntry>> {
+    pub fn entries_mut(&mut self) -> Option<&mut Vec<Entry>> {
         match &mut self.kind {
             DocKind::Object(entries) => Some(entries),
             _ => None,
@@ -297,11 +300,11 @@ impl DocNode {
             DocKind::Bool(b) => Value::Bool(*b),
             DocKind::Number(n) => Value::Number(n.clone()),
             DocKind::String(s) => Value::String(s.clone()),
-            DocKind::Array(items) => Value::Array(items.iter().map(DocNode::to_value).collect()),
+            DocKind::Array(items) => Value::Array(items.iter().map(Node::to_value).collect()),
             DocKind::Object(entries) => Value::Object(
                 entries
                     .iter()
-                    .map(|entry| Entry { key: entry.key.clone(), value: entry.value.to_value() })
+                    .map(|entry| crate::value::Entry { key: entry.key.clone(), value: entry.value.to_value() })
                     .collect(),
             ),
         }
@@ -313,11 +316,11 @@ impl DocNode {
             Value::Bool(b) => DocKind::Bool(*b),
             Value::Number(n) => DocKind::Number(n.clone()),
             Value::String(s) => DocKind::String(s.clone()),
-            Value::Array(items) => DocKind::Array(items.iter().map(DocNode::lift).collect()),
+            Value::Array(items) => DocKind::Array(items.iter().map(Node::lift).collect()),
             Value::Object(entries) => DocKind::Object(
                 entries
                     .iter()
-                    .map(|entry| DocEntry::new(entry.key.clone(), DocNode::lift(&entry.value)))
+                    .map(|entry| Entry::new(entry.key.clone(), Node::lift(&entry.value)))
                     .collect(),
             ),
         };
@@ -325,18 +328,18 @@ impl DocNode {
     }
 }
 
-/// One key–value entry of an object [`DocNode`], carrying the key's presentation facts
+/// One key–value entry of an object [`Node`], carrying the key's presentation facts
 /// and any comments that preceded the entry.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DocEntry {
+pub struct Entry {
     key: String,
     key_form: Option<KeyForm>,
     comments_before: Vec<Comment>,
-    value: DocNode,
+    value: Node,
 }
 
-impl DocEntry {
-    pub fn new(key: impl Into<String>, value: DocNode) -> Self {
+impl Entry {
+    pub fn new(key: impl Into<String>, value: Node) -> Self {
         Self { key: key.into(), key_form: None, comments_before: Vec::new(), value }
     }
 
@@ -361,17 +364,17 @@ impl DocEntry {
         self.comments_before.push(comment);
     }
 
-    pub fn value(&self) -> &DocNode {
+    pub fn value(&self) -> &Node {
         &self.value
     }
 
-    pub fn value_mut(&mut self) -> &mut DocNode {
+    pub fn value_mut(&mut self) -> &mut Node {
         &mut self.value
     }
 }
 
-impl Tree for DocNode {
-    type Entry = DocEntry;
+impl Tree for Node {
+    type Entry = Entry;
 
     const KEEPS_COMMENTS: bool = true;
 
@@ -404,7 +407,7 @@ impl Tree for DocNode {
     }
 
     fn new_entry(key: String, value: Self, facts: EntryFacts) -> Self::Entry {
-        let mut entry = DocEntry::new(key, value);
+        let mut entry = Entry::new(key, value);
         entry.key_form = Some(facts.key_form);
         entry
     }
@@ -412,25 +415,25 @@ impl Tree for DocNode {
     fn from_minimal_json(value: serde_json::Value, _facts: ContainerFacts) -> Self {
         // JSON spells strings and keys quoted, so the fragment's interior records
         // Quoted throughout — that is what the source physically says.
-        fn convert(value: serde_json::Value) -> DocNode {
+        fn convert(value: serde_json::Value) -> Node {
             match value {
-                serde_json::Value::Null => DocNode::null(),
-                serde_json::Value::Bool(b) => DocNode::bool(b),
-                serde_json::Value::Number(n) => DocNode::number(Number(n.to_string())),
+                serde_json::Value::Null => Node::null(),
+                serde_json::Value::Bool(b) => Node::bool(b),
+                serde_json::Value::Number(n) => Node::number(Number(n.to_string())),
                 serde_json::Value::String(s) => {
-                    let mut node = DocNode::string(s);
+                    let mut node = Node::string(s);
                     node.string_form = Some(StringForm::Quoted);
                     node
                 }
                 serde_json::Value::Array(items) => {
-                    let mut node = DocNode::array(items.into_iter().map(convert).collect());
+                    let mut node = Node::array(items.into_iter().map(convert).collect());
                     node.table = Some(false);
                     node
                 }
-                serde_json::Value::Object(map) => DocNode::object(
+                serde_json::Value::Object(map) => Node::object(
                     map.into_iter()
                         .map(|(key, value)| {
-                            let mut entry = DocEntry::new(key, convert(value));
+                            let mut entry = Entry::new(key, convert(value));
                             entry.key_form = Some(KeyForm::Quoted);
                             entry
                         })
@@ -507,7 +510,7 @@ mod tests {
         input.parse().expect("test document must parse")
     }
 
-    fn entry<'a>(node: &'a DocNode, key: &str) -> &'a DocEntry {
+    fn entry<'a>(node: &'a Node, key: &str) -> &'a Entry {
         node.entries()
             .expect("expected object")
             .iter()
@@ -766,7 +769,7 @@ mod tests {
 
     #[test]
     fn generators_can_attach_comments_and_facts() {
-        let mut node = DocNode::object(vec![DocEntry::new("a", DocNode::number(1i64.into()))]);
+        let mut node = Node::object(vec![Entry::new("a", Node::number(1i64.into()))]);
         let entries = node.entries_mut().expect("object");
         entries[0].push_comment_before(Comment::new("generated by test"));
         assert_eq!(entries[0].comments_before()[0].text(), "// generated by test");
