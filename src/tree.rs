@@ -56,13 +56,28 @@ pub enum MultilineFlavor {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StringForm {
-    /// Space-prefixed bare string (` value`). Folding is geometry: a folded bare
-    /// string records as `Bare`.
-    Bare,
+    /// Bare string, opened however it was opened. Folding is geometry: a folded
+    /// bare string records as `Bare`.
+    Bare(BareForm),
     /// JSON string (`"value"`). Folded JSON strings record as `Quoted`.
     Quoted,
     /// Backtick multiline string of the given flavor.
     Multiline(MultilineFlavor),
+}
+
+/// Which opener a bare string was written with.
+///
+/// A bare string's opening quote is the single space in front of it. That space
+/// may instead be written as `_`, which occupies the same column and says the
+/// same thing out loud -- so the two forms are one string written two ways, and
+/// which way is a choice the writer made rather than a fact about the data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BareForm {
+    /// The opening quote is a space (` value`), and is invisible.
+    #[default]
+    Plain,
+    /// The opening quote is written `_` (`_value`), so it can be seen.
+    Marked,
 }
 
 /// How an object key was written in the source.

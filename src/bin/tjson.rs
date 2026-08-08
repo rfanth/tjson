@@ -54,10 +54,12 @@ TJSON Output Formatting Options (for output TJSON only, not help/errors/JSON):
       --[no-]inline           Enable/disable all inline packing (default: on)
       --[no-]inline-object    Enable/disable inline object packing (default: on)
       --[no-]inline-array     Enable/disable inline array packing (default: on)
-      --bare-strings VALUE    Bare string policy: prefer, none (default: prefer)
+      --bare-strings VALUE    String style: quoted, bare (default), marked.
+                                marked writes the bare string's opening space as
+                                `_` so it can be seen
       --bare-keys VALUE       Bare key policy: prefer, none (default: prefer)
-      --string-array-style STYLE  String array packing: none, comma, spaces,
-                                prefer-spaces, prefer-comma(default)
+      --string-array-style STYLE  Array string packing: none, comma, spaces,
+                                prefer-spaces(default), prefer-comma
   -k, --kv-pack-multiple N    Spacing multiplier between packed KV pairs,
                                 1-4, spaces = N*2 (default: 2) [experimental]
 
@@ -288,7 +290,7 @@ fn main() {
                 opts = opts.wrap_width(Some(w));
             }
         }
-        if let Some(v) = opt_bare_strings.as_deref().map(|s| s.parse::<tjson::BareStyle>().unwrap_or_else(|e| { eprintln!("tjson: --bare-strings: {e}"); std::process::exit(1); })) {
+        if let Some(v) = opt_bare_strings.as_deref().map(|s| s.parse::<tjson::StringStyle>().unwrap_or_else(|e| { eprintln!("tjson: --bare-strings: {e}"); std::process::exit(1); })) {
             opts = opts.bare_strings(v);
         }
         if let Some(v) = opt_bare_keys.as_deref().map(|s| s.parse::<tjson::BareStyle>().unwrap_or_else(|e| { eprintln!("tjson: --bare-keys: {e}"); std::process::exit(1); })) {

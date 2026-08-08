@@ -129,9 +129,10 @@ fn tjson_number_field_keeps_exact_digits() {
         let parsed: N = tjson::from_str(&input).expect("Number field must accept any JSON number");
         assert_eq!(parsed.n.as_str(), digits, "digits must survive typed deserialization");
     }
-    // Exponent-sign spelling is outside the data-integrity guarantee (Ray's ruling:
-    // "1e+100" vs "1e100" may differ). tjson::Number delegates to serde_json::Number,
-    // which canonicalizes the sign; value and precision survive, the spelling may not.
+    // Exponent-sign spelling is outside the data-integrity guarantee: "1e+100"
+    // and "1e100" may differ. tjson::Number delegates to serde_json::Number,
+    // which canonicalizes the sign; value and precision survive, the spelling
+    // may not.
     let parsed: N = tjson::from_str("  n:1e100").expect("exponent numbers deserialize");
     assert_eq!(parsed.n.as_str(), "1e+100");
     assert_eq!(parsed.n.as_f64(), Some(1e100));

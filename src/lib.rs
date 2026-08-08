@@ -63,7 +63,7 @@ pub use options::RenderOptions;
 #[doc(hidden)]
 pub use options::{
     BareStyle, Eol, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphStyle, MultilineStyle,
-    StringArrayStyle, TableUnindentStyle,
+    StringArrayStyle, StringStyle, TableUnindentStyle,
 };
 pub use number::{InvalidNumber, Number};
 pub use value::{Entry, Value};
@@ -89,7 +89,7 @@ pub const DEFAULT_WRAP_WIDTH: usize = options::DEFAULT_WRAP_WIDTH;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use parse::ParseOptions;
+use options::ParseOptions;
 
 
 #[cfg(test)]
@@ -122,7 +122,7 @@ fn from_tjson_str_with_options<T: DeserializeOwned>(
     input: &str,
     options: ParseOptions,
 ) -> Result<T> {
-    let tree = parse::Parser::<spanned::SpannedValue>::parse_document(input, options.start_indent)
+    let tree = parse::Parser::<spanned::SpannedValue>::parse_document(input, options)
         .map_err(Error::Parse)?;
     de::deserialize_from_tree(&tree, Some(input)).map_err(Error::Deserialize)
 }
@@ -1089,17 +1089,26 @@ mod tests {
                 ..RenderOptions::default()
             },
         );
+        // The array does not fit on the key's line, so it starts on the next one
+        // and every row begins at the same column. Note the rows now hold seven
+        // values rather than six: the inline start had been spending `  data:  `
+        // on the first row, which made it the narrowest row rather than the widest.
         assert_eq!(
             rendered,
-            "  data:  100, 200, 300, 400, 500, 600,\n    700, 800, 900, 1000, 1100, 1200,\n    1300"
+            "  data:\n    100, 200, 300, 400, 500, 600, 700,\n    800, 900, 1000, 1100, 1200, 1300"
         );
     }
 
     #[test]
-    fn default_string_array_style_is_prefer_comma() {
+    fn default_packs_an_all_bare_string_array_with_spaces() {
         let value = tjson_value("{\"items\":[\"alpha\",\"beta\",\"gamma\"]}");
         let rendered = render_string(&value);
-        assert_eq!(rendered, "  items:   alpha,  beta,  gamma");
+        // The default is StringArrayStyle::PreferSpaces, which keeps strings bare
+        // rather than buying compactness with quotes. All three elements can be
+        // bare, so the whole array is one array format 3 run. Note that the
+        // default's own preference is not what decides this one: prefer-comma
+        // would also leave it bare, because quoting it saves no line.
+        assert_eq!(rendered, "  items:   alpha   beta   gamma");
     }
 
     #[test]
@@ -1108,7 +1117,7 @@ mod tests {
         let rendered = render_string_with_options(
             &value,
             RenderOptions {
-                bare_strings: BareStyle::None,
+                bare_strings: StringStyle::Quoted,
                 ..RenderOptions::default()
             },
         );
@@ -1266,7 +1275,7 @@ mod tests {
             &value,
             RenderOptions {
                 string_array_style: StringArrayStyle::Comma,
-                wrap_width: Some(18),
+                wrap_width: Some(20),
                 ..RenderOptions::default()
             },
         );
@@ -1274,28 +1283,38 @@ mod tests {
             &value,
             RenderOptions {
                 string_array_style: StringArrayStyle::PreferComma,
-                wrap_width: Some(18),
+                wrap_width: Some(20),
                 ..RenderOptions::default()
             },
         );
-        assert_eq!(comma, "  items:   aa,  bb,\n     cc");
-        assert_eq!(prefer_comma, "  items:   aa   bb\n     cc");
+        // Forced to array format 2 the strings must be quoted, and the quotes cost
+        // enough that the array no longer fits on the key's line, so it starts on
+        // the next one. Both layouts then take a single packed line, and a tie buys
+        // the preference nothing -- prefer-comma pays quotes only to *save* a line
+        // -- so it keeps the bare form.
+        assert_eq!(comma, "  items:\n    \"aa\", \"bb\", \"cc\"");
+        assert_eq!(prefer_comma, "  items:\n     aa   bb   cc");
     }
 
     #[test]
-    fn quotes_comma_strings_in_packed_arrays_so_they_round_trip() {
+    fn packs_comma_bearing_strings_bare_and_round_trips() {
         let value = tjson_value("{\"items\":[\"apples, oranges\",\"pears, plums\",\"grapes\"]}");
         let rendered = render_string(&value);
+        // Array format 3 has no comma separator, so a comma inside an element can
+        // only be content and needs no quoting to stay unambiguous. All three
+        // elements go bare, separated by the three-space gap. Quoting them would
+        // cost every element in the array its bare form to avoid an ambiguity the
+        // format does not have.
         assert_eq!(
             rendered,
-            "  items:  \"apples, oranges\", \"pears, plums\",  grapes"
+            "  items:   apples, oranges   pears, plums   grapes"
         );
         let reparsed = to_json_value(parse_str(&rendered).unwrap());
         assert_eq!(reparsed, to_json_value(value));
     }
 
     #[test]
-    fn spaces_style_quotes_comma_strings_and_round_trips() {
+    fn spaces_style_packs_comma_bearing_strings_bare() {
         let value = tjson_value("{\"items\":[\"apples, oranges\",\"pears, plums\"]}");
         let rendered = render_string_with_options(
             &value,
@@ -1304,7 +1323,10 @@ mod tests {
                 ..RenderOptions::default()
             },
         );
-        assert_eq!(rendered, "  items:  \"apples, oranges\"  \"pears, plums\"");
+        // `spaces` refuses to comma pack a string, and never has to here: both
+        // elements go bare, so they space pack into a single array format 3 line
+        // and no string meets a comma separator.
+        assert_eq!(rendered, "  items:   apples, oranges   pears, plums");
         let reparsed = to_json_value(parse_str(&rendered).unwrap());
         assert_eq!(reparsed, to_json_value(value));
     }
@@ -1418,7 +1440,7 @@ mod tests {
             &value,
             RenderOptions::default()
                 .wrap_width(Some(20))
-                .bare_strings(BareStyle::None)
+                .bare_strings(StringStyle::Quoted)
                 .string_quoted_fold_style(FoldStyle::Auto),
         );
         assert!(rendered.contains("/ "), "expected fold: {rendered}");
@@ -1435,7 +1457,7 @@ mod tests {
             &value,
             RenderOptions::default()
                 .wrap_width(Some(20))
-                .bare_strings(BareStyle::None)
+                .bare_strings(StringStyle::Quoted)
                 .bare_keys(BareStyle::None)
                 .string_quoted_fold_style(FoldStyle::None),
         );
@@ -1452,7 +1474,7 @@ mod tests {
             &value,
             RenderOptions::default()
                 .wrap_width(Some(20))
-                .bare_strings(BareStyle::None)
+                .bare_strings(StringStyle::Quoted)
                 .string_quoted_fold_style(FoldStyle::Fixed),
         );
         assert!(rendered.contains("/ "), "Fixed must fold: {rendered}");
@@ -1471,7 +1493,7 @@ mod tests {
             &value,
             RenderOptions::default()
                 .wrap_width(Some(20))
-                .bare_strings(BareStyle::None)
+                .bare_strings(StringStyle::Quoted)
                 .string_quoted_fold_style(FoldStyle::Auto),
         );
         assert!(rendered.contains("/ "), "Auto must fold: {rendered}");
@@ -1642,7 +1664,9 @@ mod tests {
     #[test]
     fn number_fold_auto_falls_back_to_digit_split() {
         // 24 digits, no '.'/`e`: auto falls back to digit-boundary split.
-        // wrap=20, indent=0 → avail=20. Split at pos 20 (digit-digit boundary).
+        // wrap=20, indent=0 → avail=20, but auto will not leave a tail shorter
+        // than a line is worth, so it backs the split off to 14 and the
+        // remainder is 10 rather than splitting at 20 and stranding 4.
         let value = Value::Number("123456789012345678901234".parse().unwrap());
         let rendered = value.to_tjson_with(
             RenderOptions::default()
@@ -1651,8 +1675,8 @@ mod tests {
         );
         assert!(rendered.contains("/ "), "expected fold continuation: {rendered}");
         let first_line = rendered.lines().next().unwrap();
-        assert_eq!(first_line, "12345678901234567890",
-            "auto fallback must split at digit boundary at wrap=20: {rendered}");
+        assert_eq!(first_line, "12345678901234",
+            "auto must back off the split so the tail is worth a line: {rendered}");
         let reparsed = rendered.parse::<Value>().unwrap();
         assert_eq!(reparsed, Value::Number("123456789012345678901234".parse().unwrap()),
             "roundtrip must recover original number");
@@ -2016,13 +2040,13 @@ mod tests {
 
         // single-word lowercase (BareStyle, FoldStyle, IndentGlyphStyle, TableUnindentStyle, IndentGlyphMarkerStyle)
         let c: TjsonConfig = serde_json::from_str(r#"{
-            "bareStrings": "prefer",
+            "bareStrings": "bare",
             "numberFoldStyle": "auto",
             "indentGlyphStyle": "fixed",
             "tableUnindentStyle": "floating",
             "indentGlyphMarkerStyle": "compact"
         }"#).unwrap();
-        assert_eq!(c.bare_strings, Some(BareStyle::Prefer));
+        assert_eq!(c.bare_strings, Some(StringStyle::Bare));
         assert_eq!(c.number_fold_style, Some(FoldStyle::Auto));
         assert_eq!(c.indent_glyph_style, Some(IndentGlyphStyle::Fixed));
         assert_eq!(c.table_unindent_style, Some(TableUnindentStyle::Floating));

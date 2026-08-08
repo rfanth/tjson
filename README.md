@@ -6,7 +6,9 @@ TJSON is a hyper-readable, round trip safe and data preserving substitute for JS
 
 Usage as a binary, library (including WASM too), through serde Serialize, and from other languages via a C API are all fully supported.
 
-**Input JSON**
+The below JSON is hand-formatted and hand-aligned.  It is used here as a theoretical upper bound on how good JSON can look for comparison.  The output of JSON.stringify(json, null, 2) and most platform pretty printers look far worse than this.  The TJSON output is completely automatic with zero hand tuning or options, and still looks better.
+
+**Hand-Formatted JSON Input**
 ```json
 {
   "name": "Alice",
@@ -31,7 +33,7 @@ Usage as a binary, library (including WASM too), through serde Serialize, and fr
 | She loves Rust.
    ``
   scores:  90, 85, 92
-  tags:   rust,  wasm,  json,  serialization
+  tags:   rust   wasm   json   serialization
   team:
     |name    |age  |role    |
     | Alice  |30   | admin  |
@@ -45,7 +47,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tjson = { package = "tjson-rs", version = "0.6" }
+tjson = { package = "tjson-rs", version = "0.8" }
 ```
 
 Install the CLI:
@@ -164,13 +166,13 @@ Option enums live in `tjson::options` (e.g. `use tjson::options::MultilineStyle;
 | `multiline_strings(bool)` | `true` | Use ` `` ` blocks for strings containing newlines |
 | `inline_objects(bool)` | `true` | Pack multiple key-value pairs onto one line |
 | `inline_arrays(bool)` | `true` | Pack multiple array items onto one line |
-| `string_array_style(StringArrayStyle)` | `PreferComma` | How to pack all-string arrays: `None`, `Spaces`, `PreferSpaces`, `Comma`, `PreferComma` |
+| `string_array_style(StringArrayStyle)` | `PreferSpaces` | What strings may share a line with: `Comma`, `PreferComma`, `PreferSpaces`, `Spaces`, `None` (least to most restrictive) |
 
 **Advanced options:**
 
 | Option | Default | Description |
 |---|---|---|
-| `bare_strings(BareStyle)` | `Prefer` | Use bare (unquoted) string values when spec permits: `Prefer`, `None` |
+| `bare_strings(StringStyle)` | `Bare` | How a string value announces itself: `Quoted` always quotes; `Bare` uses the unquoted form where the spec permits, its opening quote being the space in front of it; `Marked` writes that space as `_` so it can be seen |
 | `bare_keys(BareStyle)` | `Prefer` | Use bare (unquoted) object keys when spec permits: `Prefer`, `None` |
 | `force_markers(bool)` | `false` | Force explicit `[` / `{` indent markers on single-step indents |
 | `multiline_style(MultilineStyle)` | `Bold` | Multiline block style: `Bold`, `Floating`, `BoldFloating`, `BoldLight`, `Light`, `Transparent`, `FoldingQuotes` |
@@ -251,6 +253,7 @@ memory ownership, error codes, and the options object — is in
 - **Test suite**: [tjson-tests](https://github.com/rfanth/tjson-tests)
 - **npm package**: [@rfanth/tjson](https://www.npmjs.com/package/@rfanth/tjson) — JavaScript/TypeScript bindings
 - **MariaDB/MySQL UDF**: [tjson-udf](https://github.com/rfanth/tjson-udf) — same options in SQL
+- **Editor support**: [tjson-highlight](https://github.com/rfanth/tjson-highlight) — syntax highlighting and inline parse errors for VS Code and VSCodium, plus a GNU nano syntax file
 - **Specification**: [tjson-specification.md](https://github.com/rfanth/tjson-spec/blob/master/tjson-specification.md) —
   The spec is versioned independently from this implementation: each release
   is written against the spec as published at release time (the two are

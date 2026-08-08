@@ -65,7 +65,7 @@ pub(crate) enum IndentGlyphMode {
     /// Fire based on pure geometry: `pair_indent × line_count >= threshold × w²`
     IndentWeighted(f64),
     /// Fire based on content density: `pair_indent × byte_count >= threshold × w²`
-    /// 
+    ///
     /// Not yet used on purpose, but planned for later.
     ByteWeighted(f64),
     /// Fire whenever `pair_indent >= w / 2`
@@ -122,12 +122,631 @@ impl FromStr for TableUnindentStyle {
 }
 
 
+
+// ---- Lookalike character sets ----
+//
+// Each set below holds the characters a reader could mistake for one of TJSON's
+// structural characters. The structural character itself is never in the set:
+// a comma IS an array separator, it does not merely resemble one, and it is
+// tested directly by the code that looks for a separator. That split is what
+// makes these sets safe to hand to a caller -- redefining them changes which
+// *impostors* are refused, and can never change what a comma does.
+//
+// Enumerated rather than derived: no Unicode property selects any of them.
+// Sorted, because `ParseOptions` binary searches them; `ParseOptions::checked`
+// enforces both properties on anything a caller supplies.
+
+/// The COMMALIKE set as the specification enumerates it, less the comma.
+pub(crate) const SPEC_COMMALIKE: &[char] = &[
+    '\u{02BB}', '\u{02BC}', '\u{02BD}', '\u{060C}', '\u{066B}', '\u{201A}', '\u{2E32}',
+    '\u{2E34}', '\u{2E41}', '\u{2E4C}', '\u{3001}', '\u{FE50}', '\u{FE51}', '\u{FF0C}',
+    '\u{FF64}',
+];
+
+/// The COLONLIKE set as the specification enumerates it, less the colon.
+///
+/// A colon separates a key from its value, so a character drawn like one inside
+/// a bare key would let `a<colonlike>b:1` read as two different splits depending
+/// on which colon the reader believes.
+pub(crate) const SPEC_COLONLIKE: &[char] = &[
+    '\u{02D0}', '\u{02F8}', '\u{0589}', '\u{05C3}', '\u{0703}', '\u{0704}', '\u{0903}',
+    '\u{0A83}', '\u{0C03}', '\u{0C83}', '\u{0D03}', '\u{16EC}', '\u{205A}', '\u{2236}',
+    '\u{2982}', '\u{A789}', '\u{FE13}', '\u{FE30}', '\u{FF1A}',
+];
+
+/// The QUOTELIKE set as the specification enumerates it, less the three quotes
+/// the specification names outright (`"`, `'` and the backtick).
+///
+/// The 28 remaining span Po, Ps, Pe, Pi, Pf and Sk, which is why the test is a
+/// list. An earlier version tested `InitialPunctuation | FinalPunctuation` and
+/// reached only 10 of them -- it let the whole corner bracket family through
+/// (`「』﹁｣`), which open and close quotations in Japanese exactly as `"` does
+/// in English, while wrongly catching the `⸂⸃⸄⸅` substitution brackets, which
+/// are not quotes at all.
+pub(crate) const SPEC_QUOTELIKE: &[char] = &[
+    '\u{00AB}', '\u{00BB}', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}',
+    '\u{201D}', '\u{201E}', '\u{201F}', '\u{2039}', '\u{203A}', '\u{2E42}', '\u{300C}',
+    '\u{300D}', '\u{300E}', '\u{300F}', '\u{301D}', '\u{301E}', '\u{301F}', '\u{FE41}',
+    '\u{FE42}', '\u{FE43}', '\u{FE44}', '\u{FF02}', '\u{FF07}', '\u{FF62}', '\u{FF63}',
+];
+
+/// The PIPELIKE set as the specification enumerates it, less the vertical line.
+///
+/// The test is shape, not frequency -- any character rendering as a full-height
+/// vertical stroke qualifies, however rare, because the confusion it creates at
+/// the start of a line is the same either way. That is why the click letters and
+/// the runic letter are in it despite being letters, and why the danda family is
+/// not: those are short marks on the baseline rather than full-height strokes.
+pub(crate) const SPEC_PIPELIKE: &[char] = &[
+    '\u{00A6}', '\u{01C0}', '\u{01C1}', '\u{05C0}', '\u{16C1}', '\u{2016}', '\u{2223}',
+    '\u{2225}', '\u{23D0}', '\u{2502}', '\u{2503}', '\u{2506}', '\u{2507}', '\u{250A}',
+    '\u{250B}', '\u{254E}', '\u{254F}', '\u{2551}', '\u{258F}', '\u{2595}', '\u{2758}',
+    '\u{2759}', '\u{275A}', '\u{2980}', '\u{2AF4}', '\u{2AFC}', '\u{2AFE}', '\u{2AFF}',
+    '\u{2D4F}', '\u{FE31}', '\u{FE33}', '\u{FF5C}', '\u{FFE4}', '\u{1FB70}', '\u{1FB71}',
+    '\u{1FB72}', '\u{1FB73}', '\u{1FB74}', '\u{1FB75}',
+];
+
+/// The FORESLASHLIKE set as the specification enumerates it, less the solidus.
+///
+/// The test is shape: a single straight stroke leaning from the bottom left to
+/// the top right. Doubled and dotted forms are not members -- a reader tells
+/// `⫽` and `⹊` apart from `/` at a glance -- and neither are the tapering
+/// calligraphic strokes such as U+4E3F, which curve at the foot.
+///
+/// This set does more work than the others. The solidus is genuinely parse
+/// critical: it opens a fold continuation and both indent offset glyphs. So a
+/// lookalike at the start of a BARE STRING is read as a fold marker by a person
+/// even though it is not one to the parser, which is the confusion this
+/// prevents.
+pub(crate) const SPEC_FORESLASHLIKE: &[char] = &[
+    '\u{1735}', '\u{2044}', '\u{2215}', '\u{2571}', '\u{29F8}', '\u{FF0F}',
+];
+
+/// The UNDERSCORELIKE set as the specification enumerates it, less the low line.
+///
+/// The test is shape: a single solid straight stroke resting on the floor of the
+/// cell. Doubled, dashed and wavy low lines are not members -- a reader tells
+/// `‗`, `﹍` and `﹏` apart from `_` at a glance, so they are different marks
+/// rather than impostors. Orientation excludes the rest: a vertical low line
+/// such as U+FE33 is never mistaken for a floor stroke, and is a PIPELIKE
+/// character instead.
+///
+/// The low line matters because it may stand where the space that opens a BARE
+/// STRING would go, for a writer who wants to be unmistakable. A character that
+/// looks like one must not be able to sit in that slot and be read as the
+/// marker.
+pub(crate) const SPEC_UNDERSCORELIKE: &[char] = &[
+    '\u{02CD}', '\u{23BC}', '\u{23BD}', '\u{2581}', '\u{FF3F}',
+];
+
+/// The characters the format is actually built on, paired with the set of
+/// impostors each one attracts. A caller may replace a set; it may never touch
+/// this column, and `ParseOptions::checked` refuses a set that tries.
+const STRUCTURAL_COMMA: &[char] = &[','];
+const STRUCTURAL_COLON: &[char] = &[':'];
+const STRUCTURAL_PIPE: &[char] = &['|'];
+/// Three, because the specification names three: `"` and the backtick open
+/// strings and `'` is reserved alongside them.
+const STRUCTURAL_QUOTE: &[char] = &['"', '\'', '`'];
+/// One, because the low line is the only character that may stand where a BARE
+/// STRING's opening space goes.
+const STRUCTURAL_UNDERSCORE: &[char] = &['_'];
+/// One, because the solidus is the only character that opens a fold or an
+/// indent offset glyph.
+const STRUCTURAL_FORESLASH: &[char] = &['/'];
+
+/// How the parser reads bare strings and bare keys.
+///
+/// The four lookalike sets are the point of this type. They are the *only*
+/// thing about the bare forms a caller may move, and they exist so that a
+/// policy change stays survivable: narrowing what may appear unquoted turns
+/// documents that were valid when written into documents that will not load,
+/// and a caller holding the older sets can still read them. Handing back the
+/// definition is also what keeps the parser from carrying these lists around --
+/// it asks its options what counts, and only the structural characters are
+/// written into the code that looks for them.
+///
+/// Not public and not exposed through the CLI. [`SPEC_FORMS`] is the default
+/// and is what every ordinary caller gets.
 #[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParseOptions {
+    pub(crate) start_indent: usize,
+    // Private, unlike `start_indent`: these can only be set through the builders
+    // below, which is where a set containing a structural character is caught.
+    // A struct literal elsewhere in the crate would bypass that check.
+    commalike: &'static [char],
+    colonlike: &'static [char],
+    pipelike: &'static [char],
+    quotelike: &'static [char],
+    underscorelike: &'static [char],
+    foreslashlike: &'static [char],
+
+    /// Spaces at the end of a line, where they carry nothing. No reading of
+    /// this reaches inside a multiline string body, where a trailing space is
+    /// data like any other character.
+    pub(crate) trailing_spaces: TrailingSpaces,
+    /// A comment landing inside a fold, which the specification does not allow.
+    pub(crate) comment_placement_error: CommentPlacementError,
+    /// A byte order mark at the very start of the input.
+    pub(crate) byte_order_mark: ByteOrderMark,
+    /// A key whose value is indented more than one level below it, with no
+    /// marker chain saying how deep it goes.
+    pub(crate) missing_indent_marker: MissingIndentMarker,
+    /// How little a MULTILINE STRING is allowed to hold.
+    pub(crate) multiline_minimum: MultilineMinimum,
+    // TODO: duplicate keys. Today the last one silently wins, which is not a
+    // decision anyone made -- it is what the map insert happens to do, and no
+    // test pins it. Other JSON implementations keep the first or the last and
+    // almost nothing preserves both; a policy would also cover the case where
+    // we know the value is headed somewhere that accepts only one.
+    // serde_json is last, so that's nice for now.
+    // `duplicate_keys: Reject | KeepFirst | KeepLast | Preserve`.
+    //
+    // TODO: several TJSON values in one input. Nothing to decide until TJSON
+    // Lines exists. `multiple_values: Reject | Stop`.
+}
+
+/// What to do with spaces at the end of a line that carry no data.
+///
+/// Spec: "TRAILING SPACES ARE TREATED AS ERRORS BY DEFAULT WHERE NOT
+/// MEANINGFUL". The "by default" is this option; "where not meaningful" is why
+/// neither reading reaches inside a multiline string body.
+// Only the tests construct the non-default readings today. They exist ahead of
+// their consumer on purpose: the point of this type is that a preset can be
+// assembled from them later without the policy having to be rediscovered at
+// each site that applies it.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-struct ParseOptions {
-    start_indent: usize,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TrailingSpaces {
+    /// An error naming the spaces and how to be rid of them. The
+    /// specification's reading.
+    #[default]
+    Reject,
+    /// Read the line as though they had not been typed.
+    Discard,
+}
+
+/// What to do with a comment inside a fold.
+///
+/// Spec: "A comment may not be within a fold." A fold is one value spread over
+/// several lines, so a comment landing in the middle of one has no position in
+/// the document -- there is no node it sits before.
+// Only the tests construct the non-default readings today. They exist ahead of
+// their consumer on purpose: the point of this type is that a preset can be
+// assembled from them later without the policy having to be rediscovered at
+// each site that applies it.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CommentPlacementError {
+    /// An error naming the comment and where it could go instead. The
+    /// specification's reading.
+    #[default]
+    Reject,
+    /// Lift the comment to just before the value the fold belongs to, the
+    /// nearest position that exists. The comment survives and the document
+    /// re-renders as legal TJSON -- what a `--fix` pass wants.
+    Hoist,
+    /// Drop the comment and keep the value.
+    ///
+    /// The one reading that loses something a person wrote, which is why it is
+    /// named for what it does. It was once the accidental behaviour on the
+    /// table path, where a comment inside a folded row vanished with nothing
+    /// reported; a caller may still want it when only the data matters, but it
+    /// should have to say so.
+    Discard,
+}
+
+/// What to do with a byte order mark at the start of the input.
+///
+/// U+FEFF is a zero-width no-break space, so a document beginning with one has
+/// an invisible first character. At byte 0 it is usually not content at all:
+/// Windows editors add it when saving UTF-8, so the author neither typed it nor
+/// can see it. Anywhere else in the input it stays forbidden under both
+/// readings -- there it really is an invisible character sitting inside data.
+// Only the tests construct the non-default readings today. They exist ahead of
+// their consumer on purpose: the point of this type is that a preset can be
+// assembled from them later without the policy having to be rediscovered at
+// each site that applies it.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ByteOrderMark {
+    /// An error saying a mark is present and how to remove it. The
+    /// specification's reading: TJSON has no encoding preamble.
+    #[default]
+    Reject,
+    /// Parse from the character after it. Byte offsets in spans are then
+    /// relative to the input with the mark removed.
+    Discard,
+}
+
+/// FOR TESTING ONLY DO NOT USE NON-DEFAULT VALUE
+/// 
+/// What to do with a key whose value is indented more than one level below it.
+///
+/// One level down is ordinary nesting and needs no marker. Deeper than that,
+/// TJSON asks for an explicit chain -- `[ [ 3` rather than an extra two spaces
+/// -- because the chain also says what each level *is*, which indentation alone
+/// does not.
+///
+/// This is the one rule in the format that is conditional on how far a value
+/// moved, and conditional rules are the ones a writer drops. That matters most
+/// for the writers who cannot be corrected: a language model emits indentation
+/// correctly because indentation is positional, and omits the marker because
+/// "required on a multi-level jump" is a clause it has to remember to apply.
+///
+/// [`Infer`](Self::Infer) is not a guess. The depth is already written down --
+/// it is the indentation -- and each level's kind follows from the format
+/// rather than from a heuristic:
+///
+/// - Levels 1 through N-1 can only be arrays. An object cannot sit directly
+///   inside an object; it would need a key, and there is no line for one.
+/// - Level N is whatever the content there says it is, decided by exactly the
+///   test that decides it for an ordinary one-level nesting: a key followed by
+///   a colon makes an object, anything else an array. So a colon inside a bare
+///   string (`k: 10:30:00`) cannot mislead it, because that test never reads a
+///   colon that does not terminate a key.
+///
+/// The reading it produces is therefore the only one the document can have --
+/// which is why this can be a policy at all, rather than a repair.
+// Only the tests construct the non-default reading today. It is deliberately not
+// reachable from the CLI or the public API yet: the default must keep behaving
+// exactly as the specification says while the inference gets exercised.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MissingIndentMarker {
+    /// An error. The specification's reading: the depth is expressible only
+    /// with a marker chain, so a document without one is not TJSON.
+    #[default]
+    Reject,
+    /// FOR TESTING ONLY DO NOT USE - VIOLATES SPECIFICATION
+    /// 
+    /// Read the missing levels off the indentation, as described above.
+    /// This is not to ever be exposed or used, the point of this option is to
+    /// test and sharpen the internal structure of the parser, not to be used
+    /// by the public.
+    /// 
+    /// Infer here is not specification compliant.
+    Infer,
+    /// Require the generator to force indent markers on in order to parse, and
+    /// not even generate one level without a marker.  This does not force the
+    /// '[' in '  key:[ 9' vs '  key:  9' as that one isn't in the indent,
+    /// and it's incredibly ugly.
+    /// 
+    /// This exists primarily as a way to test force_markers.
+    RequireForced,
+}
+
+/// How little a MULTILINE STRING is allowed to hold.
+///
+/// Neither reading accepts an empty one. The specification gives exactly one
+/// way to write the empty string -- `""` -- and a fence holding nothing would
+/// be a second, so that stays an error however this is set.
+///
+/// The two differ only on a string with content but no line break in it.
+///
+/// Neither reading is a generator setting. The generator obeys the linefeed
+/// rule unconditionally: every path that emits a fence is gated on the value
+/// really holding a newline, so no setting here makes this library write one
+/// that does not. What is being chosen is only how tolerant the *reader* is of
+/// a fence someone else wrote.
+// Only the tests construct the non-default reading today. It exists ahead of its
+// consumer on purpose: the point of this type is that a preset can be assembled
+// from these later without the policy having to be rediscovered at each site
+// that applies it.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MultilineMinimum {
+    /// At least one real data EOL in the multiline.
+    ///
+    /// Stricter than the specification, deliberately. The linefeed is a SHOULD,
+    /// so a fence holding one unbroken line is TJSON and this refuses it
+    /// anyway -- the reading for a caller who would rather hear about it,
+    /// because on the writing side a single-line fence is usually a mistake: a
+    /// generator that reached for a fence it did not need, or an edit that
+    /// deleted every line but one. That guess may be wrong sometimes (the
+    /// specification's own example of a fence used for deliberate emphasis is
+    /// exactly this shape), so it cannot be the default.
+    Eol,
+    /// At least one character, linefeed or not.
+    /// 
+    /// This is the straight from the spec. The specification's reading:
+    /// "the actual string data being displayed SHOULD contain at least one
+    /// linefeed and is REQUIRED to contain at least one data character", and
+    /// again among the requirements, "MULTILINE STRINGS SHOULD contain at least
+    /// one real unescaped newline, but MUST contain at least one character in
+    /// order to parse."  Also, a "" is the only allowed empty string.
+    ///
+    /// The floor a multiline has to clear to be TJSON at all is one
+    /// character, which is what a parser applies by default. A fence around a
+    /// single line is legal and means what it says (no data EOL); but it is
+    /// not something a generator should normally pick on its own.
+    /// 
+    /// A multiline that contains exactly one character, an EOL, is also valid.
+    #[default]
+    Character,
+}
+
+/// The specification's own reading -- every set exactly as TJSON defines it.
+///
+/// This is [`ParseOptions::default`], and it is also what the generator writes
+/// against: `util::is_comma_like` and its siblings are this constant asked the
+/// question, so the emitter and a default parser cannot disagree about what a
+/// lookalike is.
+pub(crate) const SPEC_FORMS: ParseOptions = ParseOptions {
+    start_indent: 0,
+    commalike: SPEC_COMMALIKE,
+    colonlike: SPEC_COLONLIKE,
+    pipelike: SPEC_PIPELIKE,
+    quotelike: SPEC_QUOTELIKE,
+    underscorelike: SPEC_UNDERSCORELIKE,
+    foreslashlike: SPEC_FORESLASHLIKE,
+    trailing_spaces: TrailingSpaces::Reject,
+    comment_placement_error: CommentPlacementError::Reject,
+    byte_order_mark: ByteOrderMark::Reject,
+    missing_indent_marker: MissingIndentMarker::Reject,
+    multiline_minimum: MultilineMinimum::Character,
+};
+
+impl Default for ParseOptions {
+    fn default() -> Self {
+        SPEC_FORMS
+    }
+}
+
+/// Every lookalike set that exists, paired with the structural characters it
+/// may not contain. The builders validate one entry; `spec_sets_obey_the
+/// _rules_they_impose` validates all four of the constants, which are otherwise
+/// never checked -- [`SPEC_FORMS`] is a struct literal and goes nowhere near a
+/// builder.
+#[cfg(test)]
+const LOOKALIKE_SETS: [(&str, &[char], &[char]); 6] = [
+    ("commalike", STRUCTURAL_COMMA, SPEC_COMMALIKE),
+    ("colonlike", STRUCTURAL_COLON, SPEC_COLONLIKE),
+    ("pipelike", STRUCTURAL_PIPE, SPEC_PIPELIKE),
+    ("quotelike", STRUCTURAL_QUOTE, SPEC_QUOTELIKE),
+    ("underscorelike", STRUCTURAL_UNDERSCORE, SPEC_UNDERSCORELIKE),
+    ("foreslashlike", STRUCTURAL_FORESLASH, SPEC_FORESLASHLIKE),
+];
+
+impl ParseOptions {
+    /// Accept a lookalike set, or say why it is not one.
+    ///
+    /// Refuses a set that would redefine a structural character, that is
+    /// unsorted, or that repeats itself. The structural check is the one that
+    /// matters. The other two are here because the sets are binary searched, so
+    /// an unsorted set does not merely perform badly -- it silently fails to
+    /// match, which would look like a lookalike being accepted rather than like
+    /// a mistake in the call.
+    ///
+    /// Runs once per set installed, not once per character tested. It cannot
+    /// move to compile time for a caller's set: a `&'static [char]` arriving
+    /// through a builder is opaque to this crate until it is handed over. The
+    /// sets this crate owns are a different matter and are pinned by test.
+    ///
+    /// `set_name` is only ever one of the four literals below. It is a
+    /// `&'static str` so it stays that way -- a name assembled at runtime would
+    /// make the errors below unpredictable text rather than fixed prose.
+    fn checked(
+        set_name: &'static str,
+        structural: &'static [char],
+        lookalikes: &'static [char],
+    ) -> std::result::Result<&'static [char], String> {
+        for &ch in lookalikes {
+            if structural.contains(&ch) {
+                return Err(format!(
+                    "the {set_name} set may not contain `{ch}` (U+{:04X}): that character is \
+                     not something that resembles TJSON syntax, it is TJSON syntax, and the \
+                     parser tests for it directly. These sets hold only the characters a \
+                     reader could mistake for it.",
+                    ch as u32
+                ));
+            }
+        }
+
+        // No lookalike is ASCII, and this is what makes that true of a set a
+        // caller supplies rather than only of the ones below. The classification
+        // fast paths lean on it: for an ASCII character every `is_*_like` test
+        // reduces to comparing against the structural character itself, with no
+        // set to search. A set holding ASCII would silently break them, and
+        // silently is the problem -- so it is refused here instead.
+        //
+        // Nothing is lost. A lookalike is a character that RESEMBLES a
+        // structural one, the structural ones are all ASCII and are held apart
+        // from these sets, and no ASCII character resembles another closely
+        // enough to be confused with it in a monospace font.
+        for &ch in lookalikes {
+            if ch.is_ascii() {
+                return Err(format!(
+                    "the {set_name} set may not contain `{ch}` (U+{:04X}): lookalike sets hold \
+                     no ASCII, because an ASCII character is either a structural character in \
+                     its own right or is not mistakable for one. The parser's fast paths read \
+                     that as a guarantee and stop searching the set for ASCII input.",
+                    ch as u32
+                ));
+            }
+        }
+
+        for pair in lookalikes.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(format!(
+                    "the {set_name} set lists U+{:04X} twice",
+                    pair[0] as u32
+                ));
+            }
+            if pair[0] > pair[1] {
+                return Err(format!(
+                    "the {set_name} set must be sorted by code point, but U+{:04X} precedes \
+                     U+{:04X}; the set is binary searched, so an unsorted one would quietly \
+                     stop matching some of its own members",
+                    pair[0] as u32, pair[1] as u32
+                ));
+            }
+        }
+
+        Ok(lookalikes)
+    }
+
+    /// Replace the COMMALIKE set. The comma itself is not a member and cannot
+    /// be made one -- see [`Self::checked`].
+    #[allow(dead_code)] // Recovery path: no caller in the library or CLI selects it yet.
+    pub(crate) fn commalike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.commalike = Self::checked("commalike", STRUCTURAL_COMMA, set)?;
+        Ok(self)
+    }
+
+    /// Replace the COLONLIKE set.
+    #[allow(dead_code)]
+    pub(crate) fn colonlike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.colonlike = Self::checked("colonlike", STRUCTURAL_COLON, set)?;
+        Ok(self)
+    }
+
+    /// Replace the PIPELIKE set.
+    #[allow(dead_code)]
+    pub(crate) fn pipelike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.pipelike = Self::checked("pipelike", STRUCTURAL_PIPE, set)?;
+        Ok(self)
+    }
+
+    /// Replace the QUOTELIKE set.
+    #[allow(dead_code)]
+    pub(crate) fn quotelike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.quotelike = Self::checked("quotelike", STRUCTURAL_QUOTE, set)?;
+        Ok(self)
+    }
+
+    /// Replace the FORESLASHLIKE set.
+    #[allow(dead_code)]
+    pub(crate) fn foreslashlike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.foreslashlike = Self::checked("foreslashlike", STRUCTURAL_FORESLASH, set)?;
+        Ok(self)
+    }
+
+    /// Replace the UNDERSCORELIKE set.
+    #[allow(dead_code)]
+    pub(crate) fn underscorelike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.underscorelike = Self::checked("underscorelike", STRUCTURAL_UNDERSCORE, set)?;
+        Ok(self)
+    }
+
+    /// How to read spaces at the end of a line that carry no data.
+    #[allow(dead_code)] // Awaiting the presets these are here to be assembled into.
+    pub(crate) fn trailing_spaces(mut self, policy: TrailingSpaces) -> Self {
+        self.trailing_spaces = policy;
+        self
+    }
+
+    /// What to do with a comment that lands inside a fold.
+    #[allow(dead_code)]
+    pub(crate) fn comment_placement_error(mut self, policy: CommentPlacementError) -> Self {
+        self.comment_placement_error = policy;
+        self
+    }
+
+    /// What to do with a byte order mark at the start of the input.
+    #[allow(dead_code)]
+    pub(crate) fn byte_order_mark(mut self, policy: ByteOrderMark) -> Self {
+        self.byte_order_mark = policy;
+        self
+    }
+
+    /// What to do with a value indented more than one level below its key with
+    /// no marker chain.
+    #[allow(dead_code)]
+    pub(crate) fn missing_indent_marker(mut self, policy: MissingIndentMarker) -> Self {
+        self.missing_indent_marker = policy;
+        self
+    }
+
+    /// How little a MULTILINE STRING may hold.
+    #[allow(dead_code)]
+    pub(crate) fn multiline_minimum(mut self, policy: MultilineMinimum) -> Self {
+        self.multiline_minimum = policy;
+        self
+    }
+
+    /// Would a reader take `ch` for an array separator?
+    ///
+    /// True for the comma itself as well as for its lookalikes -- a comma is
+    /// certainly commalike. It is still not what to call when looking for a
+    /// separator: that is `ch == ','`, written out where the split happens.
+    /// This answers a question about deception, and deception is policy.
+    pub(crate) fn is_comma_like(&self, ch: char) -> bool {
+        // ASCII holds no lookalikes (`ParseOptions::checked` enforces it), so for
+        // ASCII the structural character is the whole question.
+        if ch.is_ascii() {
+            return ch == ',';
+        }
+        self.commalike.binary_search(&ch).is_ok()
+    }
+
+    /// Would a reader take `ch` for a key/value separator? Not how to find one;
+    /// see [`Self::is_comma_like`].
+    pub(crate) fn is_colon_like(&self, ch: char) -> bool {
+        // ASCII holds no lookalikes (`ParseOptions::checked` enforces it), so for
+        // ASCII the structural character is the whole question.
+        if ch.is_ascii() {
+            return ch == ':';
+        }
+        self.colonlike.binary_search(&ch).is_ok()
+    }
+
+    /// Would a reader take `ch` for a table cell delimiter? Not how to find one;
+    /// see [`Self::is_comma_like`].
+    pub(crate) fn is_pipe_like(&self, ch: char) -> bool {
+        // ASCII holds no lookalikes (`ParseOptions::checked` enforces it), so for
+        // ASCII the structural character is the whole question.
+        if ch.is_ascii() {
+            return ch == '|';
+        }
+        self.pipelike.binary_search(&ch).is_ok()
+    }
+
+    /// Would a reader take `ch` for a quote? Not how to find one; see
+    /// [`Self::is_comma_like`].
+    pub(crate) fn is_quote_like(&self, ch: char) -> bool {
+        if ch.is_ascii() {
+            return STRUCTURAL_QUOTE.contains(&ch);
+        }
+        self.quotelike.binary_search(&ch).is_ok()
+    }
+
+    /// Would a reader take `ch` for the solidus that opens a fold or an indent
+    /// offset glyph? Not how to find one; see [`Self::is_comma_like`].
+    pub(crate) fn is_foreslash_like(&self, ch: char) -> bool {
+        if ch.is_ascii() {
+            return ch == '/';
+        }
+        self.foreslashlike.binary_search(&ch).is_ok()
+    }
+
+    /// Would a reader take `ch` for the low line that may open a BARE STRING?
+    /// Not how to find one; see [`Self::is_comma_like`].
+    pub(crate) fn is_underscore_like(&self, ch: char) -> bool {
+        if ch.is_ascii() {
+            return ch == '_';
+        }
+        self.underscorelike.binary_search(&ch).is_ok()
+    }
 }
 
 /// Options controlling how TJSON is rendered. Use [`RenderOptions::default`] for sensible
@@ -140,7 +759,7 @@ pub struct RenderOptions {
     pub(crate) wrap_width: Option<usize>,
     pub(crate) start_indent: usize,
     pub(crate) force_markers: bool,
-    pub(crate) bare_strings: BareStyle,
+    pub(crate) bare_strings: StringStyle,
     pub(crate) bare_keys: BareStyle,
     pub(crate) inline_objects: bool,
     pub(crate) inline_arrays: bool,
@@ -305,20 +924,75 @@ impl FromStr for BareStyle {
     }
 }
 
-/// Controls how arrays of short strings are packed onto a single line.
+/// How a string value announces that it is a string.
 ///
-/// - `Spaces`: always separate with spaces (e.g. `[ a  b  c`).
-/// - `PreferSpaces`: use spaces when it fits, fall back to block layout.
-/// - `Comma`: always separate with commas (e.g. `[ a, b, c`).
-/// - `PreferComma` (default): use commas when it fits, fall back to block layout.
-/// - `None`: never pack string arrays onto one line.
+/// The three readings are one axis, and it runs from JSON's habits toward
+/// TJSON's own. `Quoted` falls back to the mark JSON uses. `Bare` uses TJSON's
+/// mark, the single space in front of the value, which is invisible. `Marked`
+/// writes that same space as `_` so it can be seen -- not a decoration borrowed
+/// from elsewhere, but the format's own opening quote turned up.
+///
+/// Keys are a separate question and keep [`BareStyle`]: a key sits at the
+/// structural column with no opening space in front of it, so there is no slot
+/// for a marker and nothing for a third reading to say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StringStyle {
+    /// Always `"value"`.
+    Quoted,
+    /// ` value` where the rules allow it, with the opening quote invisible.
+    #[default]
+    Bare,
+    /// `_value` where the rules allow it, with the opening quote written out.
+    Marked,
+}
+
+impl FromStr for StringStyle {
+    type Err = String;
+
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        match input {
+            "quoted" => Ok(Self::Quoted),
+            "bare" => Ok(Self::Bare),
+            "marked" => Ok(Self::Marked),
+            _ => Err(format!(
+                "invalid string style '{input}' (expected one of: quoted, bare, marked)"
+            )),
+        }
+    }
+}
+
+/// Controls how a packed array line is put together.
+///
+/// Every variant is a rule about a *line*, not about the array. A line is packed
+/// or it is not; only a packed line has a format; and only array format 2 costs a
+/// bare-able string its quotes. So an array whose elements land on separate lines
+/// can hold bare and quoted elements at once, and `Comma` does not mean "quote the
+/// whole array" -- it means "pack lines with commas".
+///
+/// The variants form a ladder, each rung taking one more thing away from strings
+/// and none of them saying anything about anything else. A string-free array is
+/// laid out identically under all five, so adding a string to an array never
+/// changes how its numbers are packed:
+///
+/// - `Comma`: always pack lines with commas, accepting quotes on strings that had
+///   no other reason to be quoted.
+/// - `PreferComma`: comma pack when it strictly saves a line, and not otherwise.
+/// - `PreferSpaces` (default): split the array into runs of similarly formattable
+///   elements, one run per line, keeping strings bare where they can be.
+/// - `Spaces`: never comma pack a string, bare-able or not, so an unbareable one
+///   takes a line to itself -- but bare-able strings still space pack together.
+/// - `None`: no string shares a line with anything. Non-strings still pack; to
+///   stop arrays packing at all, use `inline_arrays(false)`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StringArrayStyle {
     Spaces,
+    // The default, and it must stay the one `RenderOptions::default` installs --
+    // two answers to "what is the default" in one file is how they drift.
+    #[default]
     PreferSpaces,
     Comma,
-    #[default]
     PreferComma,
     None,
 }
@@ -461,7 +1135,7 @@ impl RenderOptions {
 
     /// Controls whether string values use bare string format or JSON quoted strings. `Prefer` uses
     /// bare strings whenever the spec permits; `None` always uses JSON quoted strings. Default is `Prefer`.
-    pub fn bare_strings(mut self, bare_strings: BareStyle) -> Self {
+    pub fn bare_strings(mut self, bare_strings: StringStyle) -> Self {
         self.bare_strings = bare_strings;
         self
     }
@@ -485,8 +1159,10 @@ impl RenderOptions {
         self
     }
 
-    /// Controls how arrays where every element is a string are packed onto a single line.
-    /// Has no effect on arrays that contain any non-string values. Default is `PreferComma`.
+    /// Controls how packed array lines are put together. Each variant restricts
+    /// only what strings may share a line with, so a string-free array is laid out
+    /// the same under all of them. Default is `PreferSpaces`; to stop arrays
+    /// packing at all, use [`inline_arrays`](Self::inline_arrays).
     pub fn string_array_style(mut self, string_array_style: StringArrayStyle) -> Self {
         self.string_array_style = string_array_style;
         self
@@ -686,11 +1362,11 @@ impl Default for RenderOptions {
         Self {
             start_indent: 0,
             force_markers: false,
-            bare_strings: BareStyle::Prefer,
+            bare_strings: StringStyle::Bare,
             bare_keys: BareStyle::Prefer,
             inline_objects: true,
             inline_arrays: true,
-            string_array_style: StringArrayStyle::PreferComma,
+            string_array_style: StringArrayStyle::PreferSpaces,
             tables: true,
             wrap_width: Some(DEFAULT_WRAP_WIDTH),
             table_min_rows: 3,
@@ -746,6 +1422,22 @@ mod camel_de {
     camel_option_de!(bare_style, super::BareStyle,
         "prefer" => super::BareStyle::Prefer,
         "none"   => super::BareStyle::None,
+    );
+
+    // `prefer` and `none` are the names this option carried when it was a
+    // BareStyle, kept as exact synonyms of the two readings that replaced them:
+    // `prefer` meant "bare where the spec permits", which is `bare`, and `none`
+    // meant "never bare", which is `quoted`. They are accepted here and nowhere
+    // else -- the CLI flag takes the current names only. The reason is the
+    // published bindings: the C API and the wasm/JS binding both build their
+    // options by deserializing this struct, so refusing the old names would
+    // break callers who never asked for a new spelling.
+    camel_option_de!(string_style, super::StringStyle,
+        "quoted" => super::StringStyle::Quoted,
+        "bare"   => super::StringStyle::Bare,
+        "marked" => super::StringStyle::Marked,
+        "prefer" => super::StringStyle::Bare,
+        "none"   => super::StringStyle::Quoted,
     );
 
     camel_option_de!(fold_style, super::FoldStyle,
@@ -814,8 +1506,8 @@ pub struct TjsonConfig {
     pub(crate) canonical: bool,
     pub(crate) force_markers: Option<bool>,
     pub(crate) wrap_width: Option<usize>,
-    #[serde(deserialize_with = "camel_de::bare_style")]
-    pub(crate) bare_strings: Option<BareStyle>,
+    #[serde(deserialize_with = "camel_de::string_style")]
+    pub(crate) bare_strings: Option<StringStyle>,
     #[serde(deserialize_with = "camel_de::bare_style")]
     pub(crate) bare_keys: Option<BareStyle>,
     pub(crate) inline_objects: Option<bool>,
@@ -923,16 +1615,59 @@ pub fn retired_option_hint(field: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// The specification's own sets are held to the rule they impose on a
+    /// caller's. Nothing else checks them: `SPEC_FORMS` is a struct literal, so
+    /// it never passes through a builder, and a set that was out of order would
+    /// not fail loudly -- `binary_search` would simply stop finding some of its
+    /// own members, and a lookalike would be accepted as ordinary text.
+    #[test]
+    fn spec_sets_obey_the_rules_they_impose() {
+        for (name, structural, set) in LOOKALIKE_SETS {
+            ParseOptions::checked(name, structural, set)
+                .unwrap_or_else(|error| panic!("SPEC_{}: {error}", name.to_uppercase()));
+        }
+    }
+
+    /// A structural character answers `true` to its own question while living
+    /// outside the replaceable set -- the property the whole split rests on.
+    #[test]
+    fn structural_characters_are_never_set_members() {
+        for (name, structural, set) in LOOKALIKE_SETS {
+            for ch in structural {
+                assert!(
+                    !set.contains(ch),
+                    "U+{:04X} is structural and must not be in the {name} set",
+                    *ch as u32
+                );
+            }
+        }
+    }
+
     #[test]
     fn config_values_accept_exactly_one_case() {
         // camelCase is the one accepted spelling for option values on every JSON
         // surface (wasm, C FFI, UDF, fixture configs). The PascalCase fallback was
         // removed in 0.7.0 — these assertions pin both directions.
         let ok: TjsonConfig =
-            serde_json::from_str(r#"{"multilineStyle":"boldFloating","bareStrings":"none"}"#)
+            serde_json::from_str(r#"{"multilineStyle":"boldFloating","bareStrings":"quoted"}"#)
                 .expect("camelCase values parse");
         assert_eq!(ok.multiline_style, Some(MultilineStyle::BoldFloating));
-        assert_eq!(ok.bare_strings, Some(BareStyle::None));
+        assert_eq!(ok.bare_strings, Some(StringStyle::Quoted));
+
+        // The names this option carried as a BareStyle still deserialize, as
+        // exact synonyms. The published bindings build their options through
+        // this struct, so a caller who never asked for a new spelling keeps
+        // working; the CLI flag is where the old names are gone.
+        for (old, expected) in [("prefer", StringStyle::Bare), ("none", StringStyle::Quoted)] {
+            let aliased: TjsonConfig =
+                serde_json::from_str(&format!(r#"{{"bareStrings":"{old}"}}"#))
+                    .unwrap_or_else(|e| panic!("`{old}` must still deserialize: {e}"));
+            assert_eq!(aliased.bare_strings, Some(expected), "`{old}` reads as {expected:?}");
+        }
+        assert!(
+            "prefer".parse::<StringStyle>().is_err(),
+            "but the CLI flag takes the current names only"
+        );
 
         for rejected in [
             r#"{"multilineStyle":"BoldFloating"}"#,

@@ -14,33 +14,78 @@ fn tests_dir() -> std::path::PathBuf {
     pathbuf
 }
 
+/// Collect every `.tjson` fixture under `base`, descending into subdirectories
+/// so a category can have its own folder instead of every case living in one
+/// flat listing. Returns paths paired with a name relative to `base`, so a
+/// failure reports `bare_keys/leading_pipelike` rather than a bare stem that
+/// gives no clue where to look.
+///
+/// Disabling a fixture or a whole category, for cases that record behaviour
+/// known to be wrong and that should not fail the suite yet:
+///
+/// * rename it to `<name>.tjson.disabled`
+/// * or prefix the file or directory name with `_`
+/// * or put it in a directory named `known-bugs`
+///
+/// Names beginning with `.` are skipped as well, since editors and archivers
+/// leave such files around and they are never fixtures.
+fn collect_fixtures(base: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            if name.starts_with('_') || name.starts_with('.') || name.ends_with(".disabled") {
+                continue;
+            }
+            if path.is_dir() {
+                // `expected/` holds the answers, not fixtures.
+                if name == "expected" || name == "known-bugs" {
+                    continue;
+                }
+                walk(&path, base, out);
+                continue;
+            }
+            if path.extension().map(|x| x == "tjson").unwrap_or(false) {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .with_extension("")
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((path, rel));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(base, base, &mut out);
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
 #[test]
 fn parse_valid() {
     let base = tests_dir().join("parse/valid");
-    let expected_dir = base.join("expected");
     let mut failures: Vec<String> = Vec::new();
     let mut total = 0usize;
 
-    let entries: Vec<_> = std::fs::read_dir(&base)
-        .expect("cannot read parse/valid dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "tjson")
-                .unwrap_or(false)
-        })
-        .collect();
+    let entries = collect_fixtures(&base);
 
     if entries.is_empty() {
         panic!("No .tjson files found in {:?}", base);
     }
 
-    for entry in entries {
+    for (tjson_path, stem) in entries {
         total += 1;
-        let tjson_path = entry.path();
-        let stem = tjson_path.file_stem().unwrap().to_string_lossy().into_owned();
-        let json_path = expected_dir.join(format!("{}.json", stem));
+        // Expected JSON sits in an `expected/` directory beside the fixture, so
+        // a categorised subdirectory carries its own answers.
+        let json_path = tjson_path
+            .parent()
+            .unwrap_or(&base)
+            .join("expected")
+            .join(format!("{}.json", tjson_path.file_stem().unwrap().to_string_lossy()));
 
         let tjson_src = match std::fs::read_to_string(&tjson_path) {
             Ok(s) => s,
@@ -97,25 +142,14 @@ fn parse_invalid() {
     let mut failures: Vec<String> = Vec::new();
     let mut total = 0usize;
 
-    let entries: Vec<_> = std::fs::read_dir(&base)
-        .expect("cannot read parse/invalid dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "tjson")
-                .unwrap_or(false)
-        })
-        .collect();
+    let entries = collect_fixtures(&base);
 
     if entries.is_empty() {
         panic!("No .tjson files found in {:?}", base);
     }
 
-    for entry in entries {
+    for (tjson_path, stem) in entries {
         total += 1;
-        let tjson_path = entry.path();
-        let stem = tjson_path.file_stem().unwrap().to_string_lossy().into_owned();
 
         let tjson_src = match std::fs::read_to_string(&tjson_path) {
             Ok(s) => s,

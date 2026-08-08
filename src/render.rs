@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use crate::document::{Comment, Placement};
-use crate::options::{BareStyle, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphMode, MultilineStyle, StringArrayStyle, TableUnindentStyle, RenderOptions, MIN_FOLD_CONTINUATION, indent_glyph_mode};
-use crate::tree::{KeyForm, MultilineFlavor, NodeRef, StringForm, Tree};
+use crate::options::{BareStyle, StringStyle, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphMode, MultilineStyle, StringArrayStyle, TableUnindentStyle, RenderOptions, SPEC_FORMS, MIN_FOLD_CONTINUATION, indent_glyph_mode};
+use crate::tree::{BareForm, KeyForm, MultilineFlavor, NodeRef, StringForm, Tree};
 use crate::value::{BareString, StrMeta, TableBareString};
 use crate::util::*;
 use crate::parse::MultilineLocalEol;
@@ -40,6 +40,34 @@ fn basic_value<T: Tree>(value: &T) -> Option<BasicValue<'_>> {
 
 fn resolve_string_form(form: Option<StringForm>, options: &RenderOptions) -> Option<StringForm> {
     if options.honor_string_forms { form } else { None }
+}
+
+/// The character that opens a bare string: its one-sided opening quote.
+///
+/// A recorded form wins when forms are being honored, because which opener a
+/// person wrote is a choice they made and not a fact about the data. With no
+/// recorded form the global style decides, and `Marked` means every opener --
+/// marking some and not others would leave the reader unable to take an
+/// unmarked one as meaning anything.
+/// A bare string with its opening quote in front, built by hand.
+///
+/// `format!` is measurably the wrong tool here: this runs once per bare string,
+/// and a 46 MB document is millions of them. Two `push_str` calls into a
+/// right-sized buffer do no formatting work at all, where the macro dispatches
+/// through `Display` for each piece.
+fn opened_bare(opener: &str, value: &str) -> String {
+    let mut out = String::with_capacity(opener.len() + value.len());
+    out.push_str(opener);
+    out.push_str(value);
+    out
+}
+
+fn bare_opener_for(form: Option<BareForm>, options: &RenderOptions) -> &'static str {
+    let marked = match form {
+        Some(recorded) => recorded == BareForm::Marked,
+        None => options.bare_strings == StringStyle::Marked,
+    };
+    if marked { "_" } else { " " }
 }
 
 fn resolve_key_form(form: Option<KeyForm>, options: &RenderOptions) -> Option<KeyForm> {
@@ -83,7 +111,7 @@ fn emit_comments(
 pub(crate) fn render_key_form(key: &str, form: Option<KeyForm>, options: &RenderOptions) -> String {
     match resolve_key_form(form, options) {
         Some(KeyForm::Bare)
-            if parse_bare_key_prefix(key).is_some_and(|end| end == key.len()) =>
+            if parse_bare_key_prefix(key, &SPEC_FORMS).is_some_and(|end| end == key.len()) =>
         {
             key.to_owned()
         }
@@ -244,70 +272,25 @@ fn fits_wrap(options: &RenderOptions, line: &str) -> bool {
     }
 }
 
-fn pick_preferred_string_array_layout(
-    preferred: Option<Vec<String>>,
-    fallback: Option<Vec<String>>,
-    options: &RenderOptions,
-) -> Option<Vec<String>> {
-    match (preferred, fallback) {
-        (Some(preferred), Some(fallback))
-            if string_array_layout_score(&fallback, options)
-                < string_array_layout_score(&preferred, options) =>
-        {
-            Some(fallback)
-        }
-        (Some(preferred), _) => Some(preferred),
-        (None, fallback) => fallback,
-    }
-}
-
-struct StringArrayLayoutScore {
-    overflow: usize,
-    line_count: usize,
-    max_width: usize,
-}
-
-impl PartialOrd for StringArrayLayoutScore {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for StringArrayLayoutScore {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.overflow, self.line_count, self.max_width)
-            .cmp(&(other.overflow, other.line_count, other.max_width))
-    }
-}
-
-impl PartialEq for StringArrayLayoutScore {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-
-impl Eq for StringArrayLayoutScore {}
-
-fn string_array_layout_score(lines: &[String], options: &RenderOptions) -> StringArrayLayoutScore {
-    let overflow = match options.wrap_width {
-        Some(0) | None => 0,
-        Some(width) => lines
-            .iter()
-            .map(|line| line.chars().count().saturating_sub(width))
-            .sum(),
-    };
-    let max_width = lines
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
-    StringArrayLayoutScore { overflow, line_count: lines.len(), max_width }
+/// How much a string is allowed to share a line with, under the current style.
+///
+/// The three splitting styles form a ladder, and every rung takes one more thing
+/// away from strings while saying nothing at all about scalars.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringPacking {
+    /// `prefer-spaces`: a string packs with whatever its run allows.
+    Free,
+    /// `spaces`: a string is never comma packed, so an unbareable one stands
+    /// alone, but bare-able ones still space pack with each other.
+    NoComma,
+    /// `none`: no string shares a line with anything.
+    Never,
 }
 
 
 pub(crate) fn render_key(key: &str, options: &RenderOptions) -> String {
     if options.bare_keys == BareStyle::Prefer
-        && parse_bare_key_prefix(key).is_some_and(|end| end == key.len())
+        && parse_bare_key_prefix(key, &SPEC_FORMS).is_some_and(|end| end == key.len())
     {
         key.to_owned()
     } else {
@@ -338,15 +321,16 @@ fn split_multiline_fold(text: &str, avail: usize, style: FoldStyle) -> Vec<&str>
                 // Find the last space before avail that is not a single consecutive space
                 // (spec: bare strings may not fold immediately after a single space, but
                 // multiline folds are within the body text so we just prefer spaces).
-                let candidate = &rest[..avail.min(rest.len())];
+                let cut = floor_safe_fold_point(rest, avail);
+                let candidate = &rest[..cut];
                 // Find last space boundary
                 if let Some(pos) = candidate.rfind(' ') {
-                    if pos > 0 { pos } else { avail.min(rest.len()) }
+                    if pos > 0 { pos } else { cut }
                 } else {
-                    avail.min(rest.len())
+                    cut
                 }
             }
-            FoldStyle::Fixed | FoldStyle::None => avail.min(rest.len()),
+            FoldStyle::Fixed | FoldStyle::None => floor_safe_fold_point(rest, avail),
         };
         // Don't split mid-escape-sequence (keep `\x` pairs together)
         // Find the actual safe split point: walk back if we're in the middle of `\x`
@@ -363,6 +347,68 @@ fn split_multiline_fold(text: &str, avail: usize, style: FoldStyle) -> Vec<&str>
 /// Find the last safe byte position to split a JSON-encoded string, not mid-escape.
 /// `split_at` is the desired split position. May return a smaller value if `split_at`
 /// would land in the middle of a `\uXXXX` or `\X` escape.
+/// The shape every fold shares: one first line, then continuations behind `/ `.
+///
+/// Bare strings, bare keys, numbers and JSON strings all walk the same loop —
+/// take a budget, choose a split, emit a segment, drop to the continuation
+/// budget, repeat. Only three things actually differ between them, and each is
+/// a hook:
+///
+/// * `avail_for` — the budget for the segment about to be cut. Only JSON
+///   strings use it, to reserve a column for their closing quote on the final
+///   segment; everything else hands the budget straight back.
+/// * `choose_split` — where to cut, given the remaining text, the budget, and
+///   whether this is the first line. Returning 0 means "nowhere good", and the
+///   remainder is emitted whole.
+/// * `emit` — how to render one segment, given whether it is first and whether
+///   it is last.
+///
+/// The loop lives here rather than in each caller because getting it right is
+/// fiddly and getting it slightly wrong is invisible: an off-by-one in the
+/// continuation budget, or a first/last flag read at the wrong moment, still
+/// produces output that parses and round trips. One copy can be checked once.
+fn fold_lines(
+    value: &str,
+    first_avail: usize,
+    cont_avail: usize,
+    mut avail_for: impl FnMut(&str, usize) -> usize,
+    mut choose_split: impl FnMut(&str, usize, bool) -> usize,
+    mut emit: impl FnMut(&str, bool, bool) -> String,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut rest = value;
+    let mut first = true;
+    let mut current = first_avail;
+
+    loop {
+        let avail = avail_for(rest, current);
+        // Whether this is the final segment is settled before emitting it, so
+        // a caller that needs to close something (a quote) knows in time.
+        // A caller says where it *wants* to cut; whether a cut is *allowed*
+        // there is not its business. Spec: folding in the middle of a data
+        // character or a visible character is forbidden in every context, so
+        // every proposed split is backed off to the nearest legal one here,
+        // once, rather than each fold path re-deriving the rule.
+        let split = if rest.len() <= avail {
+            0
+        } else {
+            floor_legal_split(rest, choose_split(rest, avail, first))
+        };
+
+        if split == 0 {
+            lines.push(emit(rest, first, true));
+            break;
+        }
+
+        lines.push(emit(&rest[..split], first, false));
+        rest = &rest[split..];
+        first = false;
+        current = cont_avail;
+    }
+
+    lines
+}
+
 fn fold_bare_string(
     value: &str,
     indent: usize,
@@ -371,75 +417,51 @@ fn fold_bare_string(
     wrap_width: Option<usize>,
 ) -> Option<Vec<String>> {
     let w = wrap_width?;
-    // First-line budget: indent + 1 (space before bare string) + first_line_extra + content
-    // first_line_extra accounts for any key+colon prefix on the same line.
+    // First-line budget: indent + 1 (the one-sided opening quote) + first_line_extra.
     let first_avail = w.saturating_sub(indent + 1 + first_line_extra);
     if value.len() <= first_avail {
         return None; // fits on one line, no fold needed
     }
-    // Continuation budget: indent + 2 (`/ ` prefix) + content
-    let cont_avail = w.saturating_sub(indent + 2);
+    let cont_avail = w.saturating_sub(indent + 2); // `/ ` prefix
     if cont_avail < MIN_FOLD_CONTINUATION {
         return None; // too little room for useful continuation content
     }
-    let mut lines = Vec::new();
-    let mut rest = value;
-    let mut first = true;
-    let avail = if first { first_avail } else { cont_avail };
-    let _ = avail;
-    let mut current_avail = first_avail;
-    loop {
-        if rest.is_empty() {
-            break;
-        }
-        if rest.len() <= current_avail {
+    let ind = spaces(indent);
+
+    let lines = fold_lines(
+        value,
+        first_avail,
+        cont_avail,
+        |_rest, current| current,
+        |rest, avail, first| {
+            match style {
+                // Spec: "a bare string may never be folded immediately after a
+                // single consecutive space", which is what the lookahead is for.
+                FoldStyle::Auto => {
+                    let candidate = &rest[..floor_safe_fold_point(rest, avail)];
+                    let lookahead = rest[candidate.len()..].chars().next();
+                    let at = find_bare_fold_point(candidate, lookahead);
+                    // On a continuation with no good boundary, a hard cut still
+                    // beats overflowing the margin.
+                    if at == 0 && !first {
+                        floor_safe_fold_point(rest, avail)
+                    } else {
+                        at
+                    }
+                }
+                FoldStyle::Fixed | FoldStyle::None => floor_safe_fold_point(rest, avail),
+            }
+        },
+        |segment, first, _last| {
             if first {
-                lines.push(format!("{} {}", spaces(indent), rest));
+                format!("{} {}", ind, segment)
             } else {
-                lines.push(format!("{}/ {}", spaces(indent), rest));
+                format!("{}/ {}", ind, segment)
             }
-            break;
-        }
-        // Find a fold point
-        let split_at = match style {
-            FoldStyle::Auto => {
-                // Spec: "a bare string may never be folded immediately after a single
-                // consecutive space." Find last space boundary that isn't after a lone space.
-                let candidate = &rest[..current_avail.min(rest.len())];
-                let lookahead = rest[candidate.len()..].chars().next();
-                find_bare_fold_point(candidate, lookahead)
-            }
-            FoldStyle::Fixed | FoldStyle::None => current_avail.min(rest.len()),
-        };
-        let split_at = if split_at == 0 && !first && matches!(style, FoldStyle::Auto) {
-            // No good boundary found on a continuation line — fall back to a hard cut.
-            current_avail.min(rest.len())
-        } else if split_at == 0 {
-            // No fold point on the first line, or Fixed/None style — emit remainder as-is.
-            if first {
-                lines.push(format!("{} {}", spaces(indent), rest));
-            } else {
-                lines.push(format!("{}/ {}", spaces(indent), rest));
-            }
-            break;
-        } else {
-            split_at
-        };
-        let segment = &rest[..split_at];
-        if first {
-            lines.push(format!("{} {}", spaces(indent), segment));
-            first = false;
-        } else {
-            lines.push(format!("{}/ {}", spaces(indent), segment));
-        }
-        rest = &rest[split_at..];
-        current_avail = cont_avail;
-    }
-    if lines.len() <= 1 {
-        None // only produced one line, no actual fold
-    } else {
-        Some(lines)
-    }
+        },
+    );
+
+    if lines.len() <= 1 { None } else { Some(lines) }
 }
 
 /// Fold a bare key (no leading space) into multiple continuation lines.
@@ -452,40 +474,42 @@ fn fold_bare_key(
     wrap_width: Option<usize>,
 ) -> Option<Vec<String>> {
     let w = wrap_width?;
-    if matches!(style, FoldStyle::None) { return None; }
+    if matches!(style, FoldStyle::None) {
+        return None;
+    }
     // key + colon fits — no fold needed
-    if key.len() < w.saturating_sub(pair_indent) { return None; }
+    if key.len() < w.saturating_sub(pair_indent) {
+        return None;
+    }
     let first_avail = w.saturating_sub(pair_indent);
     let cont_avail = w.saturating_sub(pair_indent + 2); // `/ ` prefix
-    if cont_avail < MIN_FOLD_CONTINUATION { return None; }
+    if cont_avail < MIN_FOLD_CONTINUATION {
+        return None;
+    }
     let ind = spaces(pair_indent);
-    let mut lines: Vec<String> = Vec::new();
-    let mut rest = key;
-    let mut first = true;
-    let mut current_avail = first_avail;
-    loop {
-        if rest.is_empty() { break; }
-        if rest.len() <= current_avail {
-            lines.push(if first { format!("{}{}", ind, rest) } else { format!("{}/ {}", ind, rest) });
-            break;
-        }
-        let split_at = match style {
+
+    let lines = fold_lines(
+        key,
+        first_avail,
+        cont_avail,
+        |_rest, current| current,
+        |rest, avail, _first| match style {
             FoldStyle::Auto => {
-                let candidate = &rest[..current_avail.min(rest.len())];
+                let candidate = &rest[..floor_safe_fold_point(rest, avail)];
                 let lookahead = rest[candidate.len()..].chars().next();
                 find_bare_fold_point(candidate, lookahead)
             }
-            FoldStyle::Fixed | FoldStyle::None => current_avail.min(rest.len()),
-        };
-        if split_at == 0 {
-            lines.push(if first { format!("{}{}", ind, rest) } else { format!("{}/ {}", ind, rest) });
-            break;
-        }
-        lines.push(if first { format!("{}{}", ind, &rest[..split_at]) } else { format!("{}/ {}", ind, &rest[..split_at]) });
-        rest = &rest[split_at..];
-        first = false;
-        current_avail = cont_avail;
-    }
+            FoldStyle::Fixed | FoldStyle::None => floor_safe_fold_point(rest, avail),
+        },
+        |segment, first, _last| {
+            if first {
+                format!("{}{}", ind, segment)
+            } else {
+                format!("{}/ {}", ind, segment)
+            }
+        },
+    );
+
     if lines.len() <= 1 { None } else { Some(lines) }
 }
 
@@ -513,66 +537,22 @@ fn fold_number(
         return None;
     }
     let auto_mode = matches!(style, FoldStyle::Auto);
-    let mut lines: Vec<String> = Vec::new();
-    let mut rest = value;
-    let mut current_avail = first_avail;
     let ind = spaces(indent);
-    loop {
-        if rest.len() <= current_avail {
-            lines.push(format!("{}{}", ind, rest));
-            break;
-        }
-        let split_at = find_number_fold_point(rest, current_avail, auto_mode);
-        if split_at == 0 {
-            lines.push(format!("{}{}", ind, rest));
-            break;
-        }
-        lines.push(format!("{}{}", ind, &rest[..split_at]));
-        rest = &rest[split_at..];
-        current_avail = cont_avail;
-        // Subsequent lines use "/ " prefix
-        let last = lines.last_mut().unwrap();
-        // First line has no prefix adjustment; continuation lines need "/ " prefix.
-        // Restructure: first push was the segment, now we need to wrap in continuation format.
-        // Actually build correctly from the start:
-        // → rebuild: first line is plain, continuations are "/ segment"
-        // We already pushed the first segment above — fix continuation format below.
-        let _ = last; // handled in next iteration via prefix logic
-    }
-    // The above loop pushes segments without "/ " prefix on continuations. Rebuild properly.
-    // Simpler: redo with explicit first/rest tracking.
-    lines.clear();
-    let mut rest = value;
-    let mut first = true;
-    let mut current_avail = first_avail;
-    loop {
-        if rest.len() <= current_avail {
+
+    Some(fold_lines(
+        value,
+        first_avail,
+        cont_avail,
+        |_rest, current| current,
+        |rest, avail, _first| find_number_fold_point(rest, avail, auto_mode),
+        |segment, first, _last| {
             if first {
-                lines.push(format!("{}{}", ind, rest));
+                format!("{}{}", ind, segment)
             } else {
-                lines.push(format!("{}/ {}", ind, rest));
+                format!("{}/ {}", ind, segment)
             }
-            break;
-        }
-        let split_at = find_number_fold_point(rest, current_avail, auto_mode);
-        if split_at == 0 {
-            if first {
-                lines.push(format!("{}{}", ind, rest));
-            } else {
-                lines.push(format!("{}/ {}", ind, rest));
-            }
-            break;
-        }
-        if first {
-            lines.push(format!("{}{}", ind, &rest[..split_at]));
-            first = false;
-        } else {
-            lines.push(format!("{}/ {}", ind, &rest[..split_at]));
-        }
-        rest = &rest[split_at..];
-        current_avail = cont_avail;
-    }
-    Some(lines)
+        },
+    ))
 }
 
 /// Character class used by [`find_bare_fold_point`] to assign break priorities.
@@ -585,84 +565,51 @@ fn fold_json_string(
 ) -> Option<Vec<String>> {
     let w = wrap_width?;
     let encoded = render_json_string(value);
-    // First-line budget: indent + first_line_extra + content (the encoded string including quotes)
     let first_avail = w.saturating_sub(indent + first_line_extra);
     if encoded.len() <= first_avail {
         return None; // fits on one line
     }
     let cont_avail = w.saturating_sub(indent + 2);
     if cont_avail < MIN_FOLD_CONTINUATION {
-        return None; // too little room for useful continuation content
+        return None;
     }
-    // The encoded string starts with `"` and ends with `"`.
-    // We strip the outer quotes and work with the raw encoded content.
-    let inner = &encoded[1..encoded.len() - 1]; // strip opening and closing `"`
-    let mut lines: Vec<String> = Vec::new();
-    let mut rest = inner;
-    let mut first = true;
-    let mut current_avail = first_avail.saturating_sub(1); // -1 for the opening `"`
-    loop {
-        if rest.is_empty() {
-            // Close the string: add closing `"` to the last line
-            if let Some(last) = lines.last_mut() {
-                last.push('"');
-            }
-            break;
-        }
-        // Adjust avail: first line has opening `"` (-1), last segment needs closing `"` (-1)
-        let segment_avail = if rest.len() <= current_avail {
-            // Last segment: needs room for closing `"`
-            current_avail.saturating_sub(1)
-        } else {
-            current_avail
-        };
-        if rest.len() <= segment_avail {
-            let segment = rest;
-            if first {
-                lines.push(format!("{}\"{}\"", spaces(indent), segment));
+    // Work on the content between the delimiters; the quotes are put back by
+    // the emitter, which is the only part that knows about them.
+    let inner = &encoded[1..encoded.len() - 1];
+    let ind = spaces(indent);
+
+    let lines = fold_lines(
+        inner,
+        first_avail.saturating_sub(1), // the opening `"` costs a column
+        cont_avail,
+        // The final segment has to leave room for the closing `"`. This is the
+        // only caller that needs the hook.
+        |rest, current| {
+            if rest.len() <= current {
+                current.saturating_sub(1)
             } else {
-                lines.push(format!("{}/ {}\"", spaces(indent), segment));
+                current
             }
-            break;
-        }
-        // Find fold point
-        let split_at = match style {
+        },
+        |rest, avail, _first| match style {
+            // Spec: fold BEFORE unescaped space runs.
             FoldStyle::Auto => {
-                let candidate = &rest[..segment_avail.min(rest.len())];
-                // Prefer to split before a space run (spec: "fold BEFORE unescaped space runs")
+                let candidate = &rest[..floor_safe_fold_point(rest, avail)];
                 find_json_fold_point(candidate)
             }
             FoldStyle::Fixed | FoldStyle::None => {
-                safe_json_split(rest, segment_avail.min(rest.len()))
+                safe_json_split(rest, floor_safe_fold_point(rest, avail))
             }
-        };
-        if split_at == 0 {
-            // Can't fold cleanly — emit rest as final segment
-            if first {
-                lines.push(format!("{}\"{}\"", spaces(indent), rest));
-            } else {
-                lines.push(format!("{}/ {}\"", spaces(indent), rest));
-            }
-            break;
-        }
-        let segment = &rest[..split_at];
-        if first {
-            lines.push(format!("{}\"{}\"", spaces(indent), segment));
-            // Fix: first line should NOT have closing quote yet
-            let last = lines.last_mut().unwrap();
-            last.pop(); // remove the premature closing `"`
-            first = false;
-        } else {
-            lines.push(format!("{}/ {}", spaces(indent), segment));
-        }
-        rest = &rest[split_at..];
-        current_avail = cont_avail;
-    }
-    if lines.len() <= 1 {
-        None
-    } else {
-        Some(lines)
-    }
+        },
+        |segment, first, last| match (first, last) {
+            (true, true) => format!("{}\"{}\"", ind, segment),
+            (true, false) => format!("{}\"{}", ind, segment),
+            (false, true) => format!("{}/ {}\"", ind, segment),
+            (false, false) => format!("{}/ {}", ind, segment),
+        },
+    );
+
+    if lines.len() <= 1 { None } else { Some(lines) }
 }
 
 /// Count consecutive backslashes immediately before `pos` in `bytes`.
@@ -684,7 +631,15 @@ fn render_folding_quotes(value: &str, indent: usize, options: &RenderOptions) ->
                 lines.last_mut().unwrap().push('"');
             }
         } else if is_last {
-            lines.push(format!("{}/ {}\"", ind, inner));
+            if inner.is_empty() {
+                // A trailing empty piece (the value ends with the EOL) would emit
+                // `/ "` -- a fold marker with no data character after it, which the
+                // spec forbids: "Fold indicators must be both preceded and followed
+                // by at least one data character." Close on the previous line instead.
+                lines.last_mut().expect("first piece always pushes a line").push('"');
+            } else {
+                lines.push(format!("{}/ {}\"", ind, inner));
+            }
         } else {
             lines.push(format!("{}/ {}{}", ind, inner, nl));
         }
@@ -985,15 +940,49 @@ impl<T: Tree> Renderer<T> {
                         NodeRef::Object(o) => o.is_empty(),
                         _ => true,
                     });
-                    if all_simple
-                        && let Some(lines) = Self::render_packed_array_lines(
+                    if all_simple {
+                        // Array starter 2/3, inline variant -- but only when the whole
+                        // array fits on the key's line. Once it wraps, the first row
+                        // starts further right than every row below it, so it holds
+                        // fewer elements than the rows under it and no column can line
+                        // up. Spec: "it usually looks better to just start on the next
+                        // line if it doesn't all fit on one line with the key, so the
+                        // default is to do that". Both remain legal to parse.
+                        if let Some(lines) = Self::render_packed_array_lines(
                             values,
                             format!("{}{}:  ", spaces(pair_indent), key_text),
                             pair_indent + 2,
                             options,
-                        ) {
+                        ) && lines.len() == 1
+                        {
                             return lines;
                         }
+                        // Not taken under `force_markers`. The array above fits
+                        // on the key's line, so its `  ` opener is the inline
+                        // start variant, which the specification exempts from
+                        // marking. This one has already given up on that: the
+                        // key sits alone and the elements begin at the child
+                        // indent, which is an ordinary indent-level start and
+                        // so is a level `force_markers` is meant to name. The
+                        // marker it falls through to lands where the array
+                        // actually begins, which is why this stays honest --
+                        // an array that had started after the key could not be
+                        // marked on a later line without claiming to start
+                        // there.
+                        if !effective_force_markers(options)
+                            && let Some(packed) = Self::render_packed_array_lines(
+                                values,
+                                spaces(pair_indent + 2),
+                                pair_indent + 2,
+                                options,
+                            )
+                        {
+                            let mut lines =
+                                vec![format!("{}{}:", spaces(pair_indent), key_text)];
+                            lines.extend(packed);
+                            return lines;
+                        }
+                    }
                 }
 
                 let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
@@ -1301,7 +1290,7 @@ impl<T: Tree> Renderer<T> {
             Some(StringForm::Quoted) => {
                 return Self::render_quoted_string_lines(value, indent, first_line_extra, options);
             }
-            Some(StringForm::Bare) if meta.is_bare_eligible => {
+            Some(StringForm::Bare(_)) if meta.is_bare_eligible => {
                 if options.string_bare_fold_style != FoldStyle::None
                     && let Some(lines) = fold_bare_string(
                         value,
@@ -1313,7 +1302,10 @@ impl<T: Tree> Renderer<T> {
                 {
                     return lines;
                 }
-                return vec![format!("{} {}", spaces(indent), value)];
+                let mut line = spaces(indent);
+                line.push_str(bare_opener_for(None, options));
+                line.push_str(value);
+                return vec![line];
             }
             Some(StringForm::Multiline(flavor))
                 if meta.has_eol && meta.eol_type.is_some() && !meta.has_forbidden_literal =>
@@ -1413,7 +1405,7 @@ impl<T: Tree> Renderer<T> {
                 };
             }
         }
-        if options.bare_strings == BareStyle::Prefer && meta.is_bare_eligible {
+        if options.bare_strings != StringStyle::Quoted && meta.is_bare_eligible {
             if options.string_bare_fold_style != FoldStyle::None
                 && let Some(lines) =
                     fold_bare_string(value, indent, first_line_extra, options.string_bare_fold_style, options.wrap_width)
@@ -1589,11 +1581,13 @@ impl<T: Tree> Renderer<T> {
             BasicValue::Bool(b) => if b { "true".to_owned() } else { "false".to_owned() },
             BasicValue::Number(n) => n.to_string(),
             BasicValue::String(s, form) => match resolve_string_form(form, options) {
-                Some(StringForm::Bare) if BareString::new(s).is_some() => format!(" {}", s),
+                Some(StringForm::Bare(form)) if BareString::new(s).is_some() => {
+                    opened_bare(bare_opener_for(Some(form), options), s)
+                }
                 Some(StringForm::Quoted) => render_json_string(s),
                 _ => {
-                    if options.bare_strings == BareStyle::Prefer && BareString::new(s).is_some() {
-                        format!(" {}", s)
+                    if options.bare_strings != StringStyle::Quoted && BareString::new(s).is_some() {
+                        opened_bare(bare_opener_for(None, options), s)
                     } else {
                         render_json_string(s)
                     }
@@ -1614,20 +1608,13 @@ impl<T: Tree> Renderer<T> {
             return Some(vec![format!("{first_prefix}[]")]);
         }
 
-        if values
-            .iter()
-            .all(|value| value.is_string())
-        {
-            return Self::render_string_array_lines(
-                values,
-                first_prefix,
-                continuation_indent,
-                options,
-            );
-        }
-
-        let tokens = Self::render_packed_array_tokens(values);
-        Self::render_packed_token_lines(tokens, first_prefix, continuation_indent, false, options)
+        // Every packed array routes through the style, not just all-string ones.
+        // The question a packed line asks of an element is "can you be bare",
+        // never "are you a string" -- a number simply answers no, the same as a
+        // string that cannot go bare. Forking on `is_string` sent any array with
+        // one number straight to array format 2, which quoted every string in it
+        // and put the style out of reach entirely.
+        Self::render_string_array_lines(values, first_prefix, continuation_indent, options)
     }
 
     fn render_string_array_lines(
@@ -1636,68 +1623,211 @@ impl<T: Tree> Renderer<T> {
         continuation_indent: usize,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
+        // Every style below is a rule about a *line*, not about the array. A line
+        // is packed or it is not; only a packed line has a format; and only array
+        // format 2 costs a bare-able string its quotes. An array whose elements
+        // land on separate lines can hold bare and quoted elements at once, since
+        // each line picks its own format -- so "comma" never means "quote the
+        // whole array", it means "pack lines with commas".
+        //
+        // Two layouts serve all five:
+        //
+        // - the *comma* layout packs every element into one comma-separated run,
+        //   which is what forces bare-able strings into quotes;
+        // - the *split* layout cuts the array into maximal runs of like elements
+        //   and gives each run its own line, so bare runs stay bare.
+        //
+        // Every style restricts only what a *string* may share a line with, so an
+        // array holding no strings is laid out identically under all five, and the
+        // comma layout is that layout. Short-circuiting is not just tidiness: a
+        // style that compares two layouts renders the array twice, and arrays
+        // nest, so the doubling compounds -- a 30-deep array cost 2^30 renders and
+        // looked like a hang. Strings never nest, so this catches every deep case.
+        let comma_layout = |prefix: String| {
+            let tokens = Self::render_packed_array_tokens(values);
+            Self::render_packed_token_lines(tokens, prefix, continuation_indent, false, options)
+        };
+
+        if !values.iter().any(|value| value.is_string()) {
+            return comma_layout(first_prefix);
+        }
+
+        let commas = comma_layout(first_prefix.clone());
+
         match options.string_array_style {
-            StringArrayStyle::None => None,
-            StringArrayStyle::Spaces => {
-                let tokens = Self::render_packed_array_tokens(values);
-                Self::render_packed_token_lines(
-                    tokens,
-                    first_prefix,
-                    continuation_indent,
-                    true,
-                    options,
-                )
-            }
-            StringArrayStyle::PreferSpaces => {
-                let tokens = Self::render_packed_array_tokens(values);
-                let preferred = Self::render_packed_token_lines(
-                    tokens.clone(),
-                    first_prefix.clone(),
-                    continuation_indent,
-                    true,
-                    options,
-                );
-                let fallback = Self::render_packed_token_lines(
-                    tokens,
-                    first_prefix,
-                    continuation_indent,
-                    false,
-                    options,
-                );
-                pick_preferred_string_array_layout(preferred, fallback, options)
-            }
-            StringArrayStyle::Comma => {
-                let tokens = Self::render_packed_array_tokens(values);
-                Self::render_packed_token_lines(
-                    tokens,
-                    first_prefix,
-                    continuation_indent,
-                    false,
-                    options,
-                )
-            }
+            // No string shares a line with anything. Scalars are not strings, so
+            // they still pack -- this is the last rung of a ladder that only ever
+            // takes things away from strings, and adding a string to an array
+            // should not change how its numbers are laid out.
+            StringArrayStyle::None => Self::render_split_array_lines(
+                values,
+                first_prefix,
+                continuation_indent,
+                StringPacking::Never,
+                options,
+            ),
+
+            // Always pack lines with commas, accepting quotes on strings that had
+            // no other reason to be quoted.
+            StringArrayStyle::Comma => commas,
+
+            // A string is never comma packed, bare-able or not, so an unbareable
+            // one stands alone -- but bare-able ones still space pack together.
+            StringArrayStyle::Spaces => Self::render_split_array_lines(
+                values,
+                first_prefix,
+                continuation_indent,
+                StringPacking::NoComma,
+                options,
+            ),
+
+            // Prefer keeping strings bare over keeping the array compact. Runs of
+            // unbareable elements still pack with commas, since that is the only
+            // format available to them.
+            StringArrayStyle::PreferSpaces => Self::render_split_array_lines(
+                values,
+                first_prefix,
+                continuation_indent,
+                StringPacking::Free,
+                options,
+            ),
+
+            // Prefer commas over losing vertical space -- quotes are what you pay
+            // to save a line, so pay only when a line is actually saved. A tie
+            // buys nothing, so it goes to the bare form: an all-bare array packs
+            // onto one line either way, and the comma version would just be the
+            // same line wearing quotes.
             StringArrayStyle::PreferComma => {
-                let tokens = Self::render_packed_array_tokens(values);
-                let preferred = Self::render_packed_token_lines(
-                    tokens.clone(),
-                    first_prefix.clone(),
-                    continuation_indent,
-                    false,
-                    options,
-                );
-                let fallback = Self::render_packed_token_lines(
-                    tokens,
+                let split = Self::render_split_array_lines(
+                    values,
                     first_prefix,
                     continuation_indent,
-                    true,
+                    StringPacking::Free,
                     options,
                 );
-                pick_preferred_string_array_layout(preferred, fallback, options)
+                match (commas, split) {
+                    (Some(c), Some(s)) if c.len() < s.len() => Some(c),
+                    (_, Some(s)) => Some(s),
+                    (commas, None) => commas,
+                }
             }
         }
     }
 
-    fn render_packed_array_tokens(values: &[T]) -> Vec<(&[Comment], PackedToken<'_, T>)> {
+    /// Render an array as runs, one run per line group.
+    ///
+    /// Spec 0.5.0, Array Format: "Different lines in the representation of the
+    /// same data array can pick 1), 2) or 3) without parse issues." That is what
+    /// makes this possible -- an array is cut into maximal runs of like elements
+    /// and each run gets its own line, bare runs as format 3 and the rest as
+    /// format 2, so one element that cannot go bare does not cost the whole array
+    /// its bare forms.
+    ///
+    /// Runs are positional, since array order is data -- the same elements in a
+    /// different order cost a different number of lines.
+    ///
+    /// `packing` is what separates the three splitting styles. Those are generator
+    /// options rather than spec rules, and each rung only ever takes something
+    /// away from strings, never from anything else: scalars pack the same way
+    /// under all three, so adding a string to an array does not change how its
+    /// numbers are laid out.
+    fn render_split_array_lines(
+        values: &[T],
+        first_prefix: String,
+        continuation_indent: usize,
+        packing: StringPacking,
+        options: &RenderOptions,
+    ) -> Option<Vec<String>> {
+        let mut runs: Vec<(bool, &[T])> = Vec::new();
+        let mut start = 0;
+        while start < values.len() {
+            let bare = Self::packs_as_bare_string(&values[start], options);
+            let mut end = start + 1;
+            while end < values.len()
+                && Self::packs_as_bare_string(&values[end], options) == bare
+            {
+                end += 1;
+            }
+            runs.push((bare, &values[start..end]));
+            start = end;
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        for (bare, run) in runs {
+            // A bare run is all strings, so `Never` explodes it and the other two
+            // leave it space packed. A run that is not bare may hold scalars and
+            // unbareable strings together: both `Never` and `NoComma` cut it again
+            // on "is it a string", giving each string its own line while a stretch
+            // of scalars stays packed, since neither rung speaks about scalars.
+            let isolate = !matches!(
+                (bare, packing),
+                (_, StringPacking::Free) | (true, StringPacking::NoComma)
+            );
+            let groups: Vec<&[T]> = if !isolate {
+                vec![run]
+            } else if bare {
+                (0..run.len()).map(|index| &run[index..index + 1]).collect()
+            } else {
+                let mut groups = Vec::new();
+                let mut index = 0;
+                while index < run.len() {
+                    if run[index].is_string() {
+                        groups.push(&run[index..index + 1]);
+                        index += 1;
+                    } else {
+                        let start = index;
+                        while index < run.len() && !run[index].is_string() {
+                            index += 1;
+                        }
+                        groups.push(&run[start..index]);
+                    }
+                }
+                groups
+            };
+            for group in groups {
+                let prefix = if lines.is_empty() {
+                    first_prefix.clone()
+                } else {
+                    spaces(continuation_indent)
+                };
+                let tokens = Self::render_packed_array_tokens(group);
+                let group_lines = Self::render_packed_token_lines(
+                    tokens,
+                    prefix,
+                    continuation_indent,
+                    bare,
+                    options,
+                )?;
+                lines.extend(group_lines);
+            }
+        }
+        Some(lines)
+    }
+
+    /// Would this element render as a bare string in a packed array?
+    ///
+    /// Mirrors the decision `render_scalar_token` makes, so the two cannot drift.
+    fn packs_as_bare_string(value: &T, options: &RenderOptions) -> bool {
+        let NodeRef::String(s) = value.node() else { return false };
+        if s.contains('\n') || s.contains('\r') {
+            return false; // a multiline string is a block element, never packed
+        }
+        match resolve_string_form(value.string_form(), options) {
+            Some(StringForm::Bare(_)) => BareString::new(s).is_some(),
+            Some(StringForm::Quoted) => false,
+            _ => options.bare_strings != StringStyle::Quoted && BareString::new(s).is_some(),
+        }
+    }
+
+    /// Classify each element as an inline token or a block that owns its lines.
+    ///
+    /// Nothing here knows the line's format. Every string keeps its natural form,
+    /// and `render_packed_token_lines` applies array format 2's quoting to the
+    /// elements that actually end up sharing a line -- an element alone on a line
+    /// was never packed, so nothing forced it to give up its bare form.
+    fn render_packed_array_tokens<'v>(
+        values: &'v [T],
+    ) -> Vec<(&'v [Comment], PackedToken<'v, T>)> {
         let mut tokens = Vec::new();
         for value in values {
             let token = match value.node() {
@@ -1712,6 +1842,12 @@ impl<T: Tree> Renderer<T> {
                 NodeRef::Null => PackedToken::Inline(BasicValue::Null),
                 NodeRef::Bool(b) => PackedToken::Inline(BasicValue::Bool(b)),
                 NodeRef::Number(n) => PackedToken::Inline(BasicValue::Number(n)),
+                // Always the element's natural form. Forcing quotes here would be
+                // deciding for the whole array something that belongs to a line:
+                // an element that ends up alone on a line was never packed, so
+                // nothing forced it to give up its bare form. The line builder
+                // applies format 2's quoting to the elements that actually share
+                // a line.
                 NodeRef::String(s) => PackedToken::Inline(BasicValue::String(s, value.string_form())),
                 NodeRef::Array(_) => PackedToken::Inline(BasicValue::EmptyArray),
                 NodeRef::Object(_) => PackedToken::Inline(BasicValue::EmptyObject),
@@ -1748,6 +1884,40 @@ impl<T: Tree> Renderer<T> {
             }
             _ => None,
         }
+    }
+
+    /// The same value forced to its quoted string form.
+    ///
+    /// Spec 0.5.0, Array Format 2: "BARE STRINGS ARE NOT ALLOWED". So any string
+    /// *sharing* a comma packed line is quoted whatever it would have been alone.
+    fn as_packed_comma_token(value: BasicValue<'_>) -> BasicValue<'_> {
+        match value {
+            BasicValue::String(s, _) => BasicValue::String(s, Some(StringForm::Quoted)),
+            other => other,
+        }
+    }
+
+    /// Finish a line of inline elements, rebuilding it if it holds only one.
+    ///
+    /// A line carrying a single element was never packed, so it has no separator
+    /// and no format, and array format 2's bar on bare elements does not reach it.
+    /// The element takes its natural form. Dropping the trailing comma with it is
+    /// spec 0.5.0, Array Format: the trailing `,` "SHOULD never be used for the
+    /// last data element of an array or a line with only one element of the data
+    /// array (but it should still parse for both)".
+    fn finish_inline_line(
+        line: String,
+        prefix: &str,
+        count: usize,
+        single: Option<BasicValue<'_>>,
+        options: &RenderOptions,
+    ) -> String {
+        if count == 1
+            && let Some(value) = single
+        {
+            return format!("{}{}", prefix, Self::render_scalar_token(value, options));
+        }
+        line
     }
 
     fn render_packed_token_lines(
@@ -1792,19 +1962,53 @@ impl<T: Tree> Renderer<T> {
         let mut current_is_fresh = true;
         let mut lines: Vec<String> = Vec::new();
 
-        for (comments, token) in tokens {
+        // Tracks what the line being built ended up holding, so a line that turns
+        // out to carry a single element can be rebuilt from that element's natural
+        // form. Until the line is flushed there is no way to know: whether a second
+        // element joins depends on the wrap, which depends on widths, which is why
+        // the decision cannot be made when the tokens are built.
+        let mut current_prefix = first_prefix.clone();
+        let mut current_count = 0usize;
+        let mut current_single: Option<BasicValue<'_>> = None;
+
+        // A comma packed line that is not the array's last gains a trailing comma
+        // when it is flushed, which happens after the fit test -- so the width has
+        // to account for it up front or every wrapped line runs one character long.
+        let token_total = tokens.len();
+
+        for (token_index, (comments, token)) in tokens.into_iter().enumerate() {
+            // Reserve room for the trailing comma this line will gain if it is
+            // flushed with elements still to come. The array's final line never
+            // gets one, so nothing is reserved there.
+            let comma_reserve = !string_spaces_mode && token_index + 1 < token_total;
+            let fits = |line: &str| {
+                if comma_reserve {
+                    fits_wrap(options, &format!("{line},"))
+                } else {
+                    fits_wrap(options, line)
+                }
+            };
             // A commented element starts a new packed run: flush the current line,
-            // emit the comment at the element's level, resume packing from here
-            // (Ray's ruling: never invent packing across a comment, never destroy
-            // packing elsewhere).
+            // emit the comment at the element's level, resume packing from here.
+            // The rule is never to invent packing across a comment, and never to
+            // destroy packing elsewhere.
             if options.render_comments && !comments.is_empty() {
                 if !current_is_fresh {
-                    if !string_spaces_mode {
+                    if !string_spaces_mode && current_count > 1 {
                         current.push(',');
                     }
-                    lines.push(current);
+                    lines.push(Self::finish_inline_line(
+                        current,
+                        &current_prefix,
+                        current_count,
+                        current_single,
+                        options,
+                    ));
                     current = continuation_prefix.clone();
+                    current_prefix = continuation_prefix.clone();
                     current_is_fresh = true;
+                    current_count = 0;
+                    current_single = None;
                 }
                 emit_comments(comments, continuation_indent, options, &mut lines);
             }
@@ -1812,10 +2016,18 @@ impl<T: Tree> Renderer<T> {
                 PackedToken::Block(value) => {
                     // Flush the current line if it has content, then render the block.
                     if !current_is_fresh {
-                        if !string_spaces_mode {
+                        if !string_spaces_mode && current_count > 1 {
                             current.push(',');
                         }
-                        lines.push(current);
+                        lines.push(Self::finish_inline_line(
+                            current,
+                            &current_prefix,
+                            current_count,
+                            current_single,
+                            options,
+                        ));
+                        current_count = 0;
+                        current_single = None;
                     }
 
                     let block_lines = match value.node() {
@@ -1847,25 +2059,35 @@ impl<T: Tree> Renderer<T> {
                     }
 
                     current = continuation_prefix.clone();
+                    current_prefix = continuation_prefix.clone();
                     current_is_fresh = true;
                 }
                 PackedToken::Inline(bv) => {
-                    // Render the token string on demand. For strings, force JSON quoting if the
-                    // string contains comma-like chars to avoid parse ambiguity.
-                    let token_str = match bv {
-                        BasicValue::String(s, _) if s.chars().any(is_comma_like) => {
-                            render_json_string(s)
-                        }
-                        _ => Self::render_scalar_token(bv, options),
+                    // Render the token string on demand. Bare strings need no special
+                    // casing here: one can never contain two spaces in a row, so it can
+                    // never contain a `,  ` separator either, and it always reads back
+                    // whole. Whether the array uses bare strings at all was settled once
+                    // in render_packed_array_tokens.
+                    // Rendered as if it will share the line, since that is the wider
+                    // form and so the safe one to measure against the wrap. If it
+                    // turns out to be alone, `finish_inline_line` rebuilds it from
+                    // the natural form, which is never wider.
+                    let packed = if string_spaces_mode {
+                        bv
+                    } else {
+                        Self::as_packed_comma_token(bv)
                     };
+                    let token_str = Self::render_scalar_token(packed, options);
 
                     if current_is_fresh {
                         // Place the token on the fresh line (first_prefix or continuation).
                         current.push_str(&token_str);
                         current_is_fresh = false;
+                        current_count = 1;
+                        current_single = Some(bv);
 
                         // Lone-overflow check: the token alone already exceeds the width.
-                        if !fits_wrap(options, &current) {
+                        if !fits(&current) {
                             let first_line_extra = if lines.is_empty() {
                                 first_prefix.len().saturating_sub(continuation_indent)
                             } else {
@@ -1890,26 +2112,40 @@ impl<T: Tree> Renderer<T> {
                                     lines.push(fl);
                                 }
                                 current = continuation_prefix.clone();
+                                current_prefix = continuation_prefix.clone();
                                 current_is_fresh = true;
+                                current_count = 0;
+                                current_single = None;
                             }
                             // else: overflow accepted — `current` retains the long line.
                         }
                     } else {
                         // Try to pack the token onto the current line.
                         let candidate = format!("{current}{separator}{token_str}");
-                        if fits_wrap(options, &candidate) {
+                        if fits(&candidate) {
                             current = candidate;
+                            current_count += 1;
+                            current_single = None;
                         } else {
                             // Flush current line, move token to a fresh continuation line.
-                            if !string_spaces_mode {
+                            if !string_spaces_mode && current_count > 1 {
                                 current.push(',');
                             }
-                            lines.push(current);
+                            lines.push(Self::finish_inline_line(
+                                current,
+                                &current_prefix,
+                                current_count,
+                                current_single,
+                                options,
+                            ));
                             current = format!("{}{}", continuation_prefix, token_str);
+                            current_prefix = continuation_prefix.clone();
                             current_is_fresh = false;
+                            current_count = 1;
+                            current_single = Some(bv);
 
                             // Lone-overflow check on the new continuation line.
-                            if !fits_wrap(options, &current)
+                            if !fits(&current)
                                 && let Some(fold_lines) = Self::fold_packed_inline(
                                     bv,
                                     continuation_indent,
@@ -1926,7 +2162,10 @@ impl<T: Tree> Renderer<T> {
                                         lines.push(fl);
                                     }
                                     current = continuation_prefix.clone();
+                                    current_prefix = continuation_prefix.clone();
                                     current_is_fresh = true;
+                                    current_count = 0;
+                                    current_single = None;
                                 }
                                 // else: overflow accepted.
                         }
@@ -1936,7 +2175,13 @@ impl<T: Tree> Renderer<T> {
         }
 
         if !current_is_fresh {
-            lines.push(current);
+            lines.push(Self::finish_inline_line(
+                current,
+                &current_prefix,
+                current_count,
+                current_single,
+                options,
+            ));
         }
 
         Some(lines)
@@ -2134,15 +2379,15 @@ impl<T: Tree> Renderer<T> {
                     return None;
                 }
                 match resolve_string_form(value.string_form(), options) {
-                    Some(StringForm::Bare) if TableBareString::new(s).is_some() => {
-                        Some(format!(" {}", s))
+                    Some(StringForm::Bare(form)) if TableBareString::new(s).is_some() => {
+                        Some(opened_bare(bare_opener_for(Some(form), options), s))
                     }
                     Some(StringForm::Quoted) => Some(render_json_string(s)),
                     _ => {
-                        if options.bare_strings == BareStyle::Prefer
+                        if options.bare_strings != StringStyle::Quoted
                             && TableBareString::new(s).is_some()
                         {
-                            Some(format!(" {}", s))
+                            Some(opened_bare(bare_opener_for(None, options), s))
                         } else {
                             Some(render_json_string(s))
                         }

@@ -3,10 +3,11 @@ use std::fmt;
 use crate::error::{Error, Result};
 use crate::number::Number;
 use crate::options::RenderOptions;
-use crate::parse::{MultilineLocalEol, ParseOptions};
+use crate::options::{ParseOptions, SPEC_FORMS};
+use crate::parse::MultilineLocalEol;
 use crate::render::Renderer;
 use crate::util::{
-    is_allowed_bare_string, /*is_comma_like,*/ is_forbidden_literal_tjson_char, is_pipe_like,
+    is_allowed_bare_string, is_forbidden_literal_tjson_char,
     is_reserved_word, parse_bare_key_prefix,
 };
 
@@ -38,8 +39,7 @@ impl<'a> StrMeta<'a> {
         let has_forbidden_literal = s.chars().any(is_forbidden_literal_tjson_char);
         let is_bare_eligible = is_allowed_bare_string(s);
         let is_reserved_word = is_reserved_word(s);
-        let has_pipe_like = s.chars().any(is_pipe_like);
-        // let has_comma_like = s.chars().any(is_comma_like);
+        let has_pipe_like = s.chars().any(|c| SPEC_FORMS.is_pipe_like(c));
         StrMeta { s, has_eol, eol_type, has_forbidden_literal, is_bare_eligible, is_reserved_word, has_pipe_like/*, has_comma_like*/ }
     }
 }
@@ -118,7 +118,7 @@ pub(crate) struct BareKey<'a>(&'a str);
 #[allow(dead_code)]
 impl<'a> BareKey<'a> {
     pub(crate) fn new(s: &'a str) -> Option<Self> {
-        if parse_bare_key_prefix(s).is_some_and(|end| end == s.len()) {
+        if parse_bare_key_prefix(s, &SPEC_FORMS).is_some_and(|end| end == s.len()) {
             Some(BareKey(s))
         } else {
             None
@@ -221,7 +221,7 @@ impl Value {
     }
 
     pub(crate) fn parse_with(input: &str, options: ParseOptions) -> Result<Self> {
-        crate::parse::Parser::<Self>::parse_document(input, options.start_indent)
+        crate::parse::Parser::<Self>::parse_document(input, options)
             .map_err(Error::Parse)
     }
 

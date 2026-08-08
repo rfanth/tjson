@@ -152,7 +152,7 @@ mod tests {
     use crate::parse::Parser;
 
     fn parse(input: &str) -> SpannedValue {
-        Parser::<SpannedValue>::parse_document(input, 0).expect("test document must parse")
+        Parser::<SpannedValue>::parse_document(input, crate::options::ParseOptions::default()).expect("test document must parse")
     }
 
     fn entry<'a>(value: &'a SpannedValue, key: &str) -> &'a SpannedEntry {
