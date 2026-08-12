@@ -42,32 +42,51 @@ fn resolve_string_form(form: Option<StringForm>, options: &RenderOptions) -> Opt
     if options.honor_string_forms { form } else { None }
 }
 
-/// The character that opens a bare string: its one-sided opening quote.
+/// The glyph a bare string's opening quote is written with. The only place in
+/// the renderer that names either character.
+///
+/// Both are one column, and that is the whole contract: the opening quote is a
+/// space, and `_` is an overlay drawn on that space so a reader can see it. It
+/// cannot move the text it opens, so no width, fold point, column, or packing
+/// decision may ever consult it -- the sole thing the form decides is which of
+/// these two characters gets written. Anything upstream that measures a bare
+/// string measures it with a one-column opener and never asks which one.
+fn bare_opener_glyph(form: BareForm) -> char {
+    match form {
+        BareForm::Marked => '_',
+        BareForm::Plain => ' ',
+    }
+}
+
+/// Which opener a bare string wears here.
 ///
 /// A recorded form wins when forms are being honored, because which opener a
-/// person wrote is a choice they made and not a fact about the data. With no
-/// recorded form the global style decides, and `Marked` means every opener --
-/// marking some and not others would leave the reader unable to take an
-/// unmarked one as meaning anything.
+/// person wrote is a choice they made and not a fact about the data -- and a
+/// `Document` exists to hold what a person wrote, inconsistencies included.
+/// Consistency is a promise the generator makes about the openers it invents,
+/// not one it enforces over openers it was given: with no recorded form, and so
+/// for every string reached from a `Value` or from JSON, the global style
+/// decides alone and decides the same way every time.
+fn bare_opener_for(form: Option<BareForm>, options: &RenderOptions) -> BareForm {
+    match form {
+        Some(recorded) => recorded,
+        None if options.bare_strings == StringStyle::Marked => BareForm::Marked,
+        None => BareForm::Plain,
+    }
+}
+
 /// A bare string with its opening quote in front, built by hand.
 ///
 /// `format!` is measurably the wrong tool here: this runs once per bare string,
-/// and a 46 MB document is millions of them. Two `push_str` calls into a
+/// and a 46 MB document is millions of them. A `push` and a `push_str` into a
 /// right-sized buffer do no formatting work at all, where the macro dispatches
 /// through `Display` for each piece.
-fn opened_bare(opener: &str, value: &str) -> String {
-    let mut out = String::with_capacity(opener.len() + value.len());
-    out.push_str(opener);
+fn opened_bare(form: BareForm, value: &str) -> String {
+    let opener = bare_opener_glyph(form);
+    let mut out = String::with_capacity(opener.len_utf8() + value.len());
+    out.push(opener);
     out.push_str(value);
     out
-}
-
-fn bare_opener_for(form: Option<BareForm>, options: &RenderOptions) -> &'static str {
-    let marked = match form {
-        Some(recorded) => recorded == BareForm::Marked,
-        None => options.bare_strings == StringStyle::Marked,
-    };
-    if marked { "_" } else { " " }
 }
 
 fn resolve_key_form(form: Option<KeyForm>, options: &RenderOptions) -> Option<KeyForm> {
@@ -413,11 +432,15 @@ fn fold_bare_string(
     value: &str,
     indent: usize,
     first_line_extra: usize,
+    opener_form: BareForm,
     style: FoldStyle,
     wrap_width: Option<usize>,
 ) -> Option<Vec<String>> {
     let w = wrap_width?;
     // First-line budget: indent + 1 (the one-sided opening quote) + first_line_extra.
+    // The 1 is a constant and stays one: `opener_form` reaches the emitter below
+    // and nothing else, because which glyph opens the string cannot move it. See
+    // `bare_opener_glyph`.
     let first_avail = w.saturating_sub(indent + 1 + first_line_extra);
     if value.len() <= first_avail {
         return None; // fits on one line, no fold needed
@@ -454,7 +477,7 @@ fn fold_bare_string(
         },
         |segment, first, _last| {
             if first {
-                format!("{} {}", ind, segment)
+                format!("{}{}{}", ind, bare_opener_glyph(opener_form), segment)
             } else {
                 format!("{}/ {}", ind, segment)
             }
@@ -1290,12 +1313,14 @@ impl<T: Tree> Renderer<T> {
             Some(StringForm::Quoted) => {
                 return Self::render_quoted_string_lines(value, indent, first_line_extra, options);
             }
-            Some(StringForm::Bare(_)) if meta.is_bare_eligible => {
+            Some(StringForm::Bare(form)) if meta.is_bare_eligible => {
+                let opener_form = bare_opener_for(Some(form), options);
                 if options.string_bare_fold_style != FoldStyle::None
                     && let Some(lines) = fold_bare_string(
                         value,
                         indent,
                         first_line_extra,
+                        opener_form,
                         options.string_bare_fold_style,
                         options.wrap_width,
                     )
@@ -1303,7 +1328,7 @@ impl<T: Tree> Renderer<T> {
                     return lines;
                 }
                 let mut line = spaces(indent);
-                line.push_str(bare_opener_for(None, options));
+                line.push(bare_opener_glyph(opener_form));
                 line.push_str(value);
                 return vec![line];
             }
@@ -1406,13 +1431,16 @@ impl<T: Tree> Renderer<T> {
             }
         }
         if options.bare_strings != StringStyle::Quoted && meta.is_bare_eligible {
+            // No form survived resolution, so this string is one the generator is
+            // inventing an opener for, and the global style is the only voice.
+            let opener_form = bare_opener_for(None, options);
             if options.string_bare_fold_style != FoldStyle::None
                 && let Some(lines) =
-                    fold_bare_string(value, indent, first_line_extra, options.string_bare_fold_style, options.wrap_width)
+                    fold_bare_string(value, indent, first_line_extra, opener_form, options.string_bare_fold_style, options.wrap_width)
                 {
                     return lines;
                 }
-            return vec![format!("{} {}", spaces(indent), value)];
+            return vec![format!("{}{}", spaces(indent), opened_bare(opener_form, value))];
         }
         Self::render_quoted_string_lines(value, indent, first_line_extra, options)
     }

@@ -47,6 +47,9 @@ wasm-bindgen-test = "0.3"
 terminal_size = "0.4"
 
 [features]
+# This is for backward compat, at one point we had serde_json as optional, and
+# we don't want to break for anyone that specifies it.  We might eventually
+# actually make it optional too, but not yet.
 default = ["serde_json"]
 serde_json = []
 # C ABI (FFI) bindings — see src/ffi.rs. Off by default. When off, the whole

@@ -79,10 +79,7 @@ const json   = toJson(tjson2);
 
 All four functions throw an `Error` on invalid input.
 
-`version()` returns the tjson version this module was built from. It is read
-from inside the wasm rather than from package metadata, so it reports the code
-that is actually running — useful when a cached artifact might be older than the
-page around it.
+`version()` returns the tjson version this module was built from.
 
 ### Two entries, same API
 

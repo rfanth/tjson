@@ -772,14 +772,23 @@ impl<'a, T: Tree> Parser<'a, T> {
             let key_line = self.line;
             let prev_len = rest.len();
             let (key, key_form, after_colon) = self.parse_key(&rest, pair_indent)?;
+            // A key that folded has no extent on any one line: `prev_len` was
+            // measured where the key started and `after_colon` begins on a later
+            // line, so their difference is not a length -- it is routinely
+            // negative, which is what `  ""\n    [ { e\n        / :"` used to
+            // panic on. There is nothing to measure against either, since the
+            // column the key started at is gone the moment the fold happens.
+            let key_facts;
             if self.line != key_line {
                 col = None;
+                key_facts = EntryFacts { key_form, key_span: self.span_at(None, 0) };
+            } else {
+                // Raw source extent of the key: everything before the colon, quotes included.
+                let key_raw_len = prev_len - after_colon.len() - 1;
+                key_facts = EntryFacts { key_form, key_span: self.span_at(col, key_raw_len) };
+                col = col.map(|c| c + key_raw_len + 1);
             }
-            // Raw source extent of the key: everything before the colon, quotes included.
-            let key_raw_len = prev_len - after_colon.len() - 1;
-            let key_facts = EntryFacts { key_form, key_span: self.span_at(col, key_raw_len) };
             rest = after_colon;
-            col = col.map(|c| c + key_raw_len + 1);
 
             if rest.is_empty() {
                 self.line += 1;
@@ -1255,6 +1264,46 @@ impl<'a, T: Tree> Parser<'a, T> {
         // Every container introduced by this marker line carries the marker line's span.
         let open_span = self.current_span();
         // Comments preceding a marker line attach to the container it introduces.
+        //
+        // DESIGN INTENT, NOT YET IMPLEMENTED. What follows is the rule decided on
+        // 2026-08-09; the code below does not do it. Written in the future tense on
+        // purpose, because a comment describing behaviour the code lacks is how
+        // `render.rs`'s `unreachable!` came to be trusted and never checked (see
+        // P2 in `local/fuzzer-found-breakage.md`). Today this function attaches to
+        // the OUTERMOST container of the chain, and the renderer then drops the
+        // comment entirely on every path but one -- so a comment above a marker
+        // line is silently lost (C1, same file).
+        //
+        // The rule: a comment annotates the thing it ALIGNS WITH on the line
+        // immediately below it. This is the format's own doctrine -- location is
+        // depth -- applied to comments, and it is what makes a packed marker chain
+        // unambiguous. A chain lays out one level every two columns:
+        //
+        //       k:
+        //     //comment          <- column 2, annotates the outer array
+        //       [ [ [ [ { b:3
+        //         ^ ^ ^ ^ ^ ^
+        //         2 4 6 8 | 12   <- 2,4,6,8 arrays; 10 object; 12 the key `b`
+        //                 10
+        //
+        // A marker occupies two columns, `[` and the space after it, and a comment
+        // starting at either one unambiguously names that container. Both are
+        // legal; the canonical form is the first, with the leading `/` directly
+        // above the `[`. A generator normalizes to that.
+        //
+        // In a table the same rule reads off the row instead of the indent: the
+        // leading `|` is the row object, and the first character after any `|` is
+        // that cell's key (header line) or value (data line). Normalization for a
+        // cell is to the character immediately after the `|`, *including* when
+        // that character is the leading space or `_` of a bare string -- the
+        // opening quote is part of the string, so the string starts there and not
+        // at its first letter.
+        //
+        // Note the asymmetry: the `|` column is structural and identical in every
+        // conforming rendering, while a cell's column depends on padding, which is
+        // the generator's choice (see the specification's column-width section).
+        // So the attachment is a fact about the tree and the column is re-derived
+        // at render time; it is never stored as a column.
         let pending = self.take_pending_comments();
         // `line_indent` is logical; spans need the raw byte column of `content`'s start.
         let base_col = line_indent.saturating_sub(self.idt.offset());

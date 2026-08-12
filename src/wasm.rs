@@ -148,10 +148,6 @@ export function fromJson(input: string, options?: StringifyOptions): string;
 
 /** Render a JavaScript value as TJSON, with optional options. */
 export function stringify(input: any, options?: StringifyOptions): string;
-
-/** The tjson version this module was built from, reported from inside the wasm
- * so it cannot disagree with the code actually running. */
-export function version(): string;
 "#;
 
 /// The tjson version this module was built from.
