@@ -24,9 +24,9 @@ echo "=== 2/4 WASM compile check ==="
 cargo check --lib --target wasm32-unknown-unknown
 
 echo "=== 3/4 no-default-features compile check ==="
-# The lib docs advertise `default-features = false` (drops the serde_json
-# From impls); make sure that config keeps compiling. The CLI is skipped
-# automatically (required-features in Cargo.toml).
+# The one feature is a no-op, so this builds exactly what the default build
+# does; it stays because a manifest saying `default-features = false` is a
+# thing people write, and it must keep compiling.
 cargo check --no-default-features
 
 echo "=== 4/4 WASM boundary tests (node) ==="

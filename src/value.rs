@@ -163,14 +163,12 @@ pub enum Value {
     Object(Vec<Entry>),
 }
 
-#[cfg(feature = "serde_json")]
 impl From<serde_json::Value> for Value {
     fn from(value: serde_json::Value) -> Self {
         Self::from_serde_json(value)
     }
 }
 
-#[cfg(feature = "serde_json")]
 impl From<Value> for serde_json::Value {
     fn from(value: Value) -> Self {
         value.to_serde_json()
@@ -197,10 +195,9 @@ impl Value {
         }
     }
 
-    /// Convert to a `serde_json::Value`. Only consumed by the feature-gated
-    /// `From<Value> for serde_json::Value` impl above, so it carries the same
-    /// gate (internal code goes through the JSON string form instead).
-    #[cfg(feature = "serde_json")]
+    /// Convert to a `serde_json::Value`. Only consumed by the
+    /// `From<Value> for serde_json::Value` impl above; internal code goes
+    /// through the JSON string form instead.
     pub(crate) fn to_serde_json(&self) -> serde_json::Value {
         match self {
             Self::Null => serde_json::Value::Null,

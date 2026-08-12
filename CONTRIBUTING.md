@@ -8,7 +8,7 @@ All of these must continue to work:
 |--------|---------|
 | Native (default) | `cargo build` |
 | Native library only | `cargo build --lib` |
-| Library without serde_json feature | `cargo build --lib --no-default-features` |
+| Library with no default features | `cargo build --lib --no-default-features` |
 | musl (static binary) | `cargo build --target x86_64-unknown-linux-musl` |
 | WASM | `wasm-pack build --target bundler` |
 | C API (shared library) | `cargo build --release --features capi --target x86_64-unknown-linux-gnu` |

@@ -22,9 +22,18 @@
 //!
 //! # Features
 //!
-//! - **`serde_json`** *(default)* — enables [`From<serde_json::Value>`] for [`Value`] and
-//!   [`From<Value>`] for `serde_json::Value`. Disable if you don't use serde_json directly
-//!   and want to avoid pulling its `arbitrary_precision` feature into your build.
+//! - **`serde_json`** *(default)* — does nothing at all. Nothing is gated on it, so
+//!   turning it off changes no code and removes no dependency: `serde_json` is an
+//!   unconditional dependency, because embedded MINIMAL JSON is parsed by it. The
+//!   name is kept only so manifests that already name the feature keep building.
+//!   If it ever does something, it will gate the `serde_json` dependency itself —
+//!   which needs a hand-written minimal-JSON parser first, and is not planned.
+//! - **`capi`** — compiles the C ABI (`src/ffi.rs`) into the cdylib, for callers linking
+//!   tjson from C rather than using it as a crate; the header is `include/tjson.h`. This
+//!   is the only build in which the crate contains any `unsafe`: every other build is
+//!   `#![forbid(unsafe_code)]`, and this one relaxes to `deny` with a single `allow`
+//!   scoped to the FFI module. It also pulls in `serde_ignored`, which that module uses
+//!   to reject unknown option fields and which no other build compiles.
 
 // The core library contains no `unsafe` and enforces it. The optional `capi`
 // feature (src/ffi.rs, the C ABI) is the sole exception: for that build we relax

@@ -75,7 +75,7 @@ let value: Value = " hello world".parse()?;
 ```rust
 use tjson::{Value, RenderOptions};
 
-// From a serde_json value (requires the default `serde_json` feature)
+// From a serde_json value
 let value = Value::from(serde_json::json!({"name": "Alice", "age": 30}));
 
 // Default options
