@@ -83,6 +83,12 @@ let tjson = value.to_tjson_with(RenderOptions::default())?;
 
 // Canonical (one key per line, no packing, see docs for details)
 let canonical = value.to_tjson_with(RenderOptions::canonical())?;
+
+// Back out to JSON. `to_json` is MINIMAL JSON -- no whitespace outside
+// strings -- which is also valid TJSON, so it can be fed straight back in.
+// `to_json_pretty` is the same data laid out for a person to read.
+let json   = value.to_json();
+let shown  = value.to_json_pretty();
 ```
 
 ### Serde integration
@@ -241,6 +247,10 @@ TjsonError err = { 0, 0, 0, NULL };
 char *json = tjson_to_json("  name: Alice  city: London", &err);
 /* ... use json ... */
 tjson_free_string(json);
+
+/* Same data, indented, for output a person reads. */
+char *shown = tjson_to_json_pretty("  name: Alice  city: London", &err);
+tjson_free_string(shown);
 ```
 
 The header is [`include/tjson.h`](include/tjson.h); the full reference —

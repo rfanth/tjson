@@ -34,8 +34,8 @@ fn invalid_option(cause: impl std::fmt::Display) -> JsValue {
 /// the render returns a `String`. Both call sites used to name that unreachable
 /// failure "TJSON render error", which was false twice over: rendering cannot
 /// fail, and the error they were labelling came from serde_json.
-fn render(json: serde_json::Value, options: crate::RenderOptions) -> String {
-    crate::Value::from(json).to_tjson_with(options)
+fn render(value: crate::Value, options: crate::RenderOptions) -> String {
+    value.to_tjson_with(options)
 }
 
 // JS <-> Rust value transport.
@@ -175,6 +175,13 @@ export function parse(input: string, options?: ParseOptions): any;
  * any size and precision pass through as exact text. */
 export function toJson(input: string): string;
 
+/** Parse a TJSON string and return an indented JSON string: two spaces per
+ * level, one element per line. Lossless on the same terms as `toJson` -- no
+ * JS number is on the path, so prefer this over
+ * `JSON.stringify(JSON.parse(tjson.toJson(x)), null, 2)`, which puts every
+ * number through an f64. */
+export function toJsonPretty(input: string): string;
+
 /** Render a JSON string as TJSON, with optional options. Never lossy:
  * numbers of any size and precision pass through as exact text. */
 export function fromJson(input: string, options?: StringifyOptions): string;
@@ -270,7 +277,7 @@ pub fn parse(input: &str, options: JsValue) -> Result<JsValue, JsValue> {
 #[wasm_bindgen(skip_typescript)]
 pub fn stringify(input: JsValue, options: JsValue) -> Result<String, JsValue> {
     let text = value_to_json_text(&input)?;
-    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+    let json: crate::Value = serde_json::from_str(&text).map_err(|e| {
         // The designed enforcement point for ill-formed strings: the JS
         // replacer does no per-string scan; lone surrogates arrive here as
         // \uXXXX escapes and serde_json refuses them. Rather than matching
@@ -303,6 +310,22 @@ pub fn to_json(input: &str) -> Result<String, JsValue> {
     serde_json::to_string(&json).map_err(|e| internal_error("converting to a JSON string", e))
 }
 
+/// Parse a TJSON string and return an indented JSON string.
+///
+/// The same data as `toJson`, laid out for a person to read. Numbers cross as
+/// exact text either way -- there is no JS number on the path, which is the
+/// whole reason this exists rather than `JSON.stringify(JSON.parse(x), null, 2)`
+/// on the caller's side, where every number becomes an f64.
+///
+/// Throws an `Error` if the input is not valid TJSON.
+#[wasm_bindgen(js_name = "toJsonPretty", skip_typescript)]
+pub fn to_json_pretty(input: &str) -> Result<String, JsValue> {
+    let value: crate::Value = input
+        .parse()
+        .map_err(|e| err(format!("invalid TJSON: {e}")))?;
+    Ok(value.to_json_pretty())
+}
+
 /// Render a JSON string as TJSON, with optional options object.
 ///
 /// Like `stringify`, but accepts a JSON string instead of a JavaScript value.
@@ -313,7 +336,7 @@ pub fn to_json(input: &str) -> Result<String, JsValue> {
 /// unrecognised.
 #[wasm_bindgen(js_name = "fromJson", skip_typescript)]
 pub fn from_json(input: &str, options: JsValue) -> Result<String, JsValue> {
-    let json: serde_json::Value = serde_json::from_str(input)
+    let json: crate::Value = serde_json::from_str(input)
         .map_err(|e| err(format!("invalid JSON: {e}")))?;
     let opts = parse_options(options)?;
     Ok(render(json, opts))

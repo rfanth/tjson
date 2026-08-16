@@ -195,6 +195,17 @@ pub fn to_string<T: Serialize>(value: &T) -> Result<String> {
 /// let s = tjson::to_string_with(&vec![1, 2, 3], tjson::RenderOptions::default()).unwrap();
 /// assert_eq!(s, "  1, 2, 3");
 /// ```
+///
+/// For your own types. If you already hold a [`Value`], call
+/// [`Value::to_tjson_with`] instead: this one has to route an arbitrary
+/// `Serialize` through a `serde_json::Value` to reach a [`Value`], so passing a
+/// [`Value`] means building the whole document twice to arrive back where you
+/// started.
+///
+/// A [`Document`](crate::document::Document) cannot be passed here at all; it
+/// carries comments and presentation facts that no `Serialize` form holds, so it
+/// deliberately does not implement the trait. Render one with
+/// [`Document::to_tjson_with`](crate::document::Document::to_tjson_with).
 pub fn to_string_with<T: Serialize>(
     value: &T,
     options: RenderOptions,

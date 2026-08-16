@@ -11,7 +11,7 @@
 //! and loud-by-default handling of integers a JS number cannot hold.
 #![cfg(target_arch = "wasm32")]
 
-use tjson::wasm::{from_json, parse, stringify, to_json};
+use tjson::wasm::{from_json, parse, stringify, to_json, to_json_pretty};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -309,6 +309,38 @@ fn parse_and_to_json_round_trip() {
     assert!(value.is_object());
     let json = to_json("  name: Alice").unwrap();
     assert!(json.contains("Alice"));
+}
+
+#[wasm_bindgen_test]
+fn to_json_pretty_lays_out_the_same_data() {
+    let source = "  name: Alice  age:30";
+    let compact = to_json(source).unwrap();
+    let pretty = to_json_pretty(source).unwrap();
+
+    assert!(!compact.contains('\n'), "toJson stays on one line: {compact:?}");
+    assert!(pretty.contains('\n'), "toJsonPretty does not: {pretty:?}");
+    assert!(pretty.contains("\n  \"name\""), "and indents its members: {pretty:?}");
+
+    // Whitespace is the only difference. Compared with the characters removed
+    // rather than by parsing, because parsing is what a caller doing this in JS
+    // would have to do, and it is the thing that would lose the numbers.
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    assert_eq!(strip(&compact), strip(&pretty), "layout changed the data");
+}
+
+#[wasm_bindgen_test]
+fn to_json_pretty_carries_huge_integers_exactly() {
+    // The reason this exists rather than JSON.stringify(JSON.parse(x), null, 2)
+    // on the caller's side: no JS number is on this path.
+    let json = to_json_pretty("  n:123456789012345678901234567890").unwrap();
+    assert!(json.contains("123456789012345678901234567890"), "{json:?}");
+    assert!(json.contains('\n'), "and it is laid out: {json:?}");
+}
+
+#[wasm_bindgen_test]
+fn to_json_pretty_reports_invalid_tjson() {
+    let err = to_json_pretty("  ok: yes\n  key: \u{7}").unwrap_err();
+    assert!(error_message(err).contains("invalid TJSON"));
 }
 
 #[wasm_bindgen_test]

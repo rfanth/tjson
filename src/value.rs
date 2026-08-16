@@ -235,6 +235,24 @@ impl Value {
         Renderer::render(self, &options)
     }
 
+    /// Serialize this value to an indented JSON string.
+    ///
+    /// The same data as [`Value::to_json`], laid out for a person to read:
+    /// two spaces per level, one element per line, empty containers left
+    /// inline. Where `to_json` produces MINIMAL JSON -- which is also valid
+    /// TJSON -- this produces JSON only.
+    ///
+    /// ```
+    /// use tjson::Value;
+    ///
+    /// let v: Value = "  name: Alice".parse().unwrap();
+    /// assert_eq!(v.to_json_pretty(), "{\n  \"name\": \"Alice\"\n}");
+    /// ```
+    pub fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(self)
+            .expect("a Value serializes without failing, and a String sink cannot error")
+    }
+
     /// Serialize this value to a JSON string.
     ///
     /// ```

@@ -84,7 +84,8 @@ is a one-liner and links against your own glibc.
 ```c
 #include "tjson.h"
 
-char       *tjson_to_json  (const char *tjson_utf8, TjsonError *err);
+char       *tjson_to_json       (const char *tjson_utf8, TjsonError *err);
+char       *tjson_to_json_pretty(const char *tjson_utf8, TjsonError *err);
 char       *tjson_from_json(const char *json_utf8,
                             const char *options_json_utf8, TjsonError *err);
 void        tjson_free_string(char *s);
@@ -100,7 +101,11 @@ typedef struct TjsonError {
 ```
 
 - `tjson_to_json` — parse a TJSON string, return the equivalent JSON string.
-  The JSON is **compact** (no insignificant whitespace).
+  The JSON is **compact** (no insignificant whitespace), which is also valid
+  TJSON, so the result can be fed straight back in.
+- `tjson_to_json_pretty` — the same data, **indented**: two spaces per level,
+  one element per line. For output a person will read. Unlike the compact form
+  this is JSON only, not also TJSON.
 - `tjson_from_json` — render a JSON string as TJSON. `options_json_utf8` may be
   `NULL` for defaults (see [Options](#options)).
 - `tjson_free_string` — release a string the library returned.
@@ -122,8 +127,9 @@ The library only reads them for the duration of the call; it never stores or
 frees them. Free them (or not) however you normally would.
 
 **Strings the library returns — the library owns the allocator, you own the
-lifetime.** This means the return value of `tjson_to_json` /
-`tjson_from_json`, and a non-`NULL` `TjsonError.message`, must be released
+lifetime.** This means the return value of `tjson_to_json`,
+`tjson_to_json_pretty` or `tjson_from_json`, and a non-`NULL`
+`TjsonError.message`, must be released
 with **`tjson_free_string`** — and only that:
 
 - **Never** call the C runtime's `free()` on them. Rust's allocator and your C
@@ -284,7 +290,7 @@ LD_LIBRARY_PATH=target/release ./example
 | `TJSON_OK`           | 0 | success (`message` is `NULL`, `line`/`column` are 0) |
 | `TJSON_ERR_NULL`     | 1 | a required pointer argument was `NULL` — a bug in the caller, not a data problem |
 | `TJSON_ERR_UTF8`     | 2 | an argument's bytes were not valid UTF-8; the message names the argument |
-| `TJSON_ERR_PARSE`    | 3 | input was not valid TJSON (`tjson_to_json`) or JSON (`tjson_from_json`) |
+| `TJSON_ERR_PARSE`    | 3 | input was not valid TJSON (`tjson_to_json`, `tjson_to_json_pretty`) or JSON (`tjson_from_json`) |
 | `TJSON_ERR_OPTIONS`  | 4 | the options JSON was not a valid options object (not JSON, unknown field, or invalid value) |
 | `TJSON_ERR_INTERNAL` | 5 | an internal failure such as a caught panic — a tjson bug, please report it |
 

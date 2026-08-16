@@ -4042,6 +4042,35 @@ fn minimal_output_is_json(json: &serde_json::Value, _options: &RenderOptions) ->
         .map(|e| format!("our own minimal output is not valid JSON: {e}\n{text}"))
 }
 
+/// **Pretty JSON is the same data, laid out.**
+///
+/// `to_json_pretty` differs from `to_json` in whitespace and nothing else, so
+/// the two must carry the same value. Worth a law rather than a few examples
+/// because the pair is exposed on three surfaces -- Rust, wasm and the C ABI --
+/// and a caller picking the readable one should never be picking a different
+/// answer with it.
+///
+/// Pretty output is deliberately *not* checked for being TJSON. Only the minimal
+/// form is both; laid-out JSON is JSON alone, which is the whole reason
+/// `to_json` and `to_json_pretty` are separate calls.
+fn pretty_json_is_the_same_data(json: &serde_json::Value, _options: &RenderOptions) -> Option<String> {
+    let value: Value = json.clone().into();
+    let pretty = value.to_json_pretty();
+
+    let parsed: serde_json::Value = match serde_json::from_str(&pretty) {
+        Ok(parsed) => parsed,
+        Err(e) => return Some(format!("pretty output is not valid JSON: {e}\n{pretty}")),
+    };
+    let compact: serde_json::Value = match serde_json::from_str(&value.to_json()) {
+        Ok(compact) => compact,
+        Err(e) => return Some(format!("compact output is not valid JSON: {e}")),
+    };
+
+    (parsed != compact).then(|| {
+        format!("laying the JSON out changed the value\n--- pretty ---\n{pretty}")
+    })
+}
+
 /// The containment set. None of the three depends on render options, so one set is
 /// enough -- the sweep varies the documents, which is the axis that matters here.
 #[test]
@@ -4052,6 +4081,7 @@ fn minimal_json_and_tjson_contain_each_other() {
         ("containment", minified_json_is_tjson as Check),
         ("minimal is tjson", minimal_output_is_tjson_and_a_fixed_point as Check),
         ("minimal is json", minimal_output_is_json as Check),
+        ("pretty is the same data", pretty_json_is_the_same_data as Check),
     ] {
         let (checked, findings) = sweep(name, check, &sets, true);
         report(name, checked, findings);

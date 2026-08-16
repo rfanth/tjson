@@ -43,7 +43,7 @@
  * compiled with and the library you loaded; tjson_version() reports the
  * library's release version as a string.
  */
-#define TJSON_ABI_VERSION 1
+#define TJSON_ABI_VERSION 2
 
 /* Success. TjsonError.code is set to this when a call succeeds. */
 #define TJSON_OK 0
@@ -55,8 +55,8 @@
 /* An argument's bytes were not valid UTF-8. The message names the argument. */
 #define TJSON_ERR_UTF8 2
 
-/* The input was not valid TJSON (tjson_to_json) or not valid JSON
- * (tjson_from_json). TjsonError.line/.column locate the problem. */
+/* The input was not valid TJSON (tjson_to_json, tjson_to_json_pretty) or not
+ * valid JSON (tjson_from_json). TjsonError.line/.column locate the problem. */
 #define TJSON_ERR_PARSE 3
 
 /* The options JSON was not a valid options object: not JSON, an unknown
@@ -101,6 +101,19 @@ extern "C" {
  * non-NULL, is filled in).
  */
 char *tjson_to_json(const char *tjson_utf8, TjsonError *err);
+
+/*
+ * Parse a TJSON string (UTF-8) and return the equivalent JSON string (UTF-8,
+ * indented — two spaces per level, one element per line).
+ *
+ * The same data tjson_to_json() returns, laid out to be read. Numbers cross
+ * as exact text either way.
+ *
+ * Returns a newly allocated string that must be freed with
+ * tjson_free_string(), or NULL on error (in which case *err, if err is
+ * non-NULL, is filled in).
+ */
+char *tjson_to_json_pretty(const char *tjson_utf8, TjsonError *err);
 
 /*
  * Render a JSON string (UTF-8) as TJSON (UTF-8).

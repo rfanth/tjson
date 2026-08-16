@@ -286,20 +286,19 @@ fn main() {
     };
 
     let result = match output {
-        // TJSON -> JSON
-        Output::Json => input.parse::<tjson::Value>()
-            .and_then(|v| serde_json::to_string_pretty(&serde_json::Value::from(v)).map_err(tjson::Error::from)),
-
-        // TJSON -> MINIMAL JSON, through this crate's own writer rather than
-        // serde_json, for two reasons. It escapes the TJSON forbidden set that JSON
-        // passes through literally, so the output is valid TJSON as well as valid
-        // JSON. And it never builds a serde_json::Value, so what -j flattens on the
-        // way out -- -0 becomes 0, integers past u64 lose their spelling -- survives
-        // here.
+        // Both JSON forms go through this crate's own API, the same calls a
+        // library user would make. Neither builds a serde_json::Value on the way,
+        // which is a whole tree per invocation that the output never needed.
         //
-        // That is a claim about *writing* only. Reading JSON back in (-t) still goes
-        // through serde_json's parser, so `-J | -t` loses -0 again; the loss is at
-        // the parse, not the serialization, and it is not ours to fix.
+        // TJSON -> JSON, laid out to read.
+        Output::Json => input.parse::<tjson::Value>().map(|v| v.to_json_pretty()),
+
+        // TJSON -> MINIMAL JSON. Also valid TJSON: our writer escapes the forbidden
+        // set that JSON passes through literally, so this output can be fed back in.
+        //
+        // Writing only. Reading JSON back (-t) still goes through serde_json's
+        // parser, so `-J | -t` is not a round trip for everything `-J` preserves --
+        // the loss is at the parse, and it is not ours to fix.
         Output::MinimalJson => input.parse::<tjson::Value>().map(|v| v.to_json()),
 
         Output::Tjson => {
@@ -390,9 +389,14 @@ fn main() {
         opts = opts.eol(eol);
 
         // JSON -> TJSON (default)
-        serde_json::from_str::<serde_json::Value>(&input)
+        //
+        // Deserialized straight into a tjson::Value. Going by way of a
+        // serde_json::Value builds the whole document twice -- every string
+        // copied, every array and object reallocated into the other crate's
+        // types -- and then frees the first copy, for a tree the output never
+        // reads.
+        serde_json::from_str::<tjson::Value>(&input)
             .map_err(tjson::Error::from)
-            .map(tjson::Value::from)
             .map(|v| v.to_tjson_with(opts))
         }
     };

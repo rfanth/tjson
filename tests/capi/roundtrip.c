@@ -36,6 +36,37 @@ int main(void) {
     check(json != NULL && strstr(json, "\"Alice\"") != NULL, "JSON contains the value");
     tjson_free_string(json);
 
+    /* TJSON -> indented JSON. Same data as tjson_to_json, laid out to read,
+       so what distinguishes it is newlines and leading spaces. */
+    char *pretty = tjson_to_json_pretty("  name: Alice  age: 30", &err);
+    check(pretty != NULL, "tjson_to_json_pretty succeeds");
+    check(err.code == TJSON_OK && err.message == NULL, "pretty success leaves err clear");
+    check(pretty != NULL && strstr(pretty, "\"Alice\"") != NULL, "pretty JSON contains the value");
+    check(pretty != NULL && strstr(pretty, "\n") != NULL, "pretty JSON is laid out over lines");
+    check(pretty != NULL && strstr(pretty, "\n  \"name\"") != NULL, "pretty JSON indents its members");
+    tjson_free_string(pretty);
+
+    /* The same input through both, so a change to one and not the other shows
+       up here rather than as a surprise for a caller switching between them. */
+    char *compact_form = tjson_to_json("  a:1  b: two", &err);
+    char *pretty_form = tjson_to_json_pretty("  a:1  b: two", &err);
+    check(compact_form != NULL && pretty_form != NULL, "both JSON forms succeed");
+    check(compact_form != NULL && strstr(compact_form, "\n") == NULL,
+          "tjson_to_json emits no line breaks");
+    check(pretty_form != NULL && strchr(pretty_form, '\n') != NULL,
+          "tjson_to_json_pretty does");
+    tjson_free_string(compact_form);
+    tjson_free_string(pretty_form);
+
+    /* Errors travel the same way on the pretty path. */
+    char *bad_pretty = tjson_to_json_pretty("  ok: yes\n  key: \a", &err);
+    check(bad_pretty == NULL, "invalid TJSON returns NULL from the pretty path");
+    check(err.code == TJSON_ERR_PARSE, "pretty path sets TJSON_ERR_PARSE");
+    check(err.line == 2, "pretty path reports the line");
+    check(err.message != NULL, "pretty path provides a message");
+    tjson_free_string(err.message);
+    err.message = NULL;
+
     /* JSON -> TJSON with options */
     char *tjson = tjson_from_json("{\"a\":1,\"b\":2}", "{\"canonical\":true}", &err);
     check(tjson != NULL, "tjson_from_json succeeds");

@@ -42,7 +42,7 @@ use std::ptr;
 /// `include/tjson.h`; a test below enforces that, and callers compare the
 /// header macro against [`tjson_abi_version`] at runtime to detect a
 /// header/library mismatch.
-pub const TJSON_ABI_VERSION: i32 = 1;
+pub const TJSON_ABI_VERSION: i32 = 2;
 
 /// Success. [`TjsonError::code`] is set to this when a call succeeds.
 pub const TJSON_OK: i32 = 0;
@@ -51,7 +51,8 @@ pub const TJSON_OK: i32 = 0;
 pub const TJSON_ERR_NULL: i32 = 1;
 /// An argument's bytes were not valid UTF-8. The message names the argument.
 pub const TJSON_ERR_UTF8: i32 = 2;
-/// The input was not valid TJSON (for [`tjson_to_json`]) or not valid JSON
+/// The input was not valid TJSON (for [`tjson_to_json`] and
+/// [`tjson_to_json_pretty`]) or not valid JSON
 /// (for [`tjson_from_json`]). `line`/`column` locate the problem.
 pub const TJSON_ERR_PARSE: i32 = 3;
 /// The options JSON was not a valid options object: not JSON, an unknown
@@ -298,6 +299,29 @@ pub extern "C" fn tjson_to_json(tjson_utf8: *const c_char, err: *mut TjsonError)
     finish(result, err)
 }
 
+/// Parse a TJSON string (UTF-8) and return the equivalent JSON string (UTF-8,
+/// indented — two spaces per level, one element per line).
+///
+/// The same data [`tjson_to_json`] returns, laid out to be read.
+///
+/// Returns a newly allocated string that must be freed with
+/// [`tjson_free_string`], or null on error (in which case `err`, if non-null,
+/// is filled in).
+#[unsafe(no_mangle)]
+pub extern "C" fn tjson_to_json_pretty(
+    tjson_utf8: *const c_char,
+    err: *mut TjsonError,
+) -> *mut c_char {
+    clear_error(err);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<String, FfiError> {
+        // SAFETY: the caller contract requires a valid C string or null.
+        let input = unsafe { borrow_utf8(tjson_utf8, "input") }?;
+        let value: crate::Value = input.parse().map_err(tjson_parse_failure)?;
+        Ok(value.to_json_pretty())
+    }));
+    finish(result, err)
+}
+
 /// Render a JSON string (UTF-8) as TJSON (UTF-8).
 ///
 /// `options_json_utf8` may be null for default rendering; otherwise it is a
@@ -316,7 +340,9 @@ pub extern "C" fn tjson_from_json(
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<String, FfiError> {
         // SAFETY: the caller contract requires a valid C string or null.
         let input = unsafe { borrow_utf8(json_utf8, "input") }?;
-        let value: serde_json::Value = serde_json::from_str(input).map_err(|e| {
+        // Straight into a crate::Value: routing through a serde_json::Value
+        // would build the entire document a second time and then drop it.
+        let value: crate::Value = serde_json::from_str(input).map_err(|e| {
             FfiError::at(TJSON_ERR_PARSE, e.line(), e.column(), format!("input is not valid JSON: {e}"))
         })?;
 
@@ -328,8 +354,7 @@ pub extern "C" fn tjson_from_json(
             parse_options(options_json)?
         };
 
-        crate::to_string_with(&value, options)
-            .map_err(|e| FfiError::new(TJSON_ERR_INTERNAL, e.to_string()))
+        Ok(value.to_tjson_with(options))
     }));
     finish(result, err)
 }
@@ -436,6 +461,26 @@ mod tests {
                 from_c.parse::<crate::Value>().is_ok(),
                 "C output is not valid TJSON for {source:?}: {from_c}"
             );
+        }
+    }
+
+    /// `tjson_to_json_pretty` gives a C caller what a Rust caller gets from
+    /// [`crate::Value::to_json_pretty`], and differs from `tjson_to_json` only
+    /// in layout.
+    #[test]
+    fn to_json_pretty_matches_the_rust_api() {
+        for source in ["  a:1\n  b: two\n", "  n:18446744073709551616\n", "  empty:{}\n"] {
+            let input = CString::new(source).unwrap();
+            let mut err = new_err();
+
+            let from_c = take(tjson_to_json_pretty(input.as_ptr(), &mut err));
+            let value: crate::Value = source.parse().unwrap();
+            assert_eq!(from_c, value.to_json_pretty(), "C and Rust disagree for {source:?}");
+
+            // Same data as the compact form, only laid out differently.
+            let compact: serde_json::Value = serde_json::from_str(&value.to_json()).unwrap();
+            let pretty: serde_json::Value = serde_json::from_str(&from_c).unwrap();
+            assert_eq!(compact, pretty, "layout changed the value for {source:?}");
         }
     }
 

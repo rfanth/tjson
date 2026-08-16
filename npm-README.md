@@ -50,13 +50,13 @@ inlined, initialized during import, nothing to call or configure) and works
 from any CDN that serves npm packages as files:
 
 ```js
-import { parse, stringify, fromJson, toJson } from 'https://unpkg.com/@rfanth/tjson/web/index.js';
+import { parse, stringify, fromJson, toJson, toJsonPretty } from 'https://unpkg.com/@rfanth/tjson/web/index.js';
 ```
 
 ## Usage
 
 ```ts
-import { parse, stringify, fromJson, toJson } from '@rfanth/tjson';
+import { parse, stringify, fromJson, toJson, toJsonPretty } from '@rfanth/tjson';
 
 // JS value → TJSON
 const tjson = stringify({ name: 'Alice', scores: [95, 87, 92] });
@@ -70,14 +70,18 @@ const narrow    = stringify({ name: 'Alice' }, { wrapWidth: 40, stringArrayStyle
 
 // String pipeline variants (if you already have a JSON string)
 const tjson2 = fromJson('{"name":"Alice"}');
-const json   = toJson(tjson2);
+const json   = toJson(tjson2);        // compact
+const shown  = toJsonPretty(tjson2);  // indented, for a person to read
 ```
 
 `stringify` accepts any JSON-serializable JS value and returns a TJSON string.
 `parse` accepts a TJSON string and returns a JS value — just like `JSON.parse`.
-`fromJson`/`toJson` are the string-in/string-out variants for JSON string pipelines.
+`fromJson`/`toJson` are the string-in/string-out variants for JSON string
+pipelines, and `toJsonPretty` is `toJson` laid out over lines. Prefer it to
+`JSON.stringify(JSON.parse(toJson(x)), null, 2)`, which puts every number
+through an f64 on the way past.
 
-All four functions throw an `Error` on invalid input.
+All of them throw an `Error` on invalid input.
 
 `version()` returns the tjson version this module was built from.
 
@@ -118,7 +122,8 @@ rather than corrupt). On the way back, integers beyond
 `Number.MAX_SAFE_INTEGER` throw by default — a plain JS number cannot hold
 them exactly — or are revived as `BigInt` from the exact source digits with
 `parse(text, { bigints: true })`. The string-to-string functions (`toJson`,
-`fromJson`) carry numbers of any size exactly with no options needed. Note
+`toJsonPretty`, `fromJson`) carry numbers of any size exactly with no options
+needed. Note
 that JS has no exact decimal type, so non-integer numbers are always `number`
 (f64) on the JS side.
 
