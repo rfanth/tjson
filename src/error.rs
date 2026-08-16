@@ -15,10 +15,10 @@ pub struct ParseError {
 }
 
 impl ParseError {
-    pub(crate) fn new(line: usize, column: usize, message: impl Into<String>, source_line: Option<String>) -> Self {
+    pub(crate) fn new(line: usize, column: crate::position::Column, message: impl Into<String>, source_line: Option<String>) -> Self {
         Self {
             line,
-            column,
+            column: column.number(),
             message: message.into(),
             source_line,
         }
@@ -200,7 +200,10 @@ pub enum Error {
     Deserialize(DeserializeError),
     /// A JSON serialization or deserialization error from serde_json.
     Json(serde_json::Error),
-    /// A render error due to an internal invariant violation (indicates a bug in this library).
+    /// A render error due to an internal invariant violation, or possibly lack of memory
+    /// or similar limitations.
+    /// 
+    /// Nothing currently constructs it, but it is reserved for such things.
     Render(String),
 }
 

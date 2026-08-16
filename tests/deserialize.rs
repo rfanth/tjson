@@ -547,3 +547,200 @@ fn from_document_reads_typed_data_without_projection() {
     assert_eq!(err.path(), "retries");
     assert_eq!(err.line(), None);
 }
+
+/// Every rung of the number ladder, at its edges.
+///
+/// `deserialize_any` offers a number as u64, then i64, then u128, then i128, then
+/// f64 when the digits survive the trip, and only then as the exact token map.
+/// Which rung a number lands on is invisible from outside -- what is visible is
+/// the value that comes out, so every boundary is compared against the oracle
+/// rather than asserted directly.
+///
+/// The edges are the point. A ladder is exactly the shape that is right in the
+/// middle of each rung and wrong by one at the joins, and nothing here used to
+/// stand on a join.
+#[test]
+fn the_number_ladder_matches_the_oracle_at_every_boundary() {
+    let digits = [
+        "0", "-0", "1", "-1",
+        // u64's top, and one past it.
+        "18446744073709551615", "18446744073709551616",
+        // i64's floor, and one below.
+        "-9223372036854775808", "-9223372036854775809",
+        // u128's top, and one past it.
+        "340282366920938463463374607431768211455",
+        "340282366920938463463374607431768211456",
+        // i128's floor, and one below.
+        "-170141183460469231731687303715884105728",
+        "-170141183460469231731687303715884105729",
+        // Spellings an f64 keeps, and spellings it does not.
+        "1.0", "1.00", "2.5", "2.50", "0.1", "-0.0",
+        "1e100", "1e+100", "1e-100", "1.7976931348623157e308",
+        // Beyond f64 entirely, and precision no f64 holds.
+        "123456789012345678901234567890.5",
+        "0.10000000000000000000000000000001",
+    ];
+    // The routes a number can take are not one route. `Value` goes through the
+    // parser, `Number` has its own visitor, and untagged enums and `flatten`
+    // buffer through `deserialize_any` -- so they see whichever visit method the
+    // ladder picked rather than asking for a type. A rung that changed would show
+    // up in some of these and not others, which is the whole reason to sweep them
+    // together.
+    for number in digits {
+        let input = format!("  n:{number}");
+        assert_matches_oracle::<serde_json::Value>(&input);
+        assert_matches_oracle::<HashMap<String, serde_json::Value>>(&input);
+        assert_matches_oracle::<HashMap<String, serde_json::Number>>(&input);
+        // `Flattened` is swept separately: see
+        // `flatten_and_untagged_accept_numbers_past_u64`, a known gap.
+
+        // Whatever rung it takes, the value must survive as a number rather than
+        // decaying to a string or failing outright.
+        let exact: HashMap<String, tjson::Number> =
+            tjson::from_str(&input).unwrap_or_else(|e| panic!("{number}: {e}"));
+        assert_eq!(
+            exact["n"].as_f64(),
+            number.parse::<f64>().ok(),
+            "{number} changed value on the way to tjson::Number"
+        );
+
+        // Untagged is swept in the known-gap test alongside `flatten`: both
+        // buffer through `Content`, and both refuse anything past `u64`.
+    }
+}
+
+
+/// KNOWN GAP, not a flaky test: `-0` loses its sign on the way to an exact field.
+///
+/// `-0` parses as an `i64` and an `i64` has no negative zero, so the ladder hands
+/// the visitor `0` and the spelling is gone before anything downstream can keep
+/// it. Every other exact spelling survives -- see `exact_digits_survive_every_rung`
+/// -- and `serde_json::Value` agrees with the oracle here, so the divergence is
+/// confined to fields that asked for the exact digits.
+///
+/// The cause is upstream and known; a patched serde_json tree exists outside this
+/// repository, and this crate deliberately does not build against it. Pinned as
+/// the behaviour that is true today so that a fix announces itself:
+///
+/// ```text
+/// cargo test --test deserialize -- --ignored negative_zero
+/// ```
+#[test]
+#[ignore = "known gap: -0 loses its sign through the integer rung"]
+fn negative_zero_keeps_its_sign_for_an_exact_field() {
+    #[derive(Deserialize)]
+    struct Holder {
+        n: tjson::Number,
+    }
+    let holder: Holder = tjson::from_str("  n:-0").expect("-0 is a valid number");
+    assert_eq!(holder.n.as_str(), "-0", "-0 lost its sign");
+}
+
+/// KNOWN GAP, not a flaky test: `flatten` and untagged reject numbers past `u64`.
+///
+/// `#[serde(flatten)]` and untagged enums do not ask for a type -- they buffer the
+/// value through `deserialize_any` into serde's private `Content`, and `Content`
+/// has no 128-bit variants. So `visit_u128` comes back as *"invalid type: integer
+/// ... as u128, expected any value"*, and a document the old trampoline accepted
+/// is refused:
+///
+/// ```text
+///   n:18446744073709551616
+/// ```
+///
+/// The trampoline avoided it by never visiting 128-bit integers at all: with
+/// `arbitrary_precision`, serde_json hands anything past `i64`/`u64` to the exact
+/// token *map*, which `Content` buffers happily. This deserializer's ladder offers
+/// `visit_u128`/`visit_i128` first, and only falls through to the token map after.
+///
+/// Confirmed pre-existing, not introduced by the `Delivery` refactor: the same
+/// case fails identically against the pre-refactor `de.rs`.
+///
+/// Typed fields are unaffected -- `deserialize_u128` is its own method and does not
+/// go through `deserialize_any` -- which is why `i128_and_u128_deserialize_from_big_digits`
+/// passes. Only the buffering consumers see it.
+///
+/// ```text
+/// cargo test --test deserialize -- --ignored flatten_and_untagged
+/// ```
+#[test]
+#[ignore = "known gap: Content has no 128-bit variants, so flatten/untagged reject them"]
+fn flatten_and_untagged_accept_numbers_past_u64() {
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Flattened {
+        #[serde(flatten)]
+        rest: HashMap<String, serde_json::Value>,
+    }
+    #[derive(Deserialize, Debug, PartialEq)]
+    #[serde(untagged)]
+    enum Untagged {
+        Int(i64),
+        Float(f64),
+    }
+    for number in [
+        "18446744073709551616",
+        "340282366920938463463374607431768211455",
+        "-9223372036854775809",
+    ] {
+        let input = format!("  n:{number}");
+        assert_matches_oracle::<Flattened>(&input);
+        assert_matches_oracle::<HashMap<String, Untagged>>(&input);
+    }
+}
+
+/// The serde modes that buffer, and a few that do not, against the oracle.
+///
+/// Internally and adjacently tagged enums route through `Content` the same way
+/// `flatten` and untagged do, and neither was covered here at all. They are the
+/// places a `Deserializer` gets caught out, because they never ask for a type --
+/// they take whichever visit method it picked and try to make sense of it later.
+#[test]
+fn buffering_and_borrowing_modes_match_the_oracle() {
+    #[derive(Deserialize, Debug, PartialEq)]
+    #[serde(tag = "kind")]
+    enum Internal {
+        Alpha { n: i64 },
+        Beta { s: String },
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    #[serde(tag = "kind", content = "body")]
+    enum Adjacent {
+        Alpha(i64),
+        Beta(String),
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Defaults {
+        #[serde(default)]
+        missing: u32,
+        #[serde(default)]
+        present: String,
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Newtype(i64);
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Optional {
+        a: Option<i64>,
+        b: Option<i64>,
+    }
+
+    assert_matches_oracle::<Internal>("  kind: Alpha\n  n:7");
+    assert_matches_oracle::<Internal>("  kind: Beta\n  s: hello");
+    assert_matches_oracle::<Adjacent>("  kind: Alpha\n  body:7");
+    assert_matches_oracle::<Adjacent>("  kind: Beta\n  body: hello");
+    assert_matches_oracle::<Defaults>("  present: here");
+    assert_matches_oracle::<Newtype>("  9");
+    assert_matches_oracle::<Optional>("  a:1\n  b:null");
+
+    // The same modes over a number the ladder delivers on a wide rung.
+    assert_matches_oracle::<Internal>("  kind: Alpha\n  n:-9223372036854775808");
+    assert_matches_oracle::<Adjacent>("  kind: Alpha\n  body:-9223372036854775808");
+
+    // Zero-copy is not reachable from the public API even though the visitor
+    // offers it: `from_str` takes `DeserializeOwned`, so a `&'a str` field cannot
+    // be expressed. `visit_borrowed_str` is still the right call -- it lets an
+    // owned `String` skip a copy -- but nothing can borrow from the input here.
+}

@@ -5,6 +5,39 @@ fn err(msg: impl AsRef<str>) -> JsValue {
     Error::new(msg.as_ref()).into()
 }
 
+/// A failure the caller did not cause and cannot act on, except by telling us.
+/// `step` names what was being attempted, because the wrapped error was written
+/// for a Rust reader and will not say.
+///
+/// Written once because it is a policy, not a fact about the failure. Five sites
+/// each wrote their own version in three wordings, and every one of them spent a
+/// clause ("this is likely a TJSON bug") restating the words "internal error"
+/// that stood immediately before it.
+fn internal_error(step: &str, cause: impl std::fmt::Display) -> JsValue {
+    err(format!("internal error {step} (please report it): {cause}"))
+}
+
+/// The options bag was not shaped like `StringifyOptions`. Reached from two
+/// directions — text that is not JSON, and JSON that is not a valid options
+/// object — which is why the pointer to the type lives here rather than at
+/// either site.
+fn invalid_option(cause: impl std::fmt::Display) -> JsValue {
+    err(format!("invalid option value (see StringifyOptions for valid values): {cause}"))
+}
+
+/// Render a JSON value as TJSON text.
+///
+/// Deliberately not [`crate::to_string_with`]: that is generic over `Serialize`,
+/// so it re-serializes through `serde_json::to_value` — a deep copy of the whole
+/// document — and returns a `Result` for a failure this path cannot produce. The
+/// value here is already a `serde_json::Value`, so converting it is a move, and
+/// the render returns a `String`. Both call sites used to name that unreachable
+/// failure "TJSON render error", which was false twice over: rendering cannot
+/// fail, and the error they were labelling came from serde_json.
+fn render(json: serde_json::Value, options: crate::RenderOptions) -> String {
+    crate::Value::from(json).to_tjson_with(options)
+}
+
 // JS <-> Rust value transport.
 //
 // Values cross the boundary as JSON *text*, produced and consumed by the two
@@ -190,10 +223,9 @@ pub fn version() -> String {
 #[wasm_bindgen(skip_typescript)]
 pub fn parse(input: &str, options: JsValue) -> Result<JsValue, JsValue> {
     let json: serde_json::Value = crate::from_str(input)
-        .map_err(|e| err(format!("invalid TJSON (input must be valid TJSON): {e}")))?;
-    let text = serde_json::to_string(&json).map_err(|e| {
-        err(format!("internal error serializing parsed value (this is likely a TJSON bug, please report it): {e}"))
-    })?;
+        .map_err(|e| err(format!("invalid TJSON: {e}")))?;
+    let text = serde_json::to_string(&json)
+        .map_err(|e| internal_error("serializing the parsed value", e))?;
     // Same rigor as StringifyOptions: the bag must be a plain object, and
     // bigints must be an actual boolean — parse(text, [1]) or
     // { bigints: "false" } silently doing something was the alternative.
@@ -250,12 +282,11 @@ pub fn stringify(input: JsValue, options: JsValue) -> Result<String, JsValue> {
         // cost is irrelevant.
         match throw_naming_ill_formed_string(&input) {
             Err(named) => named,
-            Ok(()) => err(format!("internal error re-reading serialized value (this is likely a TJSON bug, please report it): {e}")),
+            Ok(()) => internal_error("re-reading the serialized value", e),
         }
     })?;
     let opts = parse_options(options)?;
-    crate::to_string_with(&json, opts)
-        .map_err(|e| err(format!("TJSON render error (this is likely a TJSON bug, please report it): {e}")))
+    Ok(render(json, opts))
 }
 
 /// Parse a TJSON string and return a JSON string.
@@ -268,10 +299,8 @@ pub fn stringify(input: JsValue, options: JsValue) -> Result<String, JsValue> {
 #[wasm_bindgen(js_name = "toJson", skip_typescript)]
 pub fn to_json(input: &str) -> Result<String, JsValue> {
     let json: serde_json::Value = crate::from_str(input)
-        .map_err(|e| err(format!("invalid TJSON (input must be valid TJSON): {e}")))?;
-    serde_json::to_string(&json).map_err(|e| {
-        err(format!("internal error converting to JSON string (this is likely a TJSON bug, please report it): {e}"))
-    })
+        .map_err(|e| err(format!("invalid TJSON: {e}")))?;
+    serde_json::to_string(&json).map_err(|e| internal_error("converting to a JSON string", e))
 }
 
 /// Render a JSON string as TJSON, with optional options object.
@@ -285,10 +314,9 @@ pub fn to_json(input: &str) -> Result<String, JsValue> {
 #[wasm_bindgen(js_name = "fromJson", skip_typescript)]
 pub fn from_json(input: &str, options: JsValue) -> Result<String, JsValue> {
     let json: serde_json::Value = serde_json::from_str(input)
-        .map_err(|e| err(format!("invalid JSON string (input must be valid JSON): {e}")))?;
+        .map_err(|e| err(format!("invalid JSON: {e}")))?;
     let opts = parse_options(options)?;
-    crate::to_string_with(&json, opts)
-        .map_err(|e| err(format!("TJSON render error (this is likely a TJSON bug, please report it): {e}")))
+    Ok(render(json, opts))
 }
 
 fn parse_options(options: JsValue) -> Result<crate::RenderOptions, JsValue> {
@@ -298,8 +326,7 @@ fn parse_options(options: JsValue) -> Result<crate::RenderOptions, JsValue> {
     // The options bag rides the same strict text pipeline as data values, so
     // a Map or an ill-formed string in an option fails loudly here too.
     let text = value_to_json_text(&options)?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| err(format!("invalid option value (see StringifyOptions for valid values): {e}")))?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(invalid_option)?;
     // Options must be a plain object. Without this check, serde accepts a
     // JS array positionally as struct fields ([true] would silently mean
     // {canonical: true}) and bare scalars produce an error that leaks the
@@ -316,7 +343,6 @@ fn parse_options(options: JsValue) -> Result<crate::RenderOptions, JsValue> {
             return Err(err(format!("{} — please update your code", retired.hint)));
         }
     }
-    let config: crate::TjsonConfig = serde_json::from_value(json)
-        .map_err(|e| err(format!("invalid option value (see StringifyOptions for valid values): {e}")))?;
+    let config: crate::TjsonConfig = serde_json::from_value(json).map_err(invalid_option)?;
     Ok(config.into())
 }

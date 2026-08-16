@@ -74,11 +74,11 @@ impl Comment {
         self.placement
     }
 
-    fn classify(raw: RawComment, subject_level: usize) -> Self {
+    fn classify(raw: RawComment, subject_level: crate::position::LogicalIndent) -> Self {
         // Left iff at the margin under an indented subject. A comment at its subject's
         // level — including level 0, where the two readings coincide — is AtLevel, the
         // interpretation that follows the subject if the tree is later re-nested.
-        let placement = if raw.col == 0 && subject_level > 0 {
+        let placement = if raw.col == 0 && subject_level > crate::position::LogicalIndent::ROOT {
             Placement::Left
         } else {
             Placement::AtLevel
@@ -86,7 +86,10 @@ impl Comment {
         Self { text: raw.text, placement }
     }
 
-    fn classify_all(raw: Vec<RawComment>, subject_level: usize) -> Vec<Self> {
+    fn classify_all(
+        raw: Vec<RawComment>,
+        subject_level: crate::position::LogicalIndent,
+    ) -> Vec<Self> {
         raw.into_iter().map(|c| Self::classify(c, subject_level)).collect()
     }
 }
@@ -444,18 +447,26 @@ impl Tree for Node {
         convert(value)
     }
 
-    fn attach_comments_before(node: &mut Self, comments: Vec<RawComment>, node_level: usize) {
+    fn attach_comments_before(
+        node: &mut Self,
+        comments: Vec<RawComment>,
+        node_level: crate::position::LogicalIndent,
+    ) {
         node.comments_before.extend(Comment::classify_all(comments, node_level));
     }
 
-    fn attach_entry_comments(entry: &mut Self::Entry, comments: Vec<RawComment>, entry_level: usize) {
+    fn attach_entry_comments(
+        entry: &mut Self::Entry,
+        comments: Vec<RawComment>,
+        entry_level: crate::position::LogicalIndent,
+    ) {
         entry.comments_before.extend(Comment::classify_all(comments, entry_level));
     }
 
     fn attach_trailing_comments(root: &mut Self, comments: Vec<RawComment>) {
         // Trailer comments have no subject; their own column is the only signal, and
         // re-emission at the root level makes Left/AtLevel coincide anyway.
-        root.trailing_comments.extend(Comment::classify_all(comments, 0));
+        root.trailing_comments.extend(Comment::classify_all(comments, crate::position::LogicalIndent::ROOT));
     }
 
     fn node(&self) -> NodeRef<'_, Self> {
@@ -828,3 +839,5 @@ mod tests {
     }
 
 }
+
+

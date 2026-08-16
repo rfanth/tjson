@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 
 use crate::document::{Comment, Placement};
 use crate::options::{BareStyle, StringStyle, FoldStyle, IndentGlyphMarkerStyle, IndentGlyphMode, MultilineStyle, StringArrayStyle, TableUnindentStyle, RenderOptions, SPEC_FORMS, MIN_FOLD_CONTINUATION, indent_glyph_mode};
+use crate::position::{Columns, FileIndent, Glyph, LEVEL, Marker, Spaces, indent_marked};
 use crate::tree::{BareForm, KeyForm, MultilineFlavor, NodeRef, StringForm, Tree};
 use crate::value::{BareString, StrMeta, TableBareString};
 use crate::util::*;
@@ -18,6 +19,151 @@ pub(crate) enum BasicValue<'a> {
     String(&'a str, Option<StringForm>),
     EmptyArray,
     EmptyObject,
+}
+
+/// How a string will be rendered. See [`string_rendering`].
+///
+/// Not a grouping by kind: the two multiline arms are the same shape chosen two
+/// different ways, and they render differently because an honored flavour bypasses
+/// the width and line-count preferences that style-driven selection applies. What
+/// the arms share is that each answers to one fold style -- bare to
+/// `string_bare_fold_style`, quoted to `string_quoted_fold_style`, either multiline
+/// to `string_multiline_fold_style`, and folding quotes to none at all, that form
+/// being the folding itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StringRendering {
+    Bare(BareForm),
+    Quoted,
+    FoldingQuotes,
+    HonoredMultiline(MultilineFlavor),
+    StyleMultiline,
+}
+
+/// How this string will be rendered.
+///
+/// A free function because nothing in it touches the tree type: it was briefly a
+/// method, and the giveaway was the call site naming an arbitrary `Renderer<Value>`
+/// purely to reach it.
+///
+/// Extracted from [`Renderer::render_string_lines`], which dispatches on the
+/// result, so the decision has one definition. Which fold style governs a value
+/// follows from it, and that was the thing a caller outside the renderer needed
+/// and could not ask -- so it guessed, and the guess read the *key's* style to
+/// decide about a value.
+/// Whether `foldingQuotes` governs this value.
+///
+/// Asked in two places that must agree: the honored-form arm, which has to know not
+/// to preempt it, and the style dispatch below. They disagreed, which is how a
+/// document rendered with `foldingQuotes` came back unfolded -- the recorded
+/// `Quoted` answered first and the style never got to speak.
+///
+/// Pinned by `document_is_a_fixed_point` in `tests/fuzz.rs`.
+fn folding_quotes_governs(meta: &StrMeta, options: &RenderOptions) -> bool {
+    matches!(options.multiline_style, MultilineStyle::FoldingQuotes)
+        && meta.has_eol
+        && meta.eol_type.is_some()
+}
+
+fn string_rendering(
+    value: &str,
+    form: Option<StringForm>,
+    meta: &StrMeta,
+    options: &RenderOptions,
+) -> StringRendering {
+    // Honored forms first, each subject to the same safety check the renderer
+    // applies before trusting one.
+    match resolve_string_form(form, options) {
+        // `Quoted` says the string was written in quotes. It does not say whether
+        // the newlines inside it were folded, because fold state is deliberately not
+        // recorded -- "Folded JSON strings record as `Quoted`". `foldingQuotes`
+        // produces quoted output too, so honoring the form here would answer a
+        // question the record does not carry, and the fold would vanish on every
+        // rerender. Where the style governs, it decides; the honored form is still
+        // satisfied, since what it asks for is quotes and that is what it gets.
+        Some(StringForm::Quoted) if !folding_quotes_governs(meta, options) => {
+            return StringRendering::Quoted;
+        }
+        Some(StringForm::Bare(bare)) if meta.is_bare_eligible => {
+            return StringRendering::Bare(bare_opener_for(Some(bare), options));
+        }
+        Some(StringForm::Multiline(flavor))
+            if meta.has_eol && meta.eol_type.is_some() && !meta.has_forbidden_literal =>
+        {
+            return StringRendering::HonoredMultiline(flavor);
+        }
+        _ => {}
+    }
+    if folding_quotes_governs(meta, options) {
+        return StringRendering::FoldingQuotes;
+    }
+    if options.multiline_strings
+        && !meta.has_forbidden_literal
+        && meta.has_eol
+        && let Some(local_eol) = meta.eol_type
+    {
+        let eols = match local_eol {
+            MultilineLocalEol::Lf => value.split('\n').count(),
+            MultilineLocalEol::CrLf => value.split("\r\n").count(),
+        }
+        .saturating_sub(1);
+        if eols >= options.multiline_min_lines.max(1) {
+            return StringRendering::StyleMultiline;
+        }
+    }
+    if options.bare_strings != StringStyle::Quoted && meta.is_bare_eligible {
+        return StringRendering::Bare(bare_opener_for(None, options));
+    }
+    StringRendering::Quoted
+}
+
+/// May this value be placed on a `/ ` continuation line of its own?
+///
+/// Named for the question rather than for a fold style, because two of the arms
+/// have no style behind them: folding quotes consults none -- that form *is* the
+/// folding -- and a bool cannot fold at all yet may still be placed below a key
+/// that folded. Returning a `FoldStyle` here meant handing back `Auto` for both,
+/// a style nobody set, and the sole caller only ever compared it to `None`.
+///
+/// `place_value` used to be *told* this, by a `bool` computed at the key's site
+/// from the **key's** fold style -- an anonymous parameter that could not look
+/// wrong, and did not, until a number was rendered after a long bare key.
+fn may_take_a_continuation(bv: BasicValue<'_>, options: &RenderOptions) -> bool {
+    let governing = match bv {
+        BasicValue::Number(_) => options.number_fold_style,
+        BasicValue::String(value, form) => {
+            let meta = StrMeta::new(value);
+            match string_rendering(value, form, &meta, options) {
+                StringRendering::Bare(_) => options.string_bare_fold_style,
+                StringRendering::Quoted => options.string_quoted_fold_style,
+                StringRendering::HonoredMultiline(_) | StringRendering::StyleMultiline => {
+                    options.string_multiline_fold_style
+                }
+                // The form is the folding; it continues whatever any style says.
+                StringRendering::FoldingQuotes => return true,
+            }
+        }
+        // Null, booleans and the empty containers cannot fold -- there is nowhere
+        // in `true` to break. But *placing* one on a `/ ` line is a different
+        // question from folding it, and the answer is yes when folding is in use
+        // at all: after a folded key, moving a four-character value below is what
+        // keeps the line inside the margin. Answering `None` here because a bool
+        // cannot fold is the same conflation that put the key's style in charge of
+        // the value's placement.
+        // Null, booleans and the empty containers cannot fold, but *placing* one
+        // is a different question from folding it -- see below.
+        _ => {
+            let any = [
+                options.number_fold_style,
+                options.string_bare_fold_style,
+                options.string_quoted_fold_style,
+                options.string_multiline_fold_style,
+            ]
+            .into_iter()
+            .any(|style| style != FoldStyle::None);
+            return any;
+        }
+    };
+    governing != FoldStyle::None
 }
 
 fn basic_value<T: Tree>(value: &T) -> Option<BasicValue<'_>> {
@@ -110,7 +256,7 @@ fn resolve_table_attempt(opinion: Option<bool>, options: &RenderOptions) -> Opti
 /// subject's indent. No-op when comment rendering is off.
 fn emit_comments(
     comments: &[Comment],
-    subject_indent: usize,
+    subject_indent: FileIndent,
     options: &RenderOptions,
     out: &mut Vec<String>,
 ) {
@@ -120,7 +266,7 @@ fn emit_comments(
     for comment in comments {
         match comment.placement() {
             Placement::Left => out.push(comment.text().to_owned()),
-            Placement::AtLevel => out.push(format!("{}{}", spaces(subject_indent), comment.text())),
+            Placement::AtLevel => out.push(format!("{}{}", subject_indent.spaces(), comment.text())),
         }
     }
 }
@@ -154,47 +300,60 @@ fn effective_force_markers(options: &RenderOptions) -> bool {
 // Returns the target parent_indent to re-render the table at when /< /> glyphs should be
 // used, or None if no unindenting should occur.
 //
-// `natural_lines` are the table lines as rendered at pair_indent (spaces(pair_indent+2) prefix).
-fn table_unindent_target(pair_indent: usize, natural_lines: &[String], options: &RenderOptions) -> Option<usize> {
+// `natural_lines` are the table lines as rendered at pair_indent, one level in.
+fn table_unindent_target(
+    pair_indent: FileIndent,
+    natural_lines: &[String],
+    options: &RenderOptions,
+) -> Option<FileIndent> {
     let n = pair_indent;
-    let max_natural = natural_lines.iter().map(|l| l.len()).max().unwrap_or(0);
+    // Measured in columns, not bytes. `l.len()` stood here, and every comparison
+    // below weighs this against `wrap_width`, which is a column budget: a table of
+    // CJK measured about three times its real width, so it was judged not to fit
+    // at indent 0 and kept its indent, while the identical table in Latin text was
+    // pushed left. That is layout moving with the encoding of the content.
+    let max_natural =
+        natural_lines.iter().map(|l| Columns::of(l)).max().unwrap_or(Columns::ZERO);
     // data_width: widest line with the natural indent stripped
-    let data_width = max_natural.saturating_sub(n + 2);
+    let data_width = max_natural.saturating_sub(n.width() + Columns::new(LEVEL));
 
     match options.table_unindent_style {
         TableUnindentStyle::None => None,
 
         TableUnindentStyle::Left => {
             // Always push to indent 0, unless already there.
-            if n == 0 { None } else {
+            if n == FileIndent::ROOT { None } else {
                 // Check it fits at 0 (data_width <= w, or unlimited width).
-                let fits = options.wrap_width.map(|w| data_width <= w).unwrap_or(true);
-                if fits { Some(0) } else { None }
+                let fits =
+                    options.wrap_width.map(|w| data_width <= Columns::new(w)).unwrap_or(true);
+                if fits { Some(FileIndent::ROOT) } else { None }
             }
         }
 
         TableUnindentStyle::Auto => {
             // Push to indent 0 only when table overflows at natural indent.
             // With unlimited width, never unindent.
-            let w = options.wrap_width?;
+            let w = Columns::new(options.wrap_width?);
             let overflows_natural = max_natural > w;
             let fits_at_zero = data_width <= w;
-            if overflows_natural && fits_at_zero { Some(0) } else { None }
+            if overflows_natural && fits_at_zero { Some(FileIndent::ROOT) } else { None }
         }
 
         TableUnindentStyle::Floating => {
             // Push left by the minimum amount needed to fit within wrap_width.
             // With unlimited width, never unindent.
-            let w = options.wrap_width?;
+            let w = Columns::new(options.wrap_width?);
             if max_natural <= w {
                 return None; // already fits, no need to move
             }
-            // Find the minimum parent_indent such that data_width + (parent_indent + 2) <= w.
-            // data_width is fixed; we need parent_indent + 2 + data_width <= w.
+            // Find the minimum parent_indent such that data_width + (parent_indent.deeper(1)) <= w.
+            // data_width is fixed; we need parent_indent.deeper(1) + data_width <= w.
             // minimum parent_indent = 0 if data_width + 2 <= w, else can't help.
-            if data_width + 2 <= w {
+            if data_width + Columns::new(2) <= w {
                 // Find smallest parent_indent that makes table fit.
-                let target = w.saturating_sub(data_width + 2);
+                let target = FileIndent::new(
+                    w.saturating_sub(data_width + Columns::new(LEVEL)).columns(),
+                );
                 // Only unindent if it actually reduces the indent.
                 if target < n { Some(target) } else { None }
             } else {
@@ -250,44 +409,68 @@ fn subtree_max_depth<T: Tree>(value: &T) -> usize {
 }
 
 /// Returns true if a `/<` indent-offset glyph should be emitted for `value` at `pair_indent`.
-fn should_use_indent_glyph<T: Tree>(value: &T, pair_indent: usize, options: &RenderOptions) -> bool {
+fn should_use_indent_glyph<T: Tree>(value: &T, pair_indent: FileIndent, options: &RenderOptions) -> bool {
     let Some(w) = options.wrap_width else { return false; };
     let fold_floor = || {
         let max_depth = subtree_max_depth(value);
-        pair_indent + max_depth * 2 >= w.saturating_sub(MIN_FOLD_CONTINUATION + 2)
+        pair_indent.deeper(max_depth).width().columns()
+            >= w.saturating_sub(MIN_FOLD_CONTINUATION + 2)
     };
     match indent_glyph_mode(options) {
         IndentGlyphMode::None => false,
-        IndentGlyphMode::Fixed => pair_indent >= w / 2,
+        IndentGlyphMode::Fixed => pair_indent.width().columns() >= w / 2,
         IndentGlyphMode::IndentWeighted(threshold) => {
             if fold_floor() { return true; }
             let line_count = subtree_line_count(value);
-            (pair_indent * line_count) as f64 >= threshold * (w * w) as f64
+            (pair_indent.width().columns() * line_count) as f64 >= threshold * (w * w) as f64
         }
         IndentGlyphMode::ByteWeighted(threshold) => {
             if fold_floor() { return true; }
             let byte_count = subtree_byte_count(value);
-            (pair_indent * byte_count) as f64 >= threshold * (w * w) as f64
+            (pair_indent.width().columns() * byte_count) as f64 >= threshold * (w * w) as f64
         }
     }
 }
 
-/// Build the opening glyph line(s) for an indent-offset block.
-/// Returns either `["key: /<"]` or `["key:", "INDENT /<"]` depending on options.
-fn indent_glyph_open_lines(key_line: &str, pair_indent: usize, options: &RenderOptions) -> Vec<String> {
-    match options.indent_glyph_marker_style {
-        IndentGlyphMarkerStyle::Compact => vec![format!("{}: /<", key_line)],
-        IndentGlyphMarkerStyle::Separate /*| IndentGlyphMarkerStyle::Marked*/ => vec![
-            format!("{}:", key_line),
-            format!("{} /<", spaces(pair_indent)),
-        ],
-    }
+/// How a value sits relative to its key's line.
+///
+/// Every key-value layout the renderer can produce is one of these three, and which
+/// one it is is a decision the layout makes -- never something recovered afterwards
+/// by inspecting the rendered text. This replaced exactly that: the folded-key path
+/// used to re-render the pair with the key *unfolded*, strip `key:` back off the
+/// first line, and guess from the remainder. A feature that gave a value a new kind
+/// of first line could then break a caller that never mentioned it, which is how
+/// `key: /<` reached a branch whose comment said it was unreachable.
+///
+/// Every space in these strings belongs to the value: one column for a bare
+/// string's opening quote, one for the glyph's spec-mandated leading space, two for
+/// an inline array's start -- the same two it would occupy as indentation on a line
+/// of its own. The pair contributes no separator of its own, so there is no gap to
+/// carry separately.
+enum ValuePlacement {
+    /// Entirely on the key's line: `k: 42`, `k:[]`, `k:  1, 2, 3`.
+    OnKeyLine { after_colon: String },
+    /// Opens on the key's line and continues below: `k: /<` … ` />`, a multiline
+    /// string's glyph and body, or a folded string's first segment and its `/ `
+    /// continuations.
+    OpensOnKeyLine { opener: String, below: Vec<String> },
+    /// Nothing after the colon; the value's lines begin underneath.
+    Below { lines: Vec<String> },
+}
+
+/// The configured wrap width as a budget.
+///
+/// The single crossing out of the options bag, which holds the width as a plain
+/// number because it is configuration and public. Everything downstream of here
+/// carries [`Columns`], so no fold path has to remember which unit it was handed.
+fn wrap_budget(options: &RenderOptions) -> Option<Columns> {
+    options.wrap_width.map(Columns::new)
 }
 
 fn fits_wrap(options: &RenderOptions, line: &str) -> bool {
     match options.wrap_width {
         Some(0) | None => true,
-        Some(width) => line.chars().count() <= width,
+        Some(width) => Columns::of(line) <= Columns::new(width),
     }
 }
 
@@ -324,14 +507,14 @@ pub(crate) fn needs_explicit_array_marker<T: Tree>(value: &T) -> bool {
 }
 
 
-fn split_multiline_fold(text: &str, avail: usize, style: FoldStyle) -> Vec<&str> {
-    if text.len() <= avail || avail == 0 {
+fn split_multiline_fold(text: &str, avail: Columns, style: FoldStyle) -> Vec<&str> {
+    if Columns::of(text) <= avail || avail == Columns::ZERO {
         return vec![text];
     }
     let mut segments = Vec::new();
     let mut rest = text;
     loop {
-        if rest.len() <= avail {
+        if Columns::of(rest) <= avail {
             segments.push(rest);
             break;
         }
@@ -388,10 +571,10 @@ fn split_multiline_fold(text: &str, avail: usize, style: FoldStyle) -> Vec<&str>
 /// produces output that parses and round trips. One copy can be checked once.
 fn fold_lines(
     value: &str,
-    first_avail: usize,
-    cont_avail: usize,
-    mut avail_for: impl FnMut(&str, usize) -> usize,
-    mut choose_split: impl FnMut(&str, usize, bool) -> usize,
+    first_avail: Columns,
+    cont_avail: Columns,
+    mut avail_for: impl FnMut(&str, Columns) -> Columns,
+    mut choose_split: impl FnMut(&str, Columns, bool) -> usize,
     mut emit: impl FnMut(&str, bool, bool) -> String,
 ) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
@@ -408,7 +591,7 @@ fn fold_lines(
         // character or a visible character is forbidden in every context, so
         // every proposed split is backed off to the nearest legal one here,
         // once, rather than each fold path re-deriving the rule.
-        let split = if rest.len() <= avail {
+        let split = if Columns::of(rest) <= avail {
             0
         } else {
             floor_legal_split(rest, choose_split(rest, avail, first))
@@ -430,26 +613,26 @@ fn fold_lines(
 
 fn fold_bare_string(
     value: &str,
-    indent: usize,
-    first_line_extra: usize,
+    indent: FileIndent,
+    first_line_extra: Columns,
     opener_form: BareForm,
     style: FoldStyle,
-    wrap_width: Option<usize>,
+    wrap_width: Option<Columns>,
 ) -> Option<Vec<String>> {
     let w = wrap_width?;
     // First-line budget: indent + 1 (the one-sided opening quote) + first_line_extra.
     // The 1 is a constant and stays one: `opener_form` reaches the emitter below
     // and nothing else, because which glyph opens the string cannot move it. See
     // `bare_opener_glyph`.
-    let first_avail = w.saturating_sub(indent + 1 + first_line_extra);
-    if value.len() <= first_avail {
+    let first_avail = w.saturating_sub(indent.width() + Columns::new(1) + first_line_extra);
+    if Columns::of(value) <= first_avail {
         return None; // fits on one line, no fold needed
     }
-    let cont_avail = w.saturating_sub(indent + 2); // `/ ` prefix
-    if cont_avail < MIN_FOLD_CONTINUATION {
+    let cont_avail = w.saturating_sub(indent.width() + Columns::new(Marker::Fold.width()));
+    if cont_avail < Columns::new(MIN_FOLD_CONTINUATION) {
         return None; // too little room for useful continuation content
     }
-    let ind = spaces(indent);
+    let ind = indent.spaces();
 
     let lines = fold_lines(
         value,
@@ -479,7 +662,7 @@ fn fold_bare_string(
             if first {
                 format!("{}{}{}", ind, bare_opener_glyph(opener_form), segment)
             } else {
-                format!("{}/ {}", ind, segment)
+                format!("{ind}{}{segment}", Marker::Fold.text())
             }
         },
     );
@@ -487,35 +670,56 @@ fn fold_bare_string(
     if lines.len() <= 1 { None } else { Some(lines) }
 }
 
-/// Fold a bare key (no leading space) into multiple continuation lines.
-/// The caller must append `:` to the last returned line.
-/// Returns None if no fold is needed, impossible, or style is None.
+/// What a key's fold carries on its final line. Passed to the folder rather than
+/// appended after it: a folder that budgets for a suffix it does not write is
+/// trusting its caller to append exactly that much, and nothing holds the two
+/// together. Handing over the text makes the reservation and the writing one fact.
+const KEY_COLON: &str = ":";
+
+/// Fold a bare key (no leading space) into continuation lines, the last of which
+/// carries `tail`.
+///
+/// `None` when no fold is needed, none is possible, or the style forbids one.
 fn fold_bare_key(
     key: &str,
-    pair_indent: usize,
+    pair_indent: FileIndent,
     style: FoldStyle,
-    wrap_width: Option<usize>,
+    wrap_width: Option<Columns>,
+    tail: &str,
 ) -> Option<Vec<String>> {
     let w = wrap_width?;
     if matches!(style, FoldStyle::None) {
         return None;
     }
-    // key + colon fits — no fold needed
-    if key.len() < w.saturating_sub(pair_indent) {
+    // Key plus whatever the caller appends fits -- no fold needed.
+    //
+    // Stated as the tail's own width rather than as a strict `<`. The `<` reserved
+    // exactly one column, which is right for `:` and right for nothing else, so
+    // the guard held only as long as no caller passed a longer tail.
+    if Columns::of(key) + Columns::of(tail) <= w.saturating_sub(pair_indent.width()) {
         return None;
     }
-    let first_avail = w.saturating_sub(pair_indent);
-    let cont_avail = w.saturating_sub(pair_indent + 2); // `/ ` prefix
-    if cont_avail < MIN_FOLD_CONTINUATION {
+    let first_avail = w.saturating_sub(pair_indent.width());
+    let cont_avail = w.saturating_sub(pair_indent.width() + Columns::new(Marker::Fold.width()));
+    if cont_avail < Columns::new(MIN_FOLD_CONTINUATION) {
         return None;
     }
-    let ind = spaces(pair_indent);
+    let ind = pair_indent.spaces();
 
     let lines = fold_lines(
         key,
         first_avail,
         cont_avail,
-        |_rest, current| current,
+        // Whichever segment ends up last carries whatever the caller appends, so its
+        // budget is `tail_reserve` columns shorter than the others. Charged here
+        // rather than to every line, which would fold earlier than necessary.
+        |rest, current| {
+            if Columns::of(rest) <= current {
+                current.saturating_sub(Columns::of(tail))
+            } else {
+                current
+            }
+        },
         |rest, avail, _first| match style {
             FoldStyle::Auto => {
                 let candidate = &rest[..floor_safe_fold_point(rest, avail)];
@@ -524,11 +728,12 @@ fn fold_bare_key(
             }
             FoldStyle::Fixed | FoldStyle::None => floor_safe_fold_point(rest, avail),
         },
-        |segment, first, _last| {
+        |segment, first, last| {
+            let tail = if last { tail } else { "" };
             if first {
-                format!("{}{}", ind, segment)
+                format!("{}{}{}", ind, segment, tail)
             } else {
-                format!("{}/ {}", ind, segment)
+                format!("{ind}{}{segment}{tail}", Marker::Fold.text())
             }
         },
     );
@@ -536,31 +741,31 @@ fn fold_bare_key(
     if lines.len() <= 1 { None } else { Some(lines) }
 }
 
-/// Find a fold point in a number string at or before `avail` bytes.
-/// Auto mode: prefers splitting before `.` or `e`/`E` (keeping the semantic marker with the
-/// continuation); falls back to splitting between any two digits at the limit.
-/// Returns a byte offset (1..avail), or 0 if no valid point found.
+/// Fold a number across continuation lines.
+///
+/// `None` when it fits, when the style forbids folding, or when a continuation
+/// would have too little room to be worth one.
 fn fold_number(
     value: &str,
-    indent: usize,
-    first_line_extra: usize,
+    indent: FileIndent,
+    first_line_extra: Columns,
     style: FoldStyle,
-    wrap_width: Option<usize>,
+    wrap_width: Option<Columns>,
 ) -> Option<Vec<String>> {
     if matches!(style, FoldStyle::None) {
         return None;
     }
     let w = wrap_width?;
-    let first_avail = w.saturating_sub(indent + first_line_extra);
-    if value.len() <= first_avail {
+    let first_avail = w.saturating_sub(indent.width() + first_line_extra);
+    if Columns::of(value) <= first_avail {
         return None; // fits on one line
     }
-    let cont_avail = w.saturating_sub(indent + 2);
-    if cont_avail < MIN_FOLD_CONTINUATION {
+    let cont_avail = w.saturating_sub(indent.width() + Columns::new(Marker::Fold.width()));
+    if cont_avail < Columns::new(MIN_FOLD_CONTINUATION) {
         return None;
     }
     let auto_mode = matches!(style, FoldStyle::Auto);
-    let ind = spaces(indent);
+    let ind = indent.spaces();
 
     Some(fold_lines(
         value,
@@ -572,44 +777,56 @@ fn fold_number(
             if first {
                 format!("{}{}", ind, segment)
             } else {
-                format!("{}/ {}", ind, segment)
+                format!("{ind}{}{segment}", Marker::Fold.text())
             }
         },
     ))
 }
 
-/// Character class used by [`find_bare_fold_point`] to assign break priorities.
+/// Fold a JSON string across continuation lines, quotes included.
+///
+/// The delimiters are stripped before folding and put back by the emitter, which
+/// is the only part that knows about them -- so the budget arithmetic never has
+/// to remember whether the quotes are in the text it is measuring.
 fn fold_json_string(
     value: &str,
-    indent: usize,
-    first_line_extra: usize,
+    indent: FileIndent,
+    first_line_extra: Columns,
     style: FoldStyle,
-    wrap_width: Option<usize>,
+    wrap_width: Option<Columns>,
+    tail: &str,
 ) -> Option<Vec<String>> {
     let w = wrap_width?;
     let encoded = render_json_string(value);
-    let first_avail = w.saturating_sub(indent + first_line_extra);
-    if encoded.len() <= first_avail {
-        return None; // fits on one line
+    let first_avail = w.saturating_sub(indent.width() + first_line_extra);
+    // `tail` counts here, not just inside the fold loop below. This asked whether
+    // the value fits and answered for text one character shorter than the line
+    // that gets written -- so a key exactly filling the margin reported "no fold
+    // needed", and the caller's `:` then pushed the line one column over. The
+    // whole reason the tail is handed to this function rather than appended after
+    // it is that the reservation and the writing should be one fact; the early
+    // return was the one place that still separated them.
+    if Columns::of(&encoded) + Columns::of(tail) <= first_avail {
+        return None; // fits on one line, tail included
     }
-    let cont_avail = w.saturating_sub(indent + 2);
-    if cont_avail < MIN_FOLD_CONTINUATION {
+    let cont_avail = w.saturating_sub(indent.width() + Columns::new(Marker::Fold.width()));
+    if cont_avail < Columns::new(MIN_FOLD_CONTINUATION) {
         return None;
     }
     // Work on the content between the delimiters; the quotes are put back by
     // the emitter, which is the only part that knows about them.
     let inner = &encoded[1..encoded.len() - 1];
-    let ind = spaces(indent);
+    let ind = indent.spaces();
 
     let lines = fold_lines(
         inner,
-        first_avail.saturating_sub(1), // the opening `"` costs a column
+        first_avail.saturating_sub(Columns::new(1)), // the opening `"` costs a column
         cont_avail,
-        // The final segment has to leave room for the closing `"`. This is the
-        // only caller that needs the hook.
+        // The final segment has to leave room for the closing `"`, plus whatever the
+        // caller appends after it -- a key's colon, nothing for a plain value.
         |rest, current| {
-            if rest.len() <= current {
-                current.saturating_sub(1)
+            if Columns::of(rest) <= current {
+                current.saturating_sub(Columns::new(1) + Columns::of(tail))
             } else {
                 current
             }
@@ -625,10 +842,10 @@ fn fold_json_string(
             }
         },
         |segment, first, last| match (first, last) {
-            (true, true) => format!("{}\"{}\"", ind, segment),
+            (true, true) => format!("{}\"{}\"{}", ind, segment, tail),
             (true, false) => format!("{}\"{}", ind, segment),
-            (false, true) => format!("{}/ {}\"", ind, segment),
-            (false, false) => format!("{}/ {}", ind, segment),
+            (false, true) => format!("{ind}{}{segment}\"{tail}", Marker::Fold.text()),
+            (false, false) => format!("{ind}{}{segment}", Marker::Fold.text()),
         },
     );
 
@@ -636,8 +853,8 @@ fn fold_json_string(
 }
 
 /// Count consecutive backslashes immediately before `pos` in `bytes`.
-fn render_folding_quotes(value: &str, indent: usize, options: &RenderOptions) -> Vec<String> {
-    let ind = spaces(indent);
+fn render_folding_quotes(value: &str, indent: FileIndent, options: &RenderOptions) -> Vec<String> {
+    let ind = indent.spaces();
     let pieces: Vec<&str> = value.split('\n').collect();
     // Encode each piece's inner content (no outer quotes, no \n — we add \n explicitly).
     let mut lines: Vec<String> = Vec::new();
@@ -661,17 +878,17 @@ fn render_folding_quotes(value: &str, indent: usize, options: &RenderOptions) ->
                 // by at least one data character." Close on the previous line instead.
                 lines.last_mut().expect("first piece always pushes a line").push('"');
             } else {
-                lines.push(format!("{}/ {}\"", ind, inner));
+                lines.push(format!("{ind}{}{inner}\"", Marker::Fold.text()));
             }
         } else {
-            lines.push(format!("{}/ {}{}", ind, inner, nl));
+            lines.push(format!("{ind}{}{inner}{nl}", Marker::Fold.text()));
         }
         // Width-fold within this piece if the line is still too wide
         // and string_multiline_fold_style is not None.
         if !matches!(options.string_multiline_fold_style, FoldStyle::None)
             && let Some(w) = options.wrap_width {
                 let last = lines.last().unwrap();
-                if last.len() > w {
+                if Columns::of(last) > Columns::new(w) {
                     // The piece itself overflows; leave it long — within-piece folding
                     // of JSON strings mid-escape is not safe to split here.
                     // Future: could re-fold the piece using fold_json_string.
@@ -711,29 +928,29 @@ pub(crate) struct Renderer<T: Tree>(PhantomData<T>);
 impl<T: Tree> Renderer<T> {
     pub(crate) fn render(value: &T, options: &RenderOptions) -> String {
         let mut lines = Vec::new();
-        emit_comments(value.comments_before(), options.start_indent, options, &mut lines);
-        lines.extend(Self::render_root(value, options, options.start_indent));
-        emit_comments(value.trailing_comments(), 0, options, &mut lines);
+        emit_comments(value.comments_before(), FileIndent::new(options.start_indent), options, &mut lines);
+        lines.extend(Self::render_root(value, options, FileIndent::new(options.start_indent)));
+        emit_comments(value.trailing_comments(), FileIndent::ROOT, options, &mut lines);
         lines.join(options.eol.as_str())
     }
 
     fn render_root(
         value: &T,
         options: &RenderOptions,
-        start_indent: usize,
+        start_indent: FileIndent,
     ) -> Vec<String> {
         match value.node() {
-            NodeRef::Null => Self::render_scalar_lines(BasicValue::Null, start_indent, options),
-            NodeRef::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(b), start_indent, options),
-            NodeRef::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), start_indent, options),
+            NodeRef::Null => Self::render_scalar_lines(BasicValue::Null, start_indent, Columns::ZERO, options),
+            NodeRef::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(b), start_indent, Columns::ZERO, options),
+            NodeRef::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), start_indent, Columns::ZERO, options),
             NodeRef::String(s) => {
-                Self::render_scalar_lines(BasicValue::String(s, value.string_form()), start_indent, options)
+                Self::render_scalar_lines(BasicValue::String(s, value.string_form()), start_indent, Columns::ZERO, options)
             }
             NodeRef::Array([]) => {
-                Self::render_scalar_lines(BasicValue::EmptyArray, start_indent, options)
+                Self::render_scalar_lines(BasicValue::EmptyArray, start_indent, Columns::ZERO, options)
             }
             NodeRef::Object([]) => {
-                Self::render_scalar_lines(BasicValue::EmptyObject, start_indent, options)
+                Self::render_scalar_lines(BasicValue::EmptyObject, start_indent, Columns::ZERO, options)
             }
             NodeRef::Array(values) if effective_force_markers(options) => {
                 Self::render_explicit_array(values, start_indent, value.table_opinion(), options)
@@ -752,10 +969,10 @@ impl<T: Tree> Renderer<T> {
 
     fn render_implicit_object(
         entries: &[T::Entry],
-        parent_indent: usize,
+        parent_indent: FileIndent,
         options: &RenderOptions,
     ) -> Vec<String> {
-        let pair_indent = parent_indent + 2;
+        let pair_indent = parent_indent.deeper(1);
         let mut lines = Vec::new();
         let mut packed_line = String::new();
 
@@ -776,11 +993,20 @@ impl<T: Tree> Renderer<T> {
             if effective_inline_objects(options)
                 && let Some(token) = Self::render_inline_object_token(key, key_form, value, options) {
                     let candidate = if packed_line.is_empty() {
-                        format!("{}{}", spaces(pair_indent), token)
+                        format!("{}{}", pair_indent.spaces(), token)
                     } else {
-                        format!("{packed_line}{}{token}", spaces(options.kv_pack_multiple * 2))
+                        format!("{packed_line}{}{token}", Spaces::new(options.kv_pack_multiple * LEVEL))
                     };
                     if fits_wrap(options, &candidate) {
+                        // Inlining takes away the value's own line, so its comments
+                        // move to the line the pair lands on -- above it, after the
+                        // key's, since the key is to its left. Emitted only once the
+                        // inline is committed: on the fall-through below the value
+                        // still gets a line and `render_object_entry` emits them
+                        // against it instead.
+                        if options.render_comments {
+                            emit_comments(value.comments_before(), pair_indent.deeper(1), options, &mut lines);
+                        }
                         packed_line = candidate;
                         continue;
                     }
@@ -803,15 +1029,18 @@ impl<T: Tree> Renderer<T> {
         lines
     }
 
-    /// Render one key-value pair at `pair_indent`. Handles key folding: if the key itself
-    /// needs to fold across lines, the value is either attached to the last key fold line
-    /// (if it fits) or emitted as a `/ ` continuation after a bare `key:` line. When the
-    /// key does not fold, delegates directly to `render_object_entry_body`.
+    /// Render one key-value pair at `pair_indent`.
+    ///
+    /// Owns the key's line -- folded or not -- and asks [`Self::place_value`] what the
+    /// value does with it. The folded and unfolded cases differ only in what the key
+    /// line holds and which column the value would start at; the composition below is
+    /// the same for both, which is what keeps a folded key from being a second layout
+    /// engine with its own opinions.
     fn render_object_entry(
         key: &str,
         key_form: Option<KeyForm>,
         value: &T,
-        pair_indent: usize,
+        pair_indent: FileIndent,
         options: &RenderOptions,
     ) -> Vec<String> {
         let key_text = render_key_form(key, key_form, options);
@@ -819,93 +1048,186 @@ impl<T: Tree> Renderer<T> {
         // the *result* keeps honored forms and global policy on one code path.
         let is_bare = !key_text.starts_with('"');
 
-        let key_fold_enabled = if is_bare {
-            options.string_bare_fold_style != FoldStyle::None
-        } else {
-            options.string_quoted_fold_style != FoldStyle::None
-        };
-
-        // Key fold lines — last line gets ":" appended before the value.
+        // Key fold lines -- the last one gets ":" appended before the value.
         // Bare keys use string_bare_fold_style; quoted keys use string_quoted_fold_style.
         // Only the first (standalone) key on a line is ever folded; inline-packed keys
         // are not candidates (they are rendered via render_inline_object_token, not here).
+        //
+        // `None` here means "no fold needed" as much as it means "folding is off" --
+        // `fold_bare_key` returns it when the key already fits, the same way
+        // `fold_bare_string` does. So the ordinary unfolded pair is the `None` arm.
         let key_fold: Option<Vec<String>> =
             if is_bare && options.string_bare_fold_style != FoldStyle::None {
-                fold_bare_key(&key_text, pair_indent, options.string_bare_fold_style, options.wrap_width)
+                fold_bare_key(&key_text, pair_indent, options.string_bare_fold_style, wrap_budget(options), KEY_COLON)
             } else if !is_bare && options.string_quoted_fold_style != FoldStyle::None {
-                fold_json_string(key, pair_indent, 0, options.string_quoted_fold_style, options.wrap_width)
+                fold_json_string(
+                    key,
+                    pair_indent,
+                    Columns::ZERO,
+                    options.string_quoted_fold_style,
+                    wrap_budget(options),
+                    KEY_COLON,
+                )
             } else {
                 None
             };
 
-        if let Some(mut fold_lines) = key_fold {
-            // Key itself folds across multiple lines. Determine available space on the last fold
-            // line (after appending ":") and attach the value there or as a fold continuation.
-            let last_fold_line = fold_lines.last().unwrap();
-            // last_fold_line is like "  / lastpart" — pair_indent + "/ " + content.
-            // Available width after appending ":" = wrap_width - last_fold_line.len() - 1
-            let after_colon_avail = options.wrap_width
-                .map(|w| w.saturating_sub(last_fold_line.len() + 1))
-                .unwrap_or(usize::MAX);
-
-            let normal = Self::render_object_entry_body(&key_text, value, pair_indent, key_fold_enabled, options);
-            let key_prefix = format!("{}{}:", spaces(pair_indent), key_text);
-            let suffix = normal[0].strip_prefix(&key_prefix).unwrap_or("").to_owned();
-
-            // Check if the value suffix fits on the last fold line, or needs its own continuation
-            if suffix.is_empty() || after_colon_avail >= suffix.len() {
-                // Value fits (or is empty: non-scalar like arrays/objects start on the next line)
-                let last = fold_lines.pop().unwrap();
-                fold_lines.push(format!("{}:{}", last, suffix));
-                fold_lines.extend(normal.into_iter().skip(1));
-            } else {
-                // Value doesn't fit on the last key fold line — fold after colon.
-                let Some(bv) = basic_value(value) else {
-                    unreachable!("non-empty arrays/objects always render with empty suffix so suffix.is_empty() is true for them and this branch is unreachable")
-                };
-                let cont_lines = Self::render_scalar_value_continuation_lines(bv, pair_indent, options);
-                let last = fold_lines.pop().unwrap();
-                fold_lines.push(format!("{}:", last));
-                let first_cont = &cont_lines[0][pair_indent..];
-                fold_lines.push(format!("{}/ {}", spaces(pair_indent), first_cont));
-                fold_lines.extend(cont_lines.into_iter().skip(1));
+        // The key's line through its colon, and the column the value would start at.
+        // For a folded key that is the last continuation line rather than the first
+        // line -- which is the whole point: every width decision below is then made
+        // against the line that will actually be emitted, not against a hypothetical
+        // unfolded one.
+        let key_folded = key_fold.is_some();
+        let (mut lines, key_line) = match key_fold {
+            None => (Vec::new(), format!("{}{}:", pair_indent.spaces(), key_text)),
+            Some(mut fold_lines) => {
+                // The folder already put the colon on this line, and budgeted for it.
+                let last = fold_lines.pop().expect("a key fold always yields at least one line");
+                (fold_lines, last)
             }
-            return fold_lines;
-        }
+        };
+        let value_column = Columns::of(&key_line);
 
-        Self::render_object_entry_body(&key_text, value, pair_indent, key_fold_enabled, options)
+        // Hoisting above "the key's line" means above the *whole* key. A folded key
+        // has already put its earlier continuation lines into `lines`, and a comment
+        // may never sit inside a fold -- so these go in front of all of it. Unfolded,
+        // `lines` is empty and this is an ordinary append.
+        //
+        // Landing next to the key's own comments does not merge with them: those sit
+        // at the key's column and these at `n+2`, and the column is what says which
+        // one a comment belongs to.
+        let hoist_above_key = |lines: &mut Vec<String>| {
+            let mut hoisted = Vec::new();
+            emit_comments(value.comments_before(), pair_indent.deeper(1), options, &mut hoisted);
+            lines.splice(0..0, hoisted);
+        };
+
+        match Self::place_value(value, pair_indent, value_column, key_folded, options) {
+            // A key and its value are two things, so each carries its own comments,
+            // and every arm here has to say where the value's go -- all four of them.
+            // Only `Below` leaves the value a line of its own to sit above. The rest
+            // put it on the key's line, so its comments hoist above that line.
+            //
+            // They are emitted one level in from the key either way, because a
+            // comment's indent names the depth it refers to and a value is always
+            // `+2` from its key. At the key's own level they would re-read as the
+            // key's on the next parse.
+            ValuePlacement::OnKeyLine { after_colon } => {
+                hoist_above_key(&mut lines);
+                lines.push(key_line + &after_colon);
+            }
+            ValuePlacement::OpensOnKeyLine { opener, below } => {
+                hoist_above_key(&mut lines);
+                lines.push(key_line + &opener);
+                lines.extend(below);
+            }
+            ValuePlacement::Below { lines: below } => {
+                lines.push(key_line);
+                // Here the value does get its own line, so its comments sit between
+                // the key and the value rather than above the pair.
+                emit_comments(value.comments_before(), pair_indent, options, &mut lines);
+                lines.extend(below);
+            }
+        }
+        lines
     }
 
     /// Render a scalar value's lines for use as fold-after-colon continuation(s).
-    /// The first line uses `first_line_extra = 2` (the "/ " prefix overhead) so that
+    /// The first line charges itself `Marker::Fold`'s width, the "/ " prefix it will
+    /// carry, so that
     /// content is correctly fitted to `wrap_width - pair_indent - 2 - (leading space if bare)`.
     /// The caller prefixes the first element's content (after stripping `pair_indent`) with "/ ".
     fn render_scalar_value_continuation_lines(
         value: BasicValue<'_>,
-        pair_indent: usize,
+        pair_indent: FileIndent,
         options: &RenderOptions,
     ) -> Vec<String> {
         match value {
-            BasicValue::String(s, form) => Self::render_string_lines(s, form, pair_indent, 2, options),
+            BasicValue::String(s, form) => Self::render_string_lines(
+                s,
+                form,
+                pair_indent,
+                Columns::new(Marker::Fold.width()),
+                options,
+            ),
             BasicValue::Number(n) => {
                 let ns = n.to_string();
-                fold_number(&ns, pair_indent, 2, options.number_fold_style, options.wrap_width)
-                    .unwrap_or_else(|| vec![format!("{}{}", spaces(pair_indent), ns)])
+                fold_number(
+                    &ns,
+                    pair_indent,
+                    Columns::new(Marker::Fold.width()),
+                    options.number_fold_style,
+                    wrap_budget(options),
+                )
+                    .unwrap_or_else(|| vec![format!("{}{}", pair_indent.spaces(), ns)])
             }
-            BasicValue::Null => vec![format!("{}null", spaces(pair_indent))],
-            BasicValue::Bool(b) => vec![format!("{}{}", spaces(pair_indent), if b { "true" } else { "false" })],
-            BasicValue::EmptyArray => vec![format!("{}[]", spaces(pair_indent))],
-            BasicValue::EmptyObject => vec![format!("{}{{}}", spaces(pair_indent))],
+            BasicValue::Null => vec![format!("{}null", pair_indent.spaces())],
+            BasicValue::Bool(b) => vec![format!("{}{}", pair_indent.spaces(), if b { "true" } else { "false" })],
+            BasicValue::EmptyArray => vec![format!("{}[]", pair_indent.spaces())],
+            BasicValue::EmptyObject => vec![format!("{}{{}}", pair_indent.spaces())],
         }
     }
 
-    fn render_object_entry_body(
-        key_text: &str,
-        value: &T,
-        pair_indent: usize,
-        key_fold_enabled: bool,
+    /// Wrap `body` in `/<` ... `/>`, placing the opener where the marker style says.
+    ///
+    /// `Compact` puts it on the key's line and `Separate` on its own, and that is the
+    /// whole of the decision -- it does not consult the width, and it does not care
+    /// whether the key folded. A compact opener on a folded key's last continuation
+    /// reads fine and reparses, so there is nothing here for the margin to overrule.
+    fn place_indent_glyph(
+        body: Vec<String>,
+        pair_indent: FileIndent,
+        value_column: Columns,
+        key_folded: bool,
         options: &RenderOptions,
-    ) -> Vec<String> {
+    ) -> ValuePlacement {
+        // Settle the arrangement before touching `body`, so it is moved once and
+        // never copied. Sharing the separate branch between the two arms as a
+        // closure reads better and deep-clones every line of the rendered subtree
+        // to do it, once per node.
+        let on_key_line = match options.indent_glyph_marker_style {
+            // `: /<` is a reading cue, not decoration: the colon says which key is
+            // moving and the glyph says its contents are what moved. Worth running
+            // past the margin to keep -- but not worth folding a key that had no
+            // other reason to fold, because then the cue costs a line break in the
+            // key itself, which is the more expensive thing to make a reader follow.
+            IndentGlyphMarkerStyle::Compact => {
+                let overruns = options
+                    .wrap_width
+                    .is_some_and(|w| value_column + Columns::of(Glyph::IndentOpen.text()) > Columns::new(w));
+                key_folded || !overruns
+            }
+            IndentGlyphMarkerStyle::Separate => false,
+        };
+
+        let closer = Glyph::IndentClose.at(pair_indent.spaces());
+        if on_key_line {
+            let mut below = body;
+            below.push(closer);
+            ValuePlacement::OpensOnKeyLine { opener: Glyph::IndentOpen.text().to_owned(), below }
+        } else {
+            let mut lines = Vec::with_capacity(body.len() + 2);
+            lines.push(Glyph::IndentOpen.at(pair_indent.spaces()));
+            lines.extend(body);
+            lines.push(closer);
+            ValuePlacement::Below { lines }
+        }
+    }
+
+    /// Lay out `value` for a key at `pair_indent`, given the column its first character
+    /// would occupy -- that is, the length of the key's line through its colon.
+    ///
+    /// Renders no key. The caller owns the key's line, because only the caller knows
+    /// whether the key folded and where its last continuation ends. Whether an
+    /// overflowing scalar may take a `/ ` continuation of its own is asked of the
+    /// value here, through [`may_take_a_continuation`].
+    fn place_value(
+        value: &T,
+        pair_indent: FileIndent,
+        value_column: Columns,
+        key_folded: bool,
+        options: &RenderOptions,
+    ) -> ValuePlacement {
         match value.node() {
             NodeRef::Array(values) if !values.is_empty() => {
                 if let Some(forced) = resolve_table_attempt(value.table_opinion(), options)
@@ -914,47 +1236,42 @@ impl<T: Tree> Renderer<T> {
                             let Some(offset_lines) = Self::render_table(values, target_indent, forced, options) else {
                                 unreachable!("table re-render at offset indent always succeeds");
                             };
-                            let key_line = format!("{}{}", spaces(pair_indent), key_text);
-                            let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
+                            let mut body = Vec::new();
                             if effective_force_markers(options) {
-                                let elem_indent = target_indent + 2;
+                                let elem_indent = target_indent.deeper(1);
                                 let first = offset_lines.first()
                                     .expect("render_table always returns at least a header line");
-                                let stripped = first.get(elem_indent..)
+                                let stripped = elem_indent.strip(first)
                                     .expect("table line starts at elem_indent");
-                                lines.push(format!("{}[ {}", spaces(target_indent), stripped));
-                                lines.extend(offset_lines.into_iter().skip(1));
+                                body.push(indent_marked(target_indent.deeper(1), Marker::Array) + stripped);
+                                body.extend(offset_lines.into_iter().skip(1));
                             } else {
-                                lines.extend(offset_lines);
+                                body.extend(offset_lines);
                             }
-                            lines.push(format!("{} />", spaces(pair_indent)));
-                            return lines;
+                            return Self::place_indent_glyph(body, pair_indent, value_column, key_folded, options);
                         }
-                        let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
+                        let mut lines = Vec::new();
                         if effective_force_markers(options) {
-                            let elem_indent = pair_indent + 2;
+                            let elem_indent = pair_indent.deeper(1);
                             let first = table_lines.first()
                                 .expect("render_table always returns at least a header line");
-                            let stripped = first.get(elem_indent..)
+                            let stripped = elem_indent.strip(first)
                                 .expect("table line starts at elem_indent");
-                            lines.push(format!("{}[ {}", spaces(pair_indent), stripped));
+                            lines.push(indent_marked(pair_indent.deeper(1), Marker::Array) + stripped);
                             lines.extend(table_lines.into_iter().skip(1));
                         } else {
                             lines.extend(table_lines);
                         }
-                        return lines;
+                        return ValuePlacement::Below { lines };
                     }
 
                 if should_use_indent_glyph(value, pair_indent, options) {
-                    let key_line = format!("{}{}", spaces(pair_indent), key_text);
-                    let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
-                    if values.first().is_some_and(needs_explicit_array_marker) {
-                        lines.extend(Self::render_explicit_array(values, 2, value.table_opinion(), options));
+                    let body = if values.first().is_some_and(needs_explicit_array_marker) {
+                        Self::render_explicit_array(values, FileIndent::ROOT.deeper(1), value.table_opinion(), options)
                     } else {
-                        lines.extend(Self::render_array_children(values, 2, options));
-                    }
-                    lines.push(format!("{} />", spaces(pair_indent)));
-                    return lines;
+                        Self::render_array_children(values, FileIndent::ROOT.deeper(1), options)
+                    };
+                    return Self::place_indent_glyph(body, pair_indent, value_column, key_folded, options);
                 }
 
                 if effective_inline_arrays(options) {
@@ -971,14 +1288,31 @@ impl<T: Tree> Renderer<T> {
                         // up. Spec: "it usually looks better to just start on the next
                         // line if it doesn't all fit on one line with the key, so the
                         // default is to do that". Both remain legal to parse.
-                        if let Some(lines) = Self::render_packed_array_lines(
+                        //
+                        // The prefix is spaces rather than the key's text because this
+                        // function never sees the key. Its *length* is all the packer
+                        // needs, and slicing the result back off at `value_column` is
+                        // exact rather than a search: we chose that prefix ourselves.
+                        // The two extra columns are the array's own start position --
+                        // the same two it would occupy as indentation on its own line.
+                        // One line *and* within the margin. The line count alone was
+                        // standing in for the width, which holds only while the
+                        // packer would have wrapped had the elements not fitted --
+                        // and a single element has nothing to wrap, so it came back
+                        // as one line at any width and was taken as fitting. A
+                        // one-element array then sat on the key's line past the
+                        // margin while a three-element one correctly went below.
+                        if let Some(packed) = Self::render_packed_array_lines(
                             values,
-                            format!("{}{}:  ", spaces(pair_indent), key_text),
-                            pair_indent + 2,
+                            (value_column + Columns::new(LEVEL)).spaces().to_string(),
+                            pair_indent.deeper(1),
                             options,
-                        ) && lines.len() == 1
+                        ) && packed.len() == 1
+                            && fits_wrap(options, &packed[0])
                         {
-                            return lines;
+                            let after_colon =
+                                packed[0][value_column.spent_in(&packed[0])..].to_owned();
+                            return ValuePlacement::OnKeyLine { after_colon };
                         }
                         // Not taken under `force_markers`. The array above fits
                         // on the key's line, so its `  ` opener is the inline
@@ -995,101 +1329,90 @@ impl<T: Tree> Renderer<T> {
                         if !effective_force_markers(options)
                             && let Some(packed) = Self::render_packed_array_lines(
                                 values,
-                                spaces(pair_indent + 2),
-                                pair_indent + 2,
+                                pair_indent.deeper(1).spaces().to_string(),
+                                pair_indent.deeper(1),
                                 options,
                             )
                         {
-                            let mut lines =
-                                vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                            lines.extend(packed);
-                            return lines;
+                            return ValuePlacement::Below { lines: packed };
                         }
                     }
                 }
 
-                let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                if values.first().is_some_and(needs_explicit_array_marker) || effective_force_markers(options) {
-                    lines.extend(Self::render_explicit_array(
-                        values,
-                        pair_indent,
-                        value.table_opinion(),
-                        options,
-                    ));
+                let lines = if values.first().is_some_and(needs_explicit_array_marker)
+                    || effective_force_markers(options)
+                {
+                    Self::render_explicit_array(values, pair_indent, value.table_opinion(), options)
                 } else {
-                    lines.extend(Self::render_array_children(
-                        values,
-                        pair_indent + 2,
-                        options,
-                    ));
-                }
-                lines
+                    Self::render_array_children(values, pair_indent.deeper(1), options)
+                };
+                ValuePlacement::Below { lines }
             }
             NodeRef::Object(entries) if !entries.is_empty() => {
                 if should_use_indent_glyph(value, pair_indent, options) {
-                    let key_line = format!("{}{}", spaces(pair_indent), key_text);
-                    let mut lines = indent_glyph_open_lines(&key_line, pair_indent, options);
-                    lines.extend(Self::render_implicit_object(entries, 0, options));
-                    lines.push(format!("{} />", spaces(pair_indent)));
-                    return lines;
+                    let body = Self::render_implicit_object(entries, FileIndent::ROOT, options);
+                    return Self::place_indent_glyph(body, pair_indent, value_column, key_folded, options);
                 }
 
-                let mut lines = vec![format!("{}{}:", spaces(pair_indent), key_text)];
-                if effective_force_markers(options) {
-                    lines.extend(Self::render_explicit_object(entries, pair_indent, options));
+                let lines = if effective_force_markers(options) {
+                    Self::render_explicit_object(entries, pair_indent, options)
                 } else {
-                    lines.extend(Self::render_implicit_object(entries, pair_indent, options));
-                }
-                lines
+                    Self::render_implicit_object(entries, pair_indent, options)
+                };
+                ValuePlacement::Below { lines }
             }
             _ => {
-                let bv = match value.node() {
-                    NodeRef::Null => BasicValue::Null,
-                    NodeRef::Bool(b) => BasicValue::Bool(b),
-                    NodeRef::Number(n) => BasicValue::Number(n),
-                    NodeRef::String(s) => BasicValue::String(s, value.string_form()),
-                    NodeRef::Array(_) => BasicValue::EmptyArray,
-                    NodeRef::Object(_) => BasicValue::EmptyObject,
-                };
-                let scalar_lines = match bv {
-                    BasicValue::String(s, form) => {
-                        Self::render_string_lines(s, form, pair_indent, key_text.len() + 1, options)
-                    }
-                    _ => Self::render_scalar_lines(bv, pair_indent, options),
-                };
-                let first = scalar_lines[0].clone();
-                let value_suffix = &first[pair_indent..]; // " value" for bare string, "value" for others
+                let bv = basic_value(value).expect("every remaining node is a basic value");
+                // How much of this line the key has already spent. A folded key spends
+                // its last continuation, an unfolded one spends `indent + key + ':'`.
+                let first_line_extra = value_column.saturating_sub(pair_indent.width());
+                let scalar_lines = Self::render_scalar_lines(bv, pair_indent, first_line_extra, options);
+                let value_suffix = pair_indent.strip(&scalar_lines[0]).unwrap_or("");
 
-                // Check if "key: value" assembled first line overflows wrap_width.
-                // If so, and key fold is enabled, fold after the colon: key on its own line,
-                // value as a "/ " continuation at pair_indent.
-                let assembled_len = pair_indent + key_text.len() + 1 + value_suffix.len();
-                if key_fold_enabled
+                // If `key: value` would overrun the margin and folding is available, the
+                // value takes a `/ ` line of its own instead of sharing the key's.
+                //
+                // Asked of the value. This read `fold_enabled`, computed at the key's
+                // site from the **key's** fold style -- so a 60-digit number after a
+                // 27-character bare key stayed on a 90-column line at a 40-column
+                // margin, because bare-string *key* folding happened to be off. The
+                // continuation it was never offered had 36 columns free.
+                let assembled_len = value_column + Columns::of(value_suffix);
+                if may_take_a_continuation(bv, options)
                     && let Some(w) = options.wrap_width
-                        && assembled_len > w {
-                            let cont_lines = Self::render_scalar_value_continuation_lines(bv, pair_indent, options);
-                            let key_line = format!("{}{}:", spaces(pair_indent), key_text);
-                            let first_cont = &cont_lines[0][pair_indent..];
-                            let mut lines = vec![key_line, format!("{}/ {}", spaces(pair_indent), first_cont)];
+                        && assembled_len > Columns::new(w)
+                        // ...and the value is what pushes it over. When the key's
+                        // line does not fit on its own, moving the value below
+                        // leaves that line just as long and spends an extra one to
+                        // do it -- a one-digit value under a key that already
+                        // overflows buys a single column for a whole line.
+                        && value_column <= Columns::new(w) {
+                            let cont_lines =
+                                Self::render_scalar_value_continuation_lines(bv, pair_indent, options);
+                            let first_cont = pair_indent.strip(&cont_lines[0]).unwrap_or("");
+                            let mut lines = vec![(indent_marked(pair_indent.deeper(1), Marker::Fold) + first_cont)];
                             lines.extend(cont_lines.into_iter().skip(1));
-                            return lines;
+                            return ValuePlacement::Below { lines };
                         }
 
-                let mut lines = vec![format!(
-                    "{}{}:{}",
-                    spaces(pair_indent),
-                    key_text,
-                    value_suffix
-                )];
-                lines.extend(scalar_lines.into_iter().skip(1));
-                lines
+                let after_colon = value_suffix.to_owned();
+                if scalar_lines.len() == 1 {
+                    ValuePlacement::OnKeyLine { after_colon }
+                } else {
+                    // A multiline string's glyph, or a folded string's first segment:
+                    // the value opens here and the rest of it lives below.
+                    ValuePlacement::OpensOnKeyLine {
+                        opener: after_colon,
+                        below: scalar_lines.into_iter().skip(1).collect(),
+                    }
+                }
             }
         }
     }
 
     fn render_implicit_array(
         values: &[T],
-        parent_indent: usize,
+        parent_indent: FileIndent,
         opinion: Option<bool>,
         options: &RenderOptions,
     ) -> Vec<String> {
@@ -1101,14 +1424,14 @@ impl<T: Tree> Renderer<T> {
         if effective_inline_arrays(options) && !values.first().is_some_and(needs_explicit_array_marker)
             && let Some(lines) = Self::render_packed_array_lines(
                 values,
-                spaces(parent_indent + 2),
-                parent_indent + 2,
+                parent_indent.deeper(1).spaces().to_string(),
+                parent_indent.deeper(1),
                 options,
             ) {
                 return lines;
             }
 
-        let elem_indent = parent_indent + 2;
+        let elem_indent = parent_indent.deeper(1);
         let element_lines: Vec<Vec<String>> = values
             .iter()
             .map(|value| Self::render_array_element(value, elem_indent, options))
@@ -1119,9 +1442,9 @@ impl<T: Tree> Renderer<T> {
             let first = &element_lines[0];
             let first_line = first.first()
                 .expect("render_array_element always returns at least one line");
-            let stripped = first_line.get(elem_indent..)
+            let stripped = elem_indent.strip(first_line)
                 .expect("array element line is indented at elem_indent");
-            lines.push(format!("{}[ {}", spaces(parent_indent), stripped));
+            lines.push(indent_marked(parent_indent.deeper(1), Marker::Array) + stripped);
             lines.extend(first.iter().skip(1).cloned());
             for (value, extra) in values.iter().zip(element_lines.iter()).skip(1) {
                 emit_comments(value.comments_before(), elem_indent, options, &mut lines);
@@ -1140,11 +1463,11 @@ impl<T: Tree> Renderer<T> {
 
     fn render_array_children(
         values: &[T],
-        elem_indent: usize,
+        elem_indent: FileIndent,
         options: &RenderOptions,
     ) -> Vec<String> {
         let mut lines = Vec::new();
-        let table_row_prefix = format!("{}|", spaces(elem_indent));
+        let table_row_prefix = format!("{}|", elem_indent.spaces());
         for value in values {
             // prev_was_table is judged before comment lines go in: comment lines are
             // ignorable inside tables on reparse, so two tables separated only by a
@@ -1156,8 +1479,8 @@ impl<T: Tree> Renderer<T> {
             if prev_was_table && curr_is_table {
                 // Two consecutive tables: the second needs a `[ ` marker to separate them.
                 let first = elem_lines.first().unwrap();
-                let stripped = &first[elem_indent..]; // e.g. "|col  |..."
-                lines.push(format!("{}[ {}", spaces(elem_indent.saturating_sub(2)), stripped));
+                let stripped = elem_indent.strip(&first).unwrap_or(""); // e.g. "|col  |..."
+                lines.push(format!("{}{}{stripped}", elem_indent.shallower(1).spaces(), Marker::Array.text()));
                 lines.extend(elem_lines.into_iter().skip(1));
             } else {
                 lines.extend(elem_lines);
@@ -1168,7 +1491,7 @@ impl<T: Tree> Renderer<T> {
 
     fn render_explicit_array(
         values: &[T],
-        marker_indent: usize,
+        marker_indent: FileIndent,
         opinion: Option<bool>,
         options: &RenderOptions,
     ) -> Vec<String> {
@@ -1176,12 +1499,12 @@ impl<T: Tree> Renderer<T> {
             && let Some(lines) = Self::render_table(values, marker_indent, forced, options) {
                 // Always prepend "[ " — render_explicit_array always needs its marker,
                 // whether the elements render as a table or in any other form.
-                let elem_indent = marker_indent + 2;
+                let elem_indent = marker_indent.deeper(1);
                 let first = lines.first()
                     .expect("render_table always returns at least a header line");
-                let stripped = first.get(elem_indent..)
+                let stripped = elem_indent.strip(first)
                     .expect("table line starts at elem_indent");
-                let mut out = vec![format!("{}[ {}", spaces(marker_indent), stripped)];
+                let mut out = vec![(indent_marked(marker_indent.deeper(1), Marker::Array) + stripped)];
                 out.extend(lines.into_iter().skip(1));
                 return out;
             }
@@ -1189,14 +1512,14 @@ impl<T: Tree> Renderer<T> {
         if effective_inline_arrays(options)
             && let Some(lines) = Self::render_packed_array_lines(
                 values,
-                format!("{}[ ", spaces(marker_indent)),
-                marker_indent + 2,
+                indent_marked(marker_indent.deeper(1), Marker::Array),
+                marker_indent.deeper(1),
                 options,
             ) {
                 return lines;
             }
 
-        let elem_indent = marker_indent + 2;
+        let elem_indent = marker_indent.deeper(1);
         let element_lines: Vec<Vec<String>> = values
             .iter()
             .map(|value| Self::render_array_element(value, elem_indent, options))
@@ -1205,13 +1528,13 @@ impl<T: Tree> Renderer<T> {
             .unwrap_or_else(|| unreachable!("render_explicit_array called with empty values"));
         let first_line = first.first()
             .expect("render_array_element always returns at least one line");
-        let stripped = first_line.get(elem_indent..)
+        let stripped = elem_indent.strip(first_line)
             .expect("array element line is indented at elem_indent");
         let mut lines = Vec::new();
         // A first element's comments precede the `[ ` line; on reparse they attach to
         // the container, which renders in the same position.
         emit_comments(values[0].comments_before(), elem_indent, options, &mut lines);
-        lines.push(format!("{}[ {}", spaces(marker_indent), stripped));
+        lines.push(indent_marked(marker_indent.deeper(1), Marker::Array) + stripped);
         lines.extend(first.iter().skip(1).cloned());
         for (value, extra) in values.iter().zip(element_lines.iter()).skip(1) {
             emit_comments(value.comments_before(), elem_indent, options, &mut lines);
@@ -1222,35 +1545,64 @@ impl<T: Tree> Renderer<T> {
 
     fn render_explicit_object(
         entries: &[T::Entry],
-        marker_indent: usize,
+        marker_indent: FileIndent,
         options: &RenderOptions,
     ) -> Vec<String> {
-        let pair_indent = marker_indent + 2;
+        let pair_indent = marker_indent.deeper(1);
         let implicit_lines = Self::render_implicit_object(entries, marker_indent, options);
         let first_line = implicit_lines.first()
             .expect("render_implicit_object with non-empty entries returns at least one line");
-        let stripped = first_line.get(pair_indent..)
+        let stripped = pair_indent.strip(first_line)
             .expect("implicit object line is indented at pair_indent");
-        let mut lines = vec![format!("{}{{ {}", spaces(marker_indent), stripped)];
+        let mut lines = vec![(indent_marked(marker_indent.deeper(1), Marker::Object) + stripped)];
         lines.extend(implicit_lines.into_iter().skip(1));
         lines
     }
 
     fn render_array_element(
         value: &T,
-        elem_indent: usize,
+        elem_indent: FileIndent,
         options: &RenderOptions,
     ) -> Vec<String> {
         match value.node() {
             NodeRef::Array(values) if !values.is_empty() => {
                 if should_use_indent_glyph(value, elem_indent, options) {
-                    let mut lines = vec![format!("{} /<", spaces(elem_indent))];
-                    if values.first().is_some_and(|v| needs_explicit_array_marker(v)) {
-                        lines.extend(Self::render_explicit_array(values, 0, value.table_opinion(), options));
+                    // ` /<` shifts the frame; it does not open a container. This
+                    // element is an array, so its level has to be spelled by
+                    // somebody -- and which of the two bodies below does it
+                    // differs. `render_explicit_array` writes the `[ ` itself;
+                    // `render_array_children` writes only the elements, and then
+                    // nothing said the array was there. The children landed at the
+                    // shifted origin as siblings of the *outer* array's elements,
+                    // so `[["a"],["g",…]]` came back as `[["a"],"g",…]` -- a level
+                    // gone, silently, in output that parses.
+                    let (body, level_spelled_by_body) =
+                        if values.first().is_some_and(|v| needs_explicit_array_marker(v)) {
+                            (
+                                Self::render_explicit_array(
+                                    values,
+                                    FileIndent::ROOT,
+                                    value.table_opinion(),
+                                    options,
+                                ),
+                                true,
+                            )
+                        } else {
+                            (Self::render_array_children(values, FileIndent::ROOT, options), false)
+                        };
+                    // Where the glyph sits, and therefore where its closer must
+                    // pair, moves with the marker when this line carries one.
+                    let glyph_indent =
+                        if level_spelled_by_body { elem_indent } else { elem_indent.deeper(1) };
+                    let opener = if level_spelled_by_body {
+                        Glyph::IndentOpen.at(elem_indent.spaces())
                     } else {
-                        lines.extend(Self::render_array_children(values, 0, options));
-                    }
-                    lines.push(format!("{} />", spaces(elem_indent)));
+                        indent_marked(elem_indent.deeper(1), Marker::Array)
+                            + Glyph::IndentOpen.text()
+                    };
+                    let mut lines = vec![opener];
+                    lines.extend(body);
+                    lines.push(Glyph::IndentClose.at(glyph_indent.spaces()));
                     return lines;
                 }
                 Self::render_explicit_array(values, elem_indent, value.table_opinion(), options)
@@ -1258,63 +1610,76 @@ impl<T: Tree> Renderer<T> {
             NodeRef::Object(entries) if !entries.is_empty() => {
                 Self::render_explicit_object(entries, elem_indent, options)
             }
-            NodeRef::Null => Self::render_scalar_lines(BasicValue::Null, elem_indent, options),
-            NodeRef::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(b), elem_indent, options),
-            NodeRef::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), elem_indent, options),
+            NodeRef::Null => Self::render_scalar_lines(BasicValue::Null, elem_indent, Columns::ZERO, options),
+            NodeRef::Bool(b) => Self::render_scalar_lines(BasicValue::Bool(b), elem_indent, Columns::ZERO, options),
+            NodeRef::Number(n) => Self::render_scalar_lines(BasicValue::Number(n), elem_indent, Columns::ZERO, options),
             NodeRef::String(s) => {
-                Self::render_scalar_lines(BasicValue::String(s, value.string_form()), elem_indent, options)
+                Self::render_scalar_lines(BasicValue::String(s, value.string_form()), elem_indent, Columns::ZERO, options)
             }
-            NodeRef::Array(_) => Self::render_scalar_lines(BasicValue::EmptyArray, elem_indent, options),
-            NodeRef::Object(_) => Self::render_scalar_lines(BasicValue::EmptyObject, elem_indent, options),
+            NodeRef::Array(_) => Self::render_scalar_lines(BasicValue::EmptyArray, elem_indent, Columns::ZERO, options),
+            NodeRef::Object(_) => Self::render_scalar_lines(BasicValue::EmptyObject, elem_indent, Columns::ZERO, options),
         }
     }
 
+    /// Render a scalar's lines starting at `indent`, where `first_line_extra` columns
+    /// of that first line are already spent by whatever precedes it -- a key and its
+    /// colon, a `/ ` marker, nothing at all.
+    ///
+    /// It takes that the same way [`Self::render_string_lines`] does, and for the same
+    /// reason: a folder budgeting against a column the text does not start at gets the
+    /// fold points wrong. Numbers used to reach it as a hardcoded zero, so a long number
+    /// after a long key folded as though the key were not there.
     fn render_scalar_lines(
         value: BasicValue<'_>,
-        indent: usize,
+        indent: FileIndent,
+        first_line_extra: Columns,
         options: &RenderOptions,
     ) -> Vec<String> {
         match value {
-            BasicValue::Null => vec![format!("{}null", spaces(indent))],
+            BasicValue::Null => vec![format!("{}null", indent.spaces())],
             BasicValue::Bool(b) => vec![format!(
                 "{}{}",
-                spaces(indent),
+                indent.spaces(),
                 if b { "true" } else { "false" }
             )],
             BasicValue::Number(n) => {
                 let s = n.to_string();
-                if let Some(lines) = fold_number(&s, indent, 0, options.number_fold_style, options.wrap_width) {
+                if let Some(lines) =
+                    fold_number(&s, indent, first_line_extra, options.number_fold_style, wrap_budget(options))
+                {
                     return lines;
                 }
-                vec![format!("{}{}", spaces(indent), s)]
+                vec![format!("{}{}", indent.spaces(), s)]
             }
-            BasicValue::String(s, form) => Self::render_string_lines(s, form, indent, 0, options),
-            BasicValue::EmptyArray => vec![format!("{}[]", spaces(indent))],
-            BasicValue::EmptyObject => vec![format!("{}{{}}", spaces(indent))],
+            BasicValue::String(s, form) => {
+                Self::render_string_lines(s, form, indent, first_line_extra, options)
+            }
+            BasicValue::EmptyArray => vec![format!("{}[]", indent.spaces())],
+            BasicValue::EmptyObject => vec![format!("{}{{}}", indent.spaces())],
         }
     }
 
     fn render_string_lines(
         value: &str,
         form: Option<StringForm>,
-        indent: usize,
-        first_line_extra: usize,
+        indent: FileIndent,
+        first_line_extra: Columns,
         options: &RenderOptions,
     ) -> Vec<String> {
         if value.is_empty() {
-            return vec![format!("{}\"\"", spaces(indent))];
+            return vec![format!("{}\"\"", indent.spaces())];
         }
         let meta = StrMeta::new(value);
-
-        // Honored forms take precedence over the global style selection, subject to
-        // safety: an honored form that is unsafe for this content falls through to
-        // the normal policy below.
-        match resolve_string_form(form, options) {
-            Some(StringForm::Quoted) => {
-                return Self::render_quoted_string_lines(value, indent, first_line_extra, options);
+        // One dispatch, on the decision [`string_rendering`] owns. The arms used
+        // to be a ladder of guards here, and the permission check had to re-derive the
+        // same ladder to learn which style governs a value -- two readings of one
+        // rule, which is how a value's placement came to be decided by the key's
+        // fold style.
+        match string_rendering(value, form, &meta, options) {
+            StringRendering::Quoted => {
+                Self::render_quoted_string_lines(value, indent, first_line_extra, options)
             }
-            Some(StringForm::Bare(form)) if meta.is_bare_eligible => {
-                let opener_form = bare_opener_for(Some(form), options);
+            StringRendering::Bare(opener_form) => {
                 if options.string_bare_fold_style != FoldStyle::None
                     && let Some(lines) = fold_bare_string(
                         value,
@@ -1322,45 +1687,28 @@ impl<T: Tree> Renderer<T> {
                         first_line_extra,
                         opener_form,
                         options.string_bare_fold_style,
-                        options.wrap_width,
+                        wrap_budget(options),
                     )
                 {
                     return lines;
                 }
-                let mut line = spaces(indent);
-                line.push(bare_opener_glyph(opener_form));
-                line.push_str(value);
-                return vec![line];
+                vec![format!("{}{}", indent.spaces(), opened_bare(opener_form, value))]
             }
-            Some(StringForm::Multiline(flavor))
-                if meta.has_eol && meta.eol_type.is_some() && !meta.has_forbidden_literal =>
-            {
-                return Self::render_multiline_flavor(value, flavor, indent, options);
+            StringRendering::HonoredMultiline(flavor) => {
+                Self::render_multiline_flavor(value, flavor, indent, options)
             }
-            _ => {}
-        }
-
-        // FoldingQuotes: for EOL-containing strings, always use folded JSON string —
-        // checked before the multiline block so it short-circuits even if multiline_strings=false.
-        if matches!(options.multiline_style, MultilineStyle::FoldingQuotes) && meta.has_eol && meta.eol_type.is_some() {
-            return render_folding_quotes(value, indent, options);
-        }
-
-        if options.multiline_strings
-            && !meta.has_forbidden_literal
-            && meta.has_eol
-            && let Some(local_eol) = meta.eol_type
-        {
+            StringRendering::FoldingQuotes => render_folding_quotes(value, indent, options),
+            StringRendering::StyleMultiline => {
+                let local_eol = meta.eol_type.expect("StyleMultiline requires a uniform EOL");
             let suffix = local_eol.opener_suffix();
             let parts: Vec<&str> = match local_eol {
                 MultilineLocalEol::Lf => value.split('\n').collect(),
                 MultilineLocalEol::CrLf => value.split("\r\n").collect(),
             };
-            let min_eols = options.multiline_min_lines.max(1);
-            // parts.len() - 1 == number of EOLs in value
-            if parts.len().saturating_sub(1) >= min_eols {
+                // The EOL count against `multiline_min_lines` is `string_rendering`'s
+                // to check; reaching this arm is that check having passed.
                 let fold_style = options.string_multiline_fold_style;
-                let wrap = options.wrap_width;
+                let wrap = wrap_budget(options);
 
                 // Content safety checks shared across all styles
                 let pipe_heavy = {
@@ -1375,24 +1723,24 @@ impl<T: Tree> Renderer<T> {
 
                 // Whether any content line overflows wrap_width at indent+2
                 let overflows_at_natural = wrap
-                    .map(|w| parts.iter().any(|p| indent + 2 + p.len() > w))
+                    .map(|w| parts.iter().any(|p| indent.deeper(1).width() + Columns::of(p) > w))
                     .unwrap_or(false);
 
                 // Whether line count exceeds the configured maximum
                 let too_many_lines = options.multiline_max_lines > 0
                     && parts.len() > options.multiline_max_lines;
 
-                let bold = |body_indent: usize| {
+                let bold = |body_indent: FileIndent| {
                     Self::render_multiline_double_backtick(
                         &parts, indent, body_indent, suffix, fold_style, wrap,
                     )
                 };
 
-                return match options.multiline_style {
+                match options.multiline_style {
                     MultilineStyle::Floating => {
                         // Fall back to `` when content is unsafe OR would exceed width/line-count
                         if forced_bold || overflows_at_natural || too_many_lines {
-                            bold(0)
+                            bold(FileIndent::ROOT)
                         } else {
                             Self::render_multiline_single_backtick(
                                 &parts, indent, suffix, fold_style, wrap,
@@ -1404,16 +1752,16 @@ impl<T: Tree> Renderer<T> {
                         // backtick-starting). Width overflow and line count do NOT trigger fallback —
                         // Light prefers a long ` over a heavy ``.
                         if forced_bold {
-                            bold(0)
+                            bold(FileIndent::ROOT)
                         } else {
                             Self::render_multiline_single_backtick(
                                 &parts, indent, suffix, fold_style, wrap,
                             )
                         }
                     }
-                    MultilineStyle::Bold => bold(0),
+                    MultilineStyle::Bold => bold(FileIndent::ROOT),
                     MultilineStyle::BoldFloating => {
-                        let body = if forced_bold || overflows_at_natural { 0 } else { indent };
+                        let body = if forced_bold || overflows_at_natural { FileIndent::ROOT } else { indent };
                         bold(body)
                     }
                     // BoldLight never leaves the natural indent: overflow is accepted,
@@ -1421,44 +1769,31 @@ impl<T: Tree> Renderer<T> {
                     MultilineStyle::BoldLight => bold(indent),
                     MultilineStyle::Transparent => {
                         if forced_bold {
-                            bold(0)
+                            bold(FileIndent::ROOT)
                         } else {
                             Self::render_multiline_triple_backtick(&parts, indent, suffix)
                         }
                     }
                     MultilineStyle::FoldingQuotes => unreachable!(),
-                };
+                }
             }
         }
-        if options.bare_strings != StringStyle::Quoted && meta.is_bare_eligible {
-            // No form survived resolution, so this string is one the generator is
-            // inventing an opener for, and the global style is the only voice.
-            let opener_form = bare_opener_for(None, options);
-            if options.string_bare_fold_style != FoldStyle::None
-                && let Some(lines) =
-                    fold_bare_string(value, indent, first_line_extra, opener_form, options.string_bare_fold_style, options.wrap_width)
-                {
-                    return lines;
-                }
-            return vec![format!("{}{}", spaces(indent), opened_bare(opener_form, value))];
-        }
-        Self::render_quoted_string_lines(value, indent, first_line_extra, options)
     }
 
     /// Render a string as a JSON quoted string, folding when policy and width call for it.
     fn render_quoted_string_lines(
         value: &str,
-        indent: usize,
-        first_line_extra: usize,
+        indent: FileIndent,
+        first_line_extra: Columns,
         options: &RenderOptions,
     ) -> Vec<String> {
         if options.string_quoted_fold_style != FoldStyle::None
             && let Some(lines) =
-                fold_json_string(value, indent, first_line_extra, options.string_quoted_fold_style, options.wrap_width)
+                fold_json_string(value, indent, first_line_extra, options.string_quoted_fold_style, wrap_budget(options), "")
             {
                 return lines;
             }
-        vec![format!("{}{}", spaces(indent), render_json_string(value))]
+        vec![format!("{}{}", indent.spaces(), render_json_string(value))]
     }
 
     /// Render a multiline string in an honored concrete flavor. The content-safety
@@ -1469,7 +1804,7 @@ impl<T: Tree> Renderer<T> {
     fn render_multiline_flavor(
         value: &str,
         flavor: MultilineFlavor,
-        indent: usize,
+        indent: FileIndent,
         options: &RenderOptions,
     ) -> Vec<String> {
         let meta = StrMeta::new(value);
@@ -1480,7 +1815,7 @@ impl<T: Tree> Renderer<T> {
             MultilineLocalEol::CrLf => value.split("\r\n").collect(),
         };
         let fold_style = options.string_multiline_fold_style;
-        let wrap = options.wrap_width;
+        let wrap = wrap_budget(options);
         let pipe_heavy = {
             let pipe_count = parts.iter().filter(|p| line_starts_with_ws_then(p, '|')).count();
             !parts.is_empty() && pipe_count * 10 > parts.len()
@@ -1494,7 +1829,14 @@ impl<T: Tree> Renderer<T> {
             MultilineFlavor::Triple if !forced_bold => {
                 Self::render_multiline_triple_backtick(&parts, indent, suffix)
             }
-            _ => Self::render_multiline_double_backtick(&parts, indent, 0, suffix, fold_style, wrap),
+            _ => Self::render_multiline_double_backtick(
+                &parts,
+                indent,
+                FileIndent::ROOT,
+                suffix,
+                fold_style,
+                wrap,
+            ),
         }
     }
 
@@ -1503,25 +1845,25 @@ impl<T: Tree> Renderer<T> {
     /// No folding is allowed when fold_style is None.
     fn render_multiline_single_backtick(
         parts: &[&str],
-        indent: usize,
+        indent: FileIndent,
         suffix: &str,
         fold_style: FoldStyle,
-        wrap_width: Option<usize>,
+        wrap_width: Option<Columns>,
     ) -> Vec<String> {
-        let glyph = format!("{} `{}", spaces(indent), suffix);
-        let body_indent = indent + 2;
-        let fold_prefix = format!("{}/ ", spaces(indent));
-        let avail = wrap_width.map(|w| w.saturating_sub(body_indent));
+        let glyph = Glyph::MultilineSingle.at_with_suffix(indent.spaces(), suffix);
+        let body_indent = indent.deeper(1);
+        let fold_prefix = indent_marked(indent.deeper(1), Marker::Fold);
+        let avail = wrap_width.map(|w| w.saturating_sub(body_indent.width()));
         let mut lines = vec![glyph.clone()];
         for part in parts {
             if fold_style != FoldStyle::None
                 && let Some(avail_w) = avail
-                    && part.len() > avail_w {
+                    && Columns::of(part) > avail_w {
                         let segments = split_multiline_fold(part, avail_w, fold_style);
                         let mut first = true;
                         for seg in segments {
                             if first {
-                                lines.push(format!("{}{}", spaces(body_indent), seg));
+                                lines.push(format!("{}{}", body_indent.spaces(), seg));
                                 first = false;
                             } else {
                                 lines.push(format!("{}{}", fold_prefix, seg));
@@ -1529,7 +1871,7 @@ impl<T: Tree> Renderer<T> {
                         }
                         continue;
                     }
-            lines.push(format!("{}{}", spaces(body_indent), part));
+            lines.push(format!("{}{}", body_indent.spaces(), part));
         }
         lines.push(glyph);
         lines
@@ -1539,26 +1881,36 @@ impl<T: Tree> Renderer<T> {
     /// Body lines are at body_indent with `| ` prefix. Fold continuations at body_indent-2.
     fn render_multiline_double_backtick(
         parts: &[&str],
-        indent: usize,
-        body_indent: usize,
+        indent: FileIndent,
+        body_indent: FileIndent,
         suffix: &str,
         fold_style: FoldStyle,
-        wrap_width: Option<usize>,
+        wrap_width: Option<Columns>,
     ) -> Vec<String> {
-        let glyph = format!("{} ``{}", spaces(indent), suffix);
-        let fold_prefix = format!("{}/ ", spaces(body_indent.saturating_sub(2)));
-        // Available width for body content: wrap_width minus the `| ` prefix (2 chars) and body_indent
-        let avail = wrap_width.map(|w| w.saturating_sub(body_indent + 2));
+        let glyph = Glyph::MultilineDouble.at_with_suffix(indent.spaces(), suffix);
+        // At the margin, not one level out from it. A `/ ` normally replaces the
+        // last level of the indent, but a body line's indent is already spelled by
+        // its `| ` -- so here the fold replaces the `| `, and stands where it
+        // stands.
+        //
+        // `shallower(1)` sat here, and was wrong for every flavour. Three of them
+        // pass `body_indent = ROOT`, where the subtraction saturates to zero and
+        // lands on the right column anyway; only the flavour that keeps its body at
+        // its natural indent showed it, by emitting a fold two columns left of its
+        // own margin that the parser then refused.
+        let fold_prefix = format!("{}{}", body_indent.spaces(), Marker::Fold.text());
+        let avail = wrap_width
+            .map(|w| w.saturating_sub(body_indent.width() + Columns::new(Marker::Body.width())));
         let mut lines = vec![glyph.clone()];
         for part in parts {
             if fold_style != FoldStyle::None
                 && let Some(avail_w) = avail
-                    && part.len() > avail_w {
+                    && Columns::of(part) > avail_w {
                         let segments = split_multiline_fold(part, avail_w, fold_style);
                         let mut first = true;
                         for seg in segments {
                             if first {
-                                lines.push(format!("{}| {}", spaces(body_indent), seg));
+                                lines.push(indent_marked(body_indent.deeper(1), Marker::Body) + seg);
                                 first = false;
                             } else {
                                 lines.push(format!("{}{}", fold_prefix, seg));
@@ -1566,7 +1918,7 @@ impl<T: Tree> Renderer<T> {
                         }
                         continue;
                     }
-            lines.push(format!("{}| {}", spaces(body_indent), part));
+            lines.push(indent_marked(body_indent.deeper(1), Marker::Body) + part);
         }
         lines.push(glyph);
         lines
@@ -1576,8 +1928,8 @@ impl<T: Tree> Renderer<T> {
     /// No folding is allowed in ``` format per spec.
     /// Currently not invoked by the default selection heuristic; available for explicit use.
     #[allow(dead_code)]
-    fn render_multiline_triple_backtick(parts: &[&str], indent: usize, suffix: &str) -> Vec<String> {
-        let glyph = format!("{} ```{}", spaces(indent), suffix);
+    fn render_multiline_triple_backtick(parts: &[&str], indent: FileIndent, suffix: &str) -> Vec<String> {
+        let glyph = Glyph::MultilineTriple.at_with_suffix(indent.spaces(), suffix);
         let mut lines = vec![glyph.clone()];
         for part in parts {
             lines.push((*part).to_owned());
@@ -1629,7 +1981,7 @@ impl<T: Tree> Renderer<T> {
     fn render_packed_array_lines(
         values: &[T],
         first_prefix: String,
-        continuation_indent: usize,
+        continuation_indent: FileIndent,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
         if values.is_empty() {
@@ -1648,7 +2000,7 @@ impl<T: Tree> Renderer<T> {
     fn render_string_array_lines(
         values: &[T],
         first_prefix: String,
-        continuation_indent: usize,
+        continuation_indent: FileIndent,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
         // Every style below is a rule about a *line*, not about the array. A line
@@ -1762,7 +2114,7 @@ impl<T: Tree> Renderer<T> {
     fn render_split_array_lines(
         values: &[T],
         first_prefix: String,
-        continuation_indent: usize,
+        continuation_indent: FileIndent,
         packing: StringPacking,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
@@ -1816,7 +2168,7 @@ impl<T: Tree> Renderer<T> {
                 let prefix = if lines.is_empty() {
                     first_prefix.clone()
                 } else {
-                    spaces(continuation_indent)
+                    continuation_indent.spaces().to_string()
                 };
                 let tokens = Self::render_packed_array_tokens(group);
                 let group_lines = Self::render_packed_token_lines(
@@ -1890,8 +2242,8 @@ impl<T: Tree> Renderer<T> {
     /// (value fits or fold is disabled / below MIN_FOLD_CONTINUATION).
     fn fold_packed_inline(
         value: BasicValue<'_>,
-        continuation_indent: usize,
-        first_line_extra: usize,
+        continuation_indent: FileIndent,
+        first_line_extra: Columns,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
         match value {
@@ -1906,7 +2258,7 @@ impl<T: Tree> Renderer<T> {
                     continuation_indent,
                     first_line_extra,
                     options.number_fold_style,
-                    options.wrap_width,
+                    wrap_budget(options),
                 )
                 .filter(|l| l.len() > 1)
             }
@@ -1951,7 +2303,7 @@ impl<T: Tree> Renderer<T> {
     fn render_packed_token_lines(
         tokens: Vec<(&[Comment], PackedToken<'_, T>)>,
         first_prefix: String,
-        continuation_indent: usize,
+        continuation_indent: FileIndent,
         string_spaces_mode: bool,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
@@ -1961,7 +2313,7 @@ impl<T: Tree> Renderer<T> {
 
         // If the prefix alone already fills or exceeds wrap_width, no token can fit inline.
         if let Some(w) = options.wrap_width
-            && first_prefix.len() >= w
+            && Columns::of(&first_prefix) >= Columns::new(w)
         {
             return None;
         }
@@ -1982,7 +2334,7 @@ impl<T: Tree> Renderer<T> {
         }
 
         let separator = if string_spaces_mode { "  " } else { ", " };
-        let continuation_prefix = spaces(continuation_indent);
+        let continuation_prefix = continuation_indent.spaces().to_string();
 
         // `current` is the line being built. `current_is_fresh` is true when nothing
         // has been appended to `current` yet (it holds only the line prefix).
@@ -2060,7 +2412,13 @@ impl<T: Tree> Renderer<T> {
 
                     let block_lines = match value.node() {
                         NodeRef::String(s) => {
-                            Self::render_string_lines(s, value.string_form(), continuation_indent, 0, options)
+                            Self::render_string_lines(
+                    s,
+                    value.string_form(),
+                    continuation_indent,
+                    Columns::ZERO,
+                    options,
+                )
                         }
                         NodeRef::Array(vals) if !vals.is_empty() => {
                             Self::render_explicit_array(vals, continuation_indent, value.table_opinion(), options)
@@ -2080,7 +2438,7 @@ impl<T: Tree> Renderer<T> {
                         continuation_prefix.clone()
                     };
                     let first_block_content =
-                        block_lines[0].get(continuation_indent..).unwrap_or("");
+                        continuation_indent.strip(&block_lines[0]).unwrap_or("");
                     lines.push(format!("{}{}", current_prefix_str, first_block_content));
                     for bl in block_lines.into_iter().skip(1) {
                         lines.push(bl);
@@ -2116,10 +2474,14 @@ impl<T: Tree> Renderer<T> {
 
                         // Lone-overflow check: the token alone already exceeds the width.
                         if !fits(&current) {
+                            // `first_prefix.len()` stood here: a byte length used
+                            // as a width, so a non-ASCII key overstated the room
+                            // its own line had already taken.
                             let first_line_extra = if lines.is_empty() {
-                                first_prefix.len().saturating_sub(continuation_indent)
+                                Columns::of(&first_prefix)
+                                    .saturating_sub(continuation_indent.width())
                             } else {
-                                0
+                                Columns::ZERO
                             };
                             if let Some(fold_lines) = Self::fold_packed_inline(
                                 bv,
@@ -2134,7 +2496,7 @@ impl<T: Tree> Renderer<T> {
                                     continuation_prefix.clone()
                                 };
                                 let first_content =
-                                    fold_lines[0].get(continuation_indent..).unwrap_or("");
+                                    continuation_indent.strip(&fold_lines[0]).unwrap_or("");
                                 lines.push(format!("{}{}", actual_prefix, first_content));
                                 for fl in fold_lines.into_iter().skip(1) {
                                     lines.push(fl);
@@ -2177,11 +2539,11 @@ impl<T: Tree> Renderer<T> {
                                 && let Some(fold_lines) = Self::fold_packed_inline(
                                     bv,
                                     continuation_indent,
-                                    0,
+                                    Columns::ZERO,
                                     options,
                                 ) {
                                     let first_content =
-                                        fold_lines[0].get(continuation_indent..).unwrap_or("");
+                                        continuation_indent.strip(&fold_lines[0]).unwrap_or("");
                                     lines.push(format!(
                                         "{}{}",
                                         continuation_prefix, first_content
@@ -2217,7 +2579,7 @@ impl<T: Tree> Renderer<T> {
 
     fn render_table(
         values: &[T],
-        parent_indent: usize,
+        parent_indent: FileIndent,
         forced: bool,
         options: &RenderOptions,
     ) -> Option<Vec<String>> {
@@ -2231,10 +2593,10 @@ impl<T: Tree> Renderer<T> {
         let mut columns = Vec::<(String, Option<KeyForm>)>::new();
         let mut present_cells = 0usize;
 
-        // Build column order from the first row, then verify all rows use the same order
-        // for their shared keys. Differing key order would silently reorder keys on
-        // round-trip — that is data loss, not a similarity issue.
-        let mut first_row_keys: Option<Vec<&str>> = None;
+        // Columns are collected in first-seen order across all rows, and every row
+        // is then laid out in that order. A row whose own key order disagrees with
+        // it would be reordered on round-trip — that is data loss, not a
+        // similarity issue, so it refuses the table rather than rendering one.
 
         for value in values {
             let NodeRef::Object(entries) = value.node() else {
@@ -2242,7 +2604,6 @@ impl<T: Tree> Renderer<T> {
             };
             present_cells += entries.len();
             for entry in entries {
-                let key = T::entry_key(entry);
                 let cell = T::entry_value(entry);
                 if matches!(cell.node(), NodeRef::Array(inner) if !inner.is_empty())
                     || matches!(cell.node(), NodeRef::Object(inner) if !inner.is_empty())
@@ -2250,20 +2611,32 @@ impl<T: Tree> Renderer<T> {
                 {
                     return None;
                 }
-                if !columns.iter().any(|(column, _)| column == key) {
-                    columns.push((key.to_owned(), T::entry_key_form(entry)));
-                }
             }
-            // Check that shared keys appear in the same relative order as in the first row.
-            let row_keys: Vec<&str> = entries.iter().map(|e| T::entry_key(e)).collect();
-            if let Some(ref first) = first_row_keys {
-                let shared_in_first: Vec<&str> = first.iter().copied().filter(|k| row_keys.contains(k)).collect();
-                let shared_in_row: Vec<&str> = row_keys.iter().copied().filter(|k| first.contains(k)).collect();
-                if shared_in_first != shared_in_row {
-                    return None;
+            // Merge this row's order into the column order, rather than appending
+            // keys as they are first seen.
+            //
+            // Every row is laid out in column order, so a key belongs where the row
+            // that introduced it put it: `a b c x` arriving after `a b x` inserts
+            // `c` between `b` and `x`, and both rows then render in their own order.
+            // Appending it instead dropped it after `x` -- which reordered the very
+            // row that introduced it, silently, at default settings.
+            //
+            // Only a genuine contradiction is refused: a row asking for `b` before
+            // `a` when `a` already precedes `b` cannot be merged into any single
+            // column order, and no table can hold both rows without moving one of
+            // them. Those values fall back to block objects, which keep their order.
+            let mut cursor = 0usize;
+            for entry in entries {
+                let key = T::entry_key(entry);
+                match columns.iter().position(|(column, _)| column == key) {
+                    // Already placed, and placed compatibly with this row so far.
+                    Some(at) if at >= cursor => cursor = at + 1,
+                    Some(_) => return None,
+                    None => {
+                        columns.insert(cursor, (key.to_owned(), T::entry_key_form(entry)));
+                        cursor += 1;
+                    }
                 }
-            } else {
-                first_row_keys = Some(row_keys);
             }
         }
 
@@ -2300,27 +2673,35 @@ impl<T: Tree> Renderer<T> {
             rows.push(row);
         }
 
-        let mut widths = vec![0usize; columns.len()];
+        // Columns, not bytes. `{:<width$}` pads by character, so a width taken
+        // from a byte length reserves room the cell will not use -- a two-character
+        // CJK cell measured at six makes its column twice as wide as it needs to
+        // be, and can push the table past `table_column_max_width` and refuse to
+        // render one that should have rendered.
+        let mut widths = vec![Columns::ZERO; columns.len()];
         for (index, header) in header_cells.iter().enumerate() {
-            widths[index] = header.len();
+            widths[index] = Columns::of(header);
         }
         for row in &rows {
             for (index, cell) in row.iter().enumerate() {
-                widths[index] = widths[index].max(cell.len());
+                widths[index] = widths[index].max(Columns::of(cell));
             }
         }
         // Bail out if any column's content exceeds table_column_max_width.
         // This does not and should not depend on table_fold.
         if let Some(col_max) = options.table_column_max_width
-            && widths.iter().any(|w| *w > col_max) {
+            && widths.iter().any(|w| *w > Columns::new(col_max)) {
                 return None;
         }
+        // The cell's own padding: one column each side of the content, inside the
+        // `|` that delimits it.
+        const CELL_PADDING: Columns = Columns::new_const(2);
         for width in &mut widths {
-            *width += 2;
+            *width = *width + CELL_PADDING;
         }
 
         // Bail out if the table is too wide to fit within wrap_width even at indent 0.
-        // Each row is: (parent_indent + 2) spaces + |col1|col2|...|, where each colN width
+        // Each row is: (parent_indent.deeper(1)) spaces + |col1|col2|...|, where each colN width
         // includes 2 chars of padding. The caller handles unindenting via /< />, but if the
         // table still won't fit even at indent 0, block layout is better than overflow.
         if let Some(w) = options.wrap_width {
@@ -2328,13 +2709,17 @@ impl<T: Tree> Renderer<T> {
             // Minimum row width assumes indent 0: 2 spaces prefix + sum(widths) + one "|" per column + trailing "|".
             // The unindent logic may reduce indent below parent_indent, so only bail if it can't fit even at indent 0.
             // If table_fold is on, skip this bail-out — the fold logic below will handle overflow rows.
-            let min_row_width = 2 + widths.iter().sum::<usize>() + widths.len() + 1;
-            if min_row_width > w && !options.table_fold {
+            let cells: Columns = widths.iter().fold(Columns::ZERO, |total, w| total + *w);
+            // Two spaces of row prefix, the cells themselves, and one `|` opening each
+            // column plus one closing the row.
+            let min_row_width =
+                Columns::new(2) + cells + Columns::new(widths.len()) + Columns::new(1);
+            if min_row_width > Columns::new(w) && !options.table_fold {
                 return None;
             }
         }
 
-        let indent = spaces(parent_indent + 2);
+        let indent = parent_indent.deeper(1).spaces();
         let mut lines = Vec::new();
         lines.push(format!(
             "{}{}",
@@ -2342,23 +2727,23 @@ impl<T: Tree> Renderer<T> {
             header_cells
                 .iter()
                 .zip(widths.iter())
-                .map(|(cell, width)| format!("|{cell:<width$}", width = *width))
+                .map(|(cell, width)| format!("|{}", width.pad(cell)))
                 .collect::<String>()
                 + "|"
         ));
 
         // pair_indent for fold marker is two to the left of the `|` on each row
         let pair_indent = parent_indent; // elem rows at parent_indent+2, fold at parent_indent
-        let fold_prefix = spaces(pair_indent);
+        let fold_prefix = pair_indent.spaces();
 
         for (row_value, row) in values.iter().zip(rows) {
-            emit_comments(row_value.comments_before(), parent_indent + 2, options, &mut lines);
+            emit_comments(row_value.comments_before(), parent_indent.deeper(1), options, &mut lines);
             let row_line = format!(
                 "{}{}",
                 indent,
                 row.iter()
                     .zip(widths.iter())
-                    .map(|(cell, width)| format!("|{cell:<width$}", width = *width))
+                    .map(|(cell, width)| format!("|{}", width.pad(cell)))
                     .collect::<String>()
                     + "|"
             );
@@ -2371,14 +2756,20 @@ impl<T: Tree> Renderer<T> {
                 let fold_avail = options
                     .wrap_width
                     .unwrap_or(usize::MAX)
-                    .saturating_sub(pair_indent + 2); // content after `  ` row prefix
-                if row_line.len() > fold_avail + pair_indent + 2 {
+                    .saturating_sub(pair_indent.deeper(1).width().columns()); // content after `  ` row prefix
+                // A budget in columns, so it is compared against a count of them.
+                // This used to weigh it against `row_line.len()`, a byte length:
+                // a row of CJK is a third as long in characters as in bytes, so
+                // it folded at a third of the intended width while the identical
+                // table written in Latin text did not fold at all.
+                let budget = Columns::new(fold_avail) + pair_indent.deeper(1).width();
+                if Columns::of(&row_line) > budget {
                     // Find a fold point: must be within a cell's string data, after the
                     // leading space of a bare string or after the first `"` of a JSON string.
                     // We look for a space inside a cell value (not the cell padding spaces).
-                    if let Some((before, after)) = split_table_row_for_fold(&row_line, fold_avail + pair_indent + 2) {
+                    if let Some((before, after)) = split_table_row_for_fold(&row_line, budget) {
                         lines.push(before);
-                        lines.push(format!("{}/ {}", fold_prefix, after));
+                        lines.push(format!("{fold_prefix}{}{after}", Marker::Fold.text()));
                         continue;
                     }
                 }

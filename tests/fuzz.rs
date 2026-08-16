@@ -709,6 +709,26 @@ fn overlay_invariance(json: &serde_json::Value, options: &RenderOptions) -> Opti
     None
 }
 
+/// Drop every newline from a value's strings.
+///
+/// The width sweep excludes multiline bodies -- they are verbatim text the
+/// renderer may not touch, so no margin applies to them. The hostile generator
+/// emits newlines freely, so they are removed rather than the whole corpus being
+/// given up.
+fn strip_newlines(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match value {
+        J::String(s) => J::String(s.replace(['\n', '\r'], " ")),
+        J::Array(items) => J::Array(items.into_iter().map(strip_newlines).collect()),
+        J::Object(map) => J::Object(
+            map.into_iter()
+                .map(|(k, v)| (k.replace(['\n', '\r'], " "), strip_newlines(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// A line over the margin must have had nowhere to break. The renderer is
 /// allowed to overflow -- an unbreakable token has to go somewhere -- but it is
 /// not allowed to overflow past a fold point it could have used.
@@ -781,6 +801,14 @@ fn usable_fold_point(line: &str, margin: usize) -> Option<usize> {
 /// past the end of the file is worse than no coordinates at all. And an accepted
 /// mutant must still round-trip, because "parses" and "parses to something the
 /// renderer can express" are not the same claim.
+///
+/// All three are about the mutant alone, and a document can satisfy every one of
+/// them while meaning something nobody wrote: a close glyph moved two columns
+/// deeper does not panic, is not rejected, and round-trips perfectly, because the
+/// document it produces *is* self-consistent -- just not anyone's. The class
+/// "input that should have been rejected was accepted as something else" is
+/// invisible to internal consistency by construction, so the fourth law is not
+/// one: it relates the mutant back to the edit that made it. See `Mutation`.
 /// Which law a mutant broke. Shrinking needs this: a shrinker that accepts "any
 /// failure" walks a panic downhill into some unrelated complaint and reports
 /// that instead, which is how the first run of this sweep hid a real panic
@@ -793,6 +821,8 @@ enum Broke {
     RendererPanic,
     RoundTrip,
     Rerender,
+    Pairing,
+    CaretContradictsProse,
 }
 
 struct Violation {
@@ -804,7 +834,24 @@ fn violation(broke: Broke, story: String) -> Option<Violation> {
     Some(Violation { broke, story })
 }
 
-fn parser_robustness(source: &str, mutant: &str) -> Option<Violation> {
+/// The column a message presents as the *offending* one, if it names one.
+///
+/// Only phrasings that point at what is wrong count -- "is at column 7", "found
+/// at column 15". A message that names only where something *belongs* ("it must
+/// be ``` alone at column 12") is describing the fix, not the fault, and its
+/// caret is free to sit on the fault instead. Reading any "column N" as the
+/// offender confuses the two, and reports a message describing its own remedy
+/// rather than a disagreement.
+fn offending_column_named(message: &str) -> Option<usize> {
+    let at = ["is at column ", "found at column "]
+        .iter()
+        .filter_map(|phrase| message.find(phrase).map(|i| i + phrase.len()))
+        .min()?;
+    let digits: String = message[at..].chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+fn parser_robustness(source: &str, mutant: &str, mutation: &Mutation) -> Option<Violation> {
     let parsed = match catch_unwind(AssertUnwindSafe(|| mutant.parse::<Value>())) {
         Ok(result) => result,
         Err(_) => {
@@ -844,6 +891,18 @@ fn parser_robustness(source: &str, mutant: &str) -> Option<Violation> {
                     ),
                 );
             }
+            if let Some(named) = offending_column_named(error.message())
+                && named != error.column()
+            {
+                return violation(
+                    Broke::CaretContradictsProse,
+                    format!(
+                        "the caret is at column {} and the message says column {named}: \
+                         {error}\n--- mutant ---\n{mutant}",
+                        error.column()
+                    ),
+                );
+            }
             return None;
         }
     };
@@ -859,22 +918,48 @@ fn parser_robustness(source: &str, mutant: &str) -> Option<Violation> {
         }
     };
     match rendered.parse::<Value>() {
-        Ok(again) if again == value => None,
-        Ok(_) => violation(
-            Broke::RoundTrip,
-            format!(
-                "accepted mutant does not survive a round trip\n--- mutant ---\n{mutant}\
-                 \n--- rendered ---\n{rendered}"
-            ),
-        ),
-        Err(e) => violation(
-            Broke::Rerender,
-            format!(
-                "accepted mutant re-renders to something unparseable: {e}\n--- mutant ---\n{mutant}\
-                 \n--- rendered ---\n{rendered}"
-            ),
-        ),
+        Ok(again) if again == value => {}
+        Ok(_) => {
+            return violation(
+                Broke::RoundTrip,
+                format!(
+                    "accepted mutant does not survive a round trip\n--- mutant ---\n{mutant}\
+                     \n--- rendered ---\n{rendered}"
+                ),
+            );
+        }
+        Err(e) => {
+            return violation(
+                Broke::Rerender,
+                format!(
+                    "accepted mutant re-renders to something unparseable: {e}\n--- mutant ---\n{mutant}\
+                     \n--- rendered ---\n{rendered}"
+                ),
+            );
+        }
     }
+
+    // Everything the three consistency laws can say about this mutant has now
+    // been said, and the class this file was blind to survives all of it: a
+    // document that parses, renders, and re-parses to itself, and is not the
+    // document that was written. Nothing about the mutant alone can see that.
+    // The edit can.
+    let Mutation::ShiftedPairing(shift) = mutation else {
+        return None;
+    };
+    violation(
+        Broke::Pairing,
+        format!(
+            "a `{}` moved {} column(s) right was accepted\n--- line ---\n{:?}\n--- source ---\n{source}\
+             \n--- mutant ---\n{mutant}\n--- read as ---\n{rendered}",
+            match shift.glyph {
+                Glyph::Close => CLOSE_GLYPH,
+                Glyph::Fold => FOLD_MARKER,
+            },
+            shift.spaces,
+            shift.line,
+        ),
+    )
 }
 
 /// Comments in the source survive a `Document` round trip. Comments are the
@@ -957,15 +1042,162 @@ fn serializer_agreement(json: &serde_json::Value, options: &RenderOptions) -> Op
 /// Structural characters, which are what a near-miss document is made of.
 const HAZARDS: &[char] = &['|', '_', '"', '`', '/', ':', '\\', ' ', '\t', '\n', '\r', '-', ','];
 
-/// One small edit to a valid document. Small on purpose: a mutant that still
-/// almost parses reaches deeper into the parser than noise ever does.
-fn mutate(rng: &mut Rng, source: &str) -> String {
+/// A glyph that owns a whole line and whose column is fixed by something
+/// elsewhere in the document. The column is not decoration on top of the glyph,
+/// it is the half of the glyph's meaning that says *what* it closes or
+/// continues, so a line made of nothing else cannot be moved and still mean
+/// anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Glyph {
+    /// ` />` closes the frame that a ` /<` opened, and pairs with it by sitting
+    /// in that frame's close column.
+    Close,
+    /// `/ ` continues the value on the line above, in that value's column.
+    Fold,
+}
+
+/// The glyph that closes an indent-offset frame, which is the whole line.
+const CLOSE_GLYPH: &str = "/>";
+/// The marker that opens a fold continuation. The continued text follows it on
+/// the same line, so this is a prefix and not the whole line.
+const FOLD_MARKER: &str = "/ ";
+
+/// The shape of a line, on its own. Whether that shape *means* anything is a
+/// question about the whole document, and `paired_glyph_lines` is where it is
+/// asked.
+fn glyph_of(line: &str) -> Option<Glyph> {
+    let body = line.trim_start();
+    if body == CLOSE_GLYPH {
+        return Some(Glyph::Close);
+    }
+    // `//` is a comment and sits at any indent it likes; `/ ` is a fold marker
+    // and does not. The space is the whole difference.
+    if body.starts_with(FOLD_MARKER) {
+        return Some(Glyph::Fold);
+    }
+    None
+}
+
+/// True when some line of this document may be data rather than structure.
+///
+/// A multiline block is delimited by backtick markers in every style, and three
+/// of the styles -- `floating`, `light`, `transparent` -- leave the body
+/// unguarded, so a body line whose entire content is `/>` is *text* there and
+/// moving it is legal. Nothing in the line itself distinguishes the two, so one
+/// backtick anywhere is enough to give up on the whole document. That costs a
+/// smaller sample and nothing else, and it is the same hold-out the width sweep
+/// makes at the option level rather than line by line.
+///
+/// Held out with it: the multiline closer, the third pairing. A closer is
+/// backticks, so a document holding one is never classified, and the law below
+/// speaks for two of the three pairings rather than three.
+fn has_verbatim_lines(source: &str) -> bool {
+    source.contains('`')
+}
+
+/// The lines of this document that are nothing but a paired glyph.
+///
+/// The single door to classification, because the question cannot be answered a
+/// line at a time: `/>` alone on a line is a close glyph in one document and
+/// ordinary text in another, and only the document says which. A caller holding
+/// a line has no way to ask -- which is the point, since the hold-out that makes
+/// the answer sound is right here and cannot be walked around.
+fn paired_glyph_lines(source: &str) -> Vec<(&str, Glyph)> {
+    if has_verbatim_lines(source) {
+        return Vec::new();
+    }
+    let mut found: Vec<(&str, Glyph)> = Vec::new();
+    for line in lines_of(source) {
+        let Some(glyph) = glyph_of(line) else {
+            continue;
+        };
+        // A `Shift` finds its line by text, so two identical glyph lines name
+        // the same edit and the second would only re-make the first.
+        if found.iter().any(|(seen, _)| *seen == line) {
+            continue;
+        }
+        found.push((line, glyph));
+    }
+    found
+}
+
+/// One line's indentation pushed right -- the edit itself rather than its
+/// result, so that the same edit can be made again against a smaller document.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Shift {
+    /// The line as it stood before the shift, indent included. Held as text
+    /// rather than as a line number so the edit outlives a shrink that deletes
+    /// lines above it.
+    line: String,
+    spaces: usize,
+    glyph: Glyph,
+}
+
+impl Shift {
+    /// The same edit made against another document, or `None` when that
+    /// document no longer holds the line this edit is about -- a shrink step
+    /// that went one line too far, not a failure.
+    ///
+    /// Two identical glyph lines shift the first. That is a different instance
+    /// of the same edit and carries the same claim, so it needs no tie-break.
+    fn apply(&self, source: &str) -> Option<String> {
+        let lines = lines_of(source);
+        let target = lines.iter().position(|line| *line == self.line)?;
+        Some(shift_line(&lines, target, self.spaces))
+    }
+}
+
+/// `lines` with one line's indent pushed `spaces` columns right. The one
+/// definition of the edit, so that making it and re-making it cannot drift.
+fn shift_line(lines: &[&str], target: usize, spaces: usize) -> String {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == target {
+                format!("{}{line}", " ".repeat(spaces))
+            } else {
+                (*line).to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What `mutate` did, in a vocabulary the laws can reason from.
+///
+/// Almost every edit licenses no claim beyond internal consistency: a deleted
+/// character can leave anything behind, from a parse error to a different but
+/// perfectly legal document, and the harness cannot tell which was owed. One
+/// edit licenses more, and this type is what carries that difference out of
+/// `mutate` -- without it the harness cannot assert "this must be rejected",
+/// because it no longer knows what it did.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Mutation {
+    /// An edit whose consequences do not follow from the edit.
+    Opaque,
+    /// A line that was nothing but a paired glyph, moved off the column that
+    /// paired it. No valid document can come of this.
+    ShiftedPairing(Shift),
+}
+
+/// One small edit to a valid document, and what the edit was. Small on purpose:
+/// a mutant that still almost parses reaches deeper into the parser than noise
+/// ever does.
+fn mutate(rng: &mut Rng, source: &str) -> (String, Mutation) {
     let chars: Vec<char> = source.chars().collect();
     if chars.is_empty() {
-        return "\u{0}".to_owned();
+        return ("\u{0}".to_owned(), Mutation::Opaque);
     }
 
-    match rng.below(8) {
+    let choice = rng.below(8);
+    // The one edit that can be classified gets its own function; the rest are
+    // opaque together, which is what the shared tag below says.
+    if choice == 6 {
+        return shift_one_line(rng, source);
+    }
+
+    let text = match choice {
         0 => {
             let at = rng.below(chars.len());
             chars.iter().enumerate().filter(|(i, _)| *i != at).map(|(_, c)| *c).collect()
@@ -995,50 +1227,59 @@ fn mutate(rng: &mut Rng, source: &str) -> String {
         5 => {
             let lines = lines_of(source);
             if lines.len() < 2 {
-                return source.to_owned();
+                source.to_owned()
+            } else {
+                let drop = rng.below(lines.len());
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != drop)
+                    .map(|(_, line)| *line)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
-            let drop = rng.below(lines.len());
-            lines
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != drop)
-                .map(|(_, line)| *line)
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        6 => {
-            // Indentation is TJSON's structure, so shifting one line is the most
-            // structural edit available.
-            let lines = lines_of(source);
-            if lines.is_empty() {
-                return source.to_owned();
-            }
-            let target = rng.below(lines.len());
-            let shift = *rng.pick(&[" ", "  ", "   "]);
-            lines
-                .iter()
-                .enumerate()
-                .map(|(i, line)| {
-                    if i == target {
-                        format!("{shift}{line}")
-                    } else {
-                        (*line).to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
         }
         _ => {
             let lines = lines_of(source);
             if lines.len() < 2 {
-                return source.to_owned();
+                source.to_owned()
+            } else {
+                let (a, b) = (rng.below(lines.len()), rng.below(lines.len()));
+                let mut swapped: Vec<&str> = lines.clone();
+                swapped.swap(a, b);
+                swapped.join("\n")
             }
-            let (a, b) = (rng.below(lines.len()), rng.below(lines.len()));
-            let mut swapped: Vec<&str> = lines.clone();
-            swapped.swap(a, b);
-            swapped.join("\n")
         }
+    };
+
+    (text, Mutation::Opaque)
+}
+
+/// Push one line's indentation right by one to three columns.
+///
+/// Indentation is TJSON's structure, so shifting one line is the most
+/// structural edit available -- and when the line it moves is nothing but a
+/// paired glyph, it is the one edit in this file whose consequence is known in
+/// advance, which is what the returned `Mutation` says.
+fn shift_one_line(rng: &mut Rng, source: &str) -> (String, Mutation) {
+    let lines = lines_of(source);
+    if lines.is_empty() {
+        return (source.to_owned(), Mutation::Opaque);
     }
+    let target = rng.below(lines.len());
+    let spaces = 1 + rng.below(3);
+
+    let classified = paired_glyph_lines(source)
+        .into_iter()
+        .find(|(line, _)| *line == lines[target]);
+    let mutation = match classified {
+        Some((line, glyph)) => {
+            Mutation::ShiftedPairing(Shift { line: line.to_owned(), spaces, glyph })
+        }
+        None => Mutation::Opaque,
+    };
+
+    (shift_line(&lines, target, spaces), mutation)
 }
 
 /// Where in a document a comment was planted. Reported instead of the comment's
@@ -1226,6 +1467,29 @@ impl Findings {
 
     fn total(&self) -> usize {
         self.counts.values().sum()
+    }
+
+    /// Splits off findings that match a park, leaving the rest to fail the law.
+    ///
+    /// Returns `(parked, live)`. Parked findings keep their counts so they can still
+    /// be printed -- a park that goes silent is how a parked bug becomes a forgotten
+    /// one.
+    fn split_parked(self) -> (Vec<(String, usize, &'static str)>, Findings) {
+        let mut parked = Vec::new();
+        let mut live = Findings::default();
+        for key in self.order {
+            let count = self.counts[&key];
+            let example = self.examples[&key].clone();
+            match parked_reason(&example) {
+                Some(reason) => parked.push((example, count, reason)),
+                None => {
+                    live.order.push(key.clone());
+                    live.counts.insert(key.clone(), count);
+                    live.examples.insert(key, example);
+                }
+            }
+        }
+        (parked, live)
     }
 
     /// One block per distinct failure, most frequent first.
@@ -1427,12 +1691,63 @@ fn sweep(
 /// silences the panic hook so that caught panics do not bury the report, and a
 /// silenced hook would swallow an `assert!` message too. Captured stdout is
 /// shown for a failing test either way.
+/// Why a finding is parked, if it is.
+///
+/// A park is deliberately narrow: it matches one failure signature, never a whole
+/// law. Silencing the law instead would hide every other bug that law is there to
+/// catch, which is a much larger price than the one thing being parked.
+///
+/// A parked finding is still reported. It just does not fail the run.
+fn parked_reason(detail: &str) -> Option<&'static str> {
+    // A bold-family multiline body re-renders at column 0: `MultilineFlavor::Double`
+    // records which opener was written and nothing about where the body sat, and
+    // Bold / BoldFloating / BoldLight all write two backticks and differ only in
+    // that placement. Waiting on a ruling about whether the body's position is data
+    // or a viewport accommodation -- see local/parked_issues_for_after_0.9.0.md (1).
+    if detail.contains("indentation moved") && detail.contains("rewritten: \"| \"") {
+        return Some("bold multiline body re-renders at column 0 (parked issue 1)");
+    }
+
+    // Table columns are aligned by character count, which is display width only for
+    // characters one cell wide. Fixing the rest needs a Unicode width table, which
+    // is a deliberate no for now -- so raggedness involving wide, combining or emoji
+    // characters is parked.
+    //
+    // Pure-ASCII raggedness is *not* parked and still fails: there character count
+    // and display width are the same number, so a misaligned all-ASCII table is a
+    // real defect with nothing to blame it on.
+    if detail.contains("table_display_alignment") && !detail.is_ascii() {
+        return Some("table alignment ragged on characters wider than one cell");
+    }
+
+    None
+}
+
 fn report(property: &str, checked: usize, findings: Findings) {
+    let (parked, findings) = findings.split_parked();
+    for (example, count, reason) in &parked {
+        println!(
+            "{property}: PARKED -- {reason}, {count} occurrence(s)\n{}\n",
+            example
+                .lines()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     if findings.is_empty() {
         // Printed on success too: a sweep whose corpus quietly generated nothing
         // reports "ok" exactly like one that checked sixty thousand cases, and
         // the difference is the whole value of the run.
-        println!("{property}: {checked} checks, no findings (seed {:#x})", seed());
+        let parked_note = match parked.len() {
+            0 => String::new(),
+            n => format!(", {n} parked"),
+        };
+        println!(
+            "{property}: {checked} checks, no live findings{parked_note} (seed {:#x})",
+            seed()
+        );
         assert!(checked > 0, "{property} ran no checks at all");
         return;
     }
@@ -1461,6 +1776,7 @@ fn render_is_idempotent() {
 }
 
 #[test]
+
 fn document_is_a_fixed_point() {
     let (checked, findings) = sweep("document_fixed_point", document_fixed_point, &option_sets(), true);
     report("document fixed point", checked, findings);
@@ -1508,8 +1824,17 @@ fn lines_fold_when_they_can() {
     let mut findings = Findings::default();
     let mut checked = 0usize;
 
-    for _ in 0..cases() {
-        let json = gen_value(&mut rng, 0, false);
+    for case in 0..cases() {
+        // Half the corpus is hostile text. A law that counts columns can only
+        // fail on input where columns and bytes differ, so feeding it ASCII makes
+        // it structurally incapable of finding the thing it exists to find --
+        // which is exactly what happened: a byte budget was being spent against a
+        // column margin and this sweep ran green over it for its whole life.
+        let json = if case % 2 == 0 {
+            gen_value(&mut rng, 0, false)
+        } else {
+            strip_newlines(gen_hostile_value(&mut rng, 0))
+        };
         for (name, options, margin) in &sets {
             checked += 1;
             let width_check = |candidate: &serde_json::Value| {
@@ -1543,16 +1868,127 @@ fn lines_fold_when_they_can() {
     report("width discipline", checked, findings);
 }
 
+/// How many shifts of each glyph a sweep made: the sample each half of the
+/// pairing law actually got, rather than the sample the sweep ran.
+///
+/// Reported because a law nobody exercised prints "no findings" in exactly the
+/// words of one that held. "The close glyph is never accepted off its column"
+/// is a claim about a denominator, and without the denominator beside it, it is
+/// a claim about nothing.
+#[derive(Default)]
+struct Exercised {
+    close: usize,
+    fold: usize,
+}
+
+impl Exercised {
+    fn count(&mut self, glyph: Glyph) {
+        match glyph {
+            Glyph::Close => self.close += 1,
+            Glyph::Fold => self.fold += 1,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.close + self.fold
+    }
+}
+
+/// What one mutation sweep did.
+struct Robustness {
+    checked: usize,
+    shifted: Exercised,
+    findings: Findings,
+}
+
+/// The smallest reproduction of `found` this sweep can reach, told as a story.
+///
+/// What gets shrunk depends on what the edit was, because "smaller" is a
+/// property of the thing the law is about. An opaque edit's law is about the
+/// mutant, so the mutant text shrinks. A shifted pairing's law is about the
+/// *edit*, and it only holds against a document the parser accepts, so the
+/// source shrinks and the same edit is made again on every candidate. Shrinking
+/// the mutant text there would walk straight out of the law's domain -- deleting
+/// the moved glyph, or the frame it failed to pair with -- and report a document
+/// nobody ever claimed anything about.
+fn minimal_story(source: &str, mutant: &str, mutation: &Mutation, found: &Violation) -> String {
+    let broke = found.broke;
+    let story = match mutation {
+        Mutation::Opaque => {
+            let minimal = shrink_text(mutant.to_owned(), |candidate| {
+                parser_robustness(source, candidate, mutation).map(|v| v.broke) == Some(broke)
+            });
+            parser_robustness(source, &minimal, mutation).map(|v| v.story)
+        }
+        Mutation::ShiftedPairing(shift) => {
+            let minimal = shrink_text(source.to_owned(), |candidate| {
+                // A glyph is only paired inside a document that parses, so a
+                // candidate the parser rejects cannot carry the claim however
+                // small it has become.
+                candidate.parse::<Value>().is_ok()
+                    && shift.apply(candidate).is_some_and(|mutant| {
+                        parser_robustness(candidate, &mutant, mutation).map(|v| v.broke)
+                            == Some(broke)
+                    })
+            });
+            shift
+                .apply(&minimal)
+                .and_then(|mutant| parser_robustness(&minimal, &mutant, mutation))
+                .map(|v| v.story)
+        }
+    };
+    story.unwrap_or_else(|| found.story.clone())
+}
+
+/// Every shifted pairing this document admits: each distinct paired-glyph line,
+/// moved one, two and three columns right.
+///
+/// Enumerated rather than sampled, because sampling did not work. Letting
+/// `mutate` find these on its own put a glyph line under the shift about once in
+/// a hundred and twenty mutants, and at that rate the pairing law reported "no
+/// findings" over a bug that was live the whole time -- it took ten times the
+/// default corpus to see it once. A document has very few glyph lines and each
+/// shift costs one parse, so they are all shifted, every run.
+fn pairing_shifts(source: &str) -> Vec<Shift> {
+    paired_glyph_lines(source)
+        .into_iter()
+        .flat_map(|(line, glyph)| {
+            (1..=3).map(move |spaces| Shift { line: line.to_owned(), spaces, glyph })
+        })
+        .collect()
+}
+
+/// Record one violation, shrinking it first if its fingerprint is new.
+fn record_violation(
+    findings: &mut Findings,
+    label: &str,
+    source: &str,
+    mutant: &str,
+    mutation: &Mutation,
+    found: &Violation,
+) {
+    let detail = format!("{:?} {}", found.broke, found.story);
+    if !findings.is_new(&detail) {
+        findings.record(&detail, String::new());
+        return;
+    }
+    // Shrinking is the expensive step, so it runs once per distinct failure
+    // rather than once per occurrence.
+    let story = minimal_story(source, mutant, mutation, found);
+    findings.record(&detail, format!("[{label}] {:?}\n{story}", found.broke));
+}
+
 /// One pass of mutation, reporting only the laws in `enforced`. The laws are
-/// separable because they are not equally settled: a panic is a bug by any
-/// reading, while where an error at end-of-input should point is a question
-/// still open (see `errors_point_inside_the_text`).
-fn robustness_sweep(enforced: &[Broke]) -> (usize, Findings) {
+/// separable so that a finding names which promise broke -- a panic, a position
+/// outside the text, and a caret disagreeing with its own prose are three
+/// different faults and want three different reports.
+fn robustness_sweep(enforced: &[Broke]) -> Robustness {
     quiet_panics();
     let mut rng = Rng::new(seed());
     let sets = option_sets();
     let mut findings = Findings::default();
     let mut checked = 0usize;
+    let mut shifted = Exercised::default();
 
     let wanted = |found: &Violation| enforced.contains(&found.broke);
 
@@ -1571,64 +2007,129 @@ fn robustness_sweep(enforced: &[Broke]) -> (usize, Findings) {
         let (name, options) = rng.pick(&sets);
         let source = original.to_tjson_with(options.clone());
 
-        // The clean rendering first: it must survive its own parser.
+        // The clean rendering first: it must survive its own parser. Nothing was
+        // edited, so there is no claim beyond consistency to make about it.
         checked += 1;
-        if let Some(found) = parser_robustness(&source, &source).filter(wanted) {
+        if let Some(found) = parser_robustness(&source, &source, &Mutation::Opaque).filter(wanted) {
             let detail = format!("{:?} {}", found.broke, found.story);
             findings.record(&detail, format!("[clean/{name}] {:?}\n{}", found.broke, found.story));
         }
 
         for _ in 0..6 {
-            let mutant = mutate(&mut rng, &source);
+            let (mutant, mutation) = mutate(&mut rng, &source);
             checked += 1;
-            let Some(found) = parser_robustness(&source, &mutant).filter(wanted) else {
+            if let Mutation::ShiftedPairing(shift) = &mutation {
+                shifted.count(shift.glyph);
+            }
+            let Some(found) = parser_robustness(&source, &mutant, &mutation).filter(wanted) else {
                 continue;
             };
-            let detail = format!("{:?} {}", found.broke, found.story);
-            if !findings.is_new(&detail) {
-                findings.record(&detail, String::new());
+            record_violation(
+                &mut findings,
+                &format!("mutant/{name}"),
+                &source,
+                &mutant,
+                &mutation,
+                &found,
+            );
+        }
+
+        // The one edit whose consequence is known in advance is too rare to
+        // leave to the dice -- see `pairing_shifts`.
+        for shift in pairing_shifts(&source) {
+            let Some(mutant) = shift.apply(&source) else {
                 continue;
-            }
-            let broke = found.broke;
-            let minimal = shrink_text(mutant.clone(), |candidate| {
-                parser_robustness(&source, candidate).map(|v| v.broke) == Some(broke)
-            });
-            let story = parser_robustness(&source, &minimal)
-                .map(|v| v.story)
-                .unwrap_or(found.story);
-            findings.record(&detail, format!("[mutant/{name}] {broke:?}\n{story}"));
+            };
+            shifted.count(shift.glyph);
+            let mutation = Mutation::ShiftedPairing(shift);
+            checked += 1;
+            let Some(found) = parser_robustness(&source, &mutant, &mutation).filter(wanted) else {
+                continue;
+            };
+            record_violation(
+                &mut findings,
+                &format!("shift/{name}"),
+                &source,
+                &mutant,
+                &mutation,
+                &found,
+            );
         }
     }
 
-    (checked, findings)
+    Robustness { checked, shifted, findings }
 }
 
 #[test]
 fn no_input_panics() {
-    let (checked, findings) = robustness_sweep(&[
+    let sweep = robustness_sweep(&[
         Broke::ParserPanic,
         Broke::RendererPanic,
         Broke::RoundTrip,
         Broke::Rerender,
     ]);
-    report("parser robustness", checked, findings);
+    report("parser robustness", sweep.checked, sweep.findings);
 }
 
-/// KNOWN GAP, not a flaky test: an error raised at end of input points past the
-/// last line, so no source line and no caret can be shown for it. `  a:` alone
-/// in a file reports "line 3, column 1: expected a nested value" -- a one-line
-/// document, a line number two past its end, and the `a:` that actually made the
-/// promise never named. Where such an error should point is a product decision,
-/// so this sweep records the gap rather than deciding it:
+/// A glyph moved off the column that paired it must be refused.
 ///
-/// ```text
-/// cargo test --test fuzz -- --ignored errors_point_inside_the_text
-/// ```
+/// This is the only law in the file that relates an accepted mutant back to the
+/// document it was made from. The other three ask the mutant about itself, and
+/// a document can answer all three and still be one nobody wrote -- which is
+/// what a close glyph two columns too deep did, silently, until the parser was
+/// taught to say so.
+///
+/// The claim is stated on the one edit strong enough to carry it: a line that is
+/// nothing but ` />` or `/ `, pushed right. The pairing is what the glyph means,
+/// so at any other column the line is not a weaker version of itself, it is
+/// nothing. A survivor is therefore not noise to be tuned away -- it is a parser
+/// that accepted a document nobody could have written, which is the whole class
+/// this file could not see before.
 #[test]
-#[ignore = "known gap: end-of-input errors point past the last line"]
+fn shifted_pairings_are_rejected() {
+    let sweep = robustness_sweep(&[Broke::Pairing]);
+    // Printed, not asserted: this file silences the panic hook, so an `assert!`
+    // message never reaches the reader -- see `report`.
+    println!(
+        "pairing: of {} checks, {} moved a `{CLOSE_GLYPH}` and {} moved a `{FOLD_MARKER}`",
+        sweep.checked, sweep.shifted.close, sweep.shifted.fold
+    );
+    let exercised = sweep.shifted.total() > 0;
+    report("pairing", sweep.checked, sweep.findings);
+    assert!(exercised, "the pairing law was never exercised");
+}
+
+/// **Every positioned error points at a line the document actually has.**
+///
+/// A line number past the end has no source line to quote and no column to put a
+/// caret under, so the reader gets a coordinate they cannot look at.
+///
+/// It also lets a message be about nothing. A parser that can reach a line which is
+/// not there will happily describe a content fault against it -- complaining that a
+/// line does not start with `| ` when there is no such line -- and the error that
+/// actually fits, that something opened and the input ended before it closed, never
+/// gets raised.
+#[test]
 fn errors_point_inside_the_text() {
-    let (checked, findings) = robustness_sweep(&[Broke::ErrorLine, Broke::ErrorColumn]);
-    report("error position", checked, findings);
+    let sweep = robustness_sweep(&[Broke::ErrorLine, Broke::ErrorColumn]);
+    report("error position", sweep.checked, sweep.findings);
+}
+
+/// **An error's caret and its own prose must name the same column.**
+///
+/// Errors are the one output nothing here used to assert. A message that says
+/// "column 9" while the caret sits under column 7 is worse than either alone:
+/// the reader trusts the arrow, and the number sends them somewhere else. That
+/// happened -- three positions and no two agreeing -- and was fixed by routing
+/// both through one offset, which is exactly the kind of fix that quietly comes
+/// undone when a later message builds a column by hand.
+///
+/// Independent of `errors_point_inside_the_text`: this asks only whether an error
+/// agrees with itself, which it can do whether or not it points inside the text.
+#[test]
+fn a_caret_agrees_with_its_own_message() {
+    let sweep = robustness_sweep(&[Broke::CaretContradictsProse]);
+    report("caret agreement", sweep.checked, sweep.findings);
 }
 
 /// The same laws, over configurations nobody wrote down.
@@ -1766,6 +2267,40 @@ const HOSTILE_CHARS: &[(&str, char)] = &[
 /// is wrong three times over.
 const WIDE_CHARS: &[char] = &['何', '字', '한', '🎉', '👍', '～'];
 
+/// Characters grouped by how many bytes they take in UTF-8.
+///
+/// Every bug this suite found in the width and fold machinery was a byte count
+/// standing in for a column count, and every one of them was invisible while the
+/// corpus was ASCII, where the two agree. One non-ASCII length is not enough
+/// either: a corpus of only 4-byte emoji makes the ratio a constant, and code
+/// that divides or multiplies by the wrong constant still lines up. Drawing from
+/// all four lengths means no single factor relates bytes to characters anywhere
+/// in a document.
+///
+/// Deliberately spread across scripts as well as lengths -- Latin supplement,
+/// Greek, Cyrillic, Hebrew and Arabic at two bytes; CJK, Hangul, Devanagari and
+/// fullwidth forms at three; emoji and historic scripts at four.
+const UTF8_BY_LEN: &[(usize, &[char])] = &[
+    (1, &['a', 'z', '0', '9', '-', '_']),
+    (2, &['é', 'ü', 'ñ', 'ß', 'λ', 'Ω', 'д', 'ж', 'א', 'ع', 'þ', 'ø']),
+    (3, &['何', '字', '한', '글', 'あ', 'ア', 'क', 'ह', '～', 'ｱ', '€', '∑']),
+    (4, &['🎉', '👍', '😀', '🌍', '𝄞', '𝔘', '𩸽', '🜁']),
+];
+
+/// A string of `chars` characters drawn from the given UTF-8 byte lengths.
+fn gen_from_lengths(rng: &mut Rng, chars: usize, lengths: &[usize]) -> String {
+    (0..chars)
+        .map(|_| {
+            let want = *rng.pick(lengths);
+            let (_, set) = UTF8_BY_LEN
+                .iter()
+                .find(|(len, _)| *len == want)
+                .expect("every length in the table");
+            *rng.pick(set)
+        })
+        .collect()
+}
+
 /// Marks that belong to the character in front of them. A line boundary between
 /// a base character and one of these has torn a single glyph in half.
 fn is_combining(c: char) -> bool {
@@ -1814,7 +2349,54 @@ fn display_width(text: &str) -> usize {
 /// would make the "no fold splits a glyph" law report the generator instead of
 /// the renderer.
 fn gen_hostile_string(rng: &mut Rng) -> String {
-    match rng.below(12) {
+    match rng.below(15) {
+        12 => {
+            // Every UTF-8 length in one string, so no constant relates its byte
+            // count to its character count.
+            let n = 8 + rng.below(40);
+            let mut out = gen_from_lengths(rng, n, &[1, 2, 3, 4]);
+            // Spaces so the folder has somewhere legal to break.
+            let marks: Vec<usize> = (0..out.chars().count()).step_by(5 + rng.below(4)).collect();
+            let mut spaced = String::new();
+            for (index, ch) in out.chars().enumerate() {
+                if index > 0 && marks.contains(&index) {
+                    spaced.push(' ');
+                }
+                spaced.push(ch);
+            }
+            out = spaced;
+            out
+        }
+        13 => {
+            // No ASCII at all. Anything that assumed one byte per column has
+            // nowhere to hide.
+            let n = 6 + rng.below(30);
+            let mut out = String::new();
+            for i in 0..n {
+                if i > 0 && i % (3 + rng.below(3)) == 0 {
+                    // U+3000 IDEOGRAPHIC SPACE is not a space to the parser, so
+                    // use a real one -- the point is non-ASCII content, not an
+                    // unparseable line.
+                    out.push(' ');
+                }
+                out.push_str(&gen_from_lengths(rng, 1, &[2, 3, 4]));
+            }
+            out
+        }
+        14 => {
+            // One length throughout, but which length varies per string, so a
+            // document holds several different byte-to-character ratios.
+            let only = *rng.pick(&[2usize, 3, 4]);
+            let n = 6 + rng.below(30);
+            let mut out = String::new();
+            for i in 0..n {
+                if i > 0 && i % 4 == 0 {
+                    out.push(' ');
+                }
+                out.push_str(&gen_from_lengths(rng, 1, &[only]));
+            }
+            out
+        }
         0 => {
             // A base letter wearing a stack of marks, at a length that folds.
             let mut out = String::new();
@@ -2350,6 +2932,121 @@ fn directed_sweep(
     (checked, findings)
 }
 
+/// Re-encode every ASCII letter and digit as a character of a different UTF-8
+/// length but the same column count.
+///
+/// `a` becomes a three-byte CJK character, `b` a two-byte Greek one, and so on,
+/// chosen so the mapping is one character in, one character out. Everything else
+/// -- spaces, punctuation, structure -- is left alone, so the document has the
+/// same shape and the same widths and differs only in how many bytes those
+/// widths take.
+fn widen_encoding(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    // One column each, spread across 2-, 3- and 4-byte encodings so no single
+    // ratio relates the two documents.
+    //
+    // Every one is a *letter* by Unicode category, and that is load-bearing: a
+    // symbol or an emoji is not permitted in a bare string, so substituting one
+    // would force quoting and change the layout for a legitimate reason, and the
+    // law would report a difference it caused itself. Letters keep whatever form
+    // the original had, so the only thing that varies is how many bytes it takes.
+    const WIDE: &[char] = &[
+        'é', 'ü', 'ñ', 'ß', 'λ', 'Ω', 'д', 'ж', 'þ', 'ø',
+        '何', '字', '한', '글', 'あ', 'ア', 'क', 'ह', 'ب', 'ת',
+        '𝔄', '𝕬', '𝖆', '𝐀', '𝒜', '𩸽', '𠀋', '𪚥', '𐌀', '𐎠',
+    ];
+    fn widen(text: &str) -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    let index = (c as usize) % WIDE.len();
+                    WIDE[index]
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+    match value {
+        J::String(text) => J::String(widen(text)),
+        J::Array(items) => J::Array(items.iter().map(widen_encoding).collect()),
+        J::Object(map) => J::Object(
+            map.iter()
+                .map(|(key, v)| (widen(key), widen_encoding(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The skeleton of a rendering: how wide each line is, in columns, and nothing
+/// about what is on it.
+fn layout_shape(rendered: &str) -> Vec<usize> {
+    lines_of(rendered).iter().map(|line| line.chars().count()).collect()
+}
+
+/// **Byte length must never affect layout.**
+///
+/// Every width bug this suite has found was a byte count standing in for a
+/// column count, and each was invisible while the corpus was ASCII, where the
+/// two agree. This states the invariant directly instead of hoping a margin
+/// check trips over it: re-encode a document so every character takes a
+/// different number of bytes but the same number of columns, and the two
+/// renderings must have the identical shape -- same line count, same width per
+/// line. Only the glyphs may differ.
+///
+/// Sharper than the margin law, which can only fail on documents that happen to
+/// overflow. This must hold for every document there is.
+fn encoding_does_not_move_layout(
+    json: &serde_json::Value,
+    options: &RenderOptions,
+) -> Option<String> {
+    // Folding is switched off for the comparison, and that is a scope statement
+    // rather than a convenience.
+    //
+    // Where a fold may legally land depends on the *characters* either side of it,
+    // not on their widths: `is_known_safe_fold_point` allows a split only between
+    // two ASCII characters or beside a space, and the extended rule adds the pairs
+    // the implementation can prove separable. That is deliberate and it fails
+    // safe -- the worst case is a fold not taken, never a glyph split down the
+    // middle. But it means substituting a character changes which folds are
+    // legal, so a widened document can fold in a different place for a reason
+    // that has nothing to do with byte length, and this law would report it.
+    //
+    // Measured: with folding on, `"trailing "` after an escaped key places two
+    // columns on the key's line, the same text in ideographs places one, and in
+    // astral letters none -- three layouts at one character count. With folding
+    // off, a sweep of every width from 20 to 58 shows no difference at all. The
+    // invariant this law exists for is intact; the fold rule was riding along.
+    let options = options
+        .clone()
+        .fold(tjson::FoldStyle::None)
+        .string_multiline_fold_style(tjson::FoldStyle::None);
+    let narrow: Value = json.clone().into();
+    let widened: Value = widen_encoding(json).into();
+    let a = narrow.to_tjson_with(options.clone());
+    let b = widened.to_tjson_with(options.clone());
+    let (sa, sb) = (layout_shape(&a), layout_shape(&b));
+    if sa == sb {
+        return None;
+    }
+    let first = sa
+        .iter()
+        .zip(sb.iter())
+        .position(|(x, y)| x != y)
+        .map_or(sa.len().min(sb.len()), |i| i);
+    Some(format!(
+        "re-encoding the same content at a different byte width moved the layout: \
+         {} lines vs {}, first differing at line {} ({} columns vs {})\n\
+         --- ascii ---\n{a}\n--- widened ---\n{b}",
+        sa.len(),
+        sb.len(),
+        first + 1,
+        sa.get(first).copied().unwrap_or(0),
+        sb.get(first).copied().unwrap_or(0),
+    ))
+}
+
 fn laws_for_directed() -> Vec<(&'static str, Check)> {
     vec![
         ("value_roundtrip", value_roundtrip as Check),
@@ -2357,6 +3054,7 @@ fn laws_for_directed() -> Vec<(&'static str, Check)> {
         ("document_fixed_point", document_fixed_point as Check),
         ("overlay_invariance", overlay_invariance as Check),
         ("serializer_agreement", serializer_agreement as Check),
+        ("encoding_does_not_move_layout", encoding_does_not_move_layout as Check),
     ]
 }
 
@@ -2467,7 +3165,9 @@ fn hostile_source_sweep() {
 
     for (name, source) in hostile_sources() {
         checked += 1;
-        if let Some(found) = parser_robustness(&source, &source) {
+        // A hand-written source, not an edit of anything, so only the laws about
+        // the text itself apply.
+        if let Some(found) = parser_robustness(&source, &source, &Mutation::Opaque) {
             // Error position is a known open question (see E1); the panic and
             // round-trip laws are not.
             if !matches!(found.broke, Broke::ErrorLine | Broke::ErrorColumn) {
@@ -2494,9 +3194,13 @@ fn hostile_source_sweep() {
     report("hostile source", checked, findings);
 }
 
-/// Not a law: how often character-aligned columns are ragged on screen.
+/// **Table columns line up on screen, not merely in character counts.**
+///
+/// Enforced for content one cell wide, where the two are the same number.
+/// Wider characters need a Unicode width table to place correctly, which is
+/// not something this crate carries, so those are parked and reported rather
+/// than failed -- see `parked_reason`.
 #[test]
-#[ignore = "observation, not a law: reports character vs display column alignment"]
 fn tables_align_on_screen() {
     let sets: Vec<(&str, RenderOptions)> = [
         ("tables", r#"{"tableMinRows":2,"tableMinColumns":2}"#),
@@ -2607,7 +3311,7 @@ fn document_comment_policy(source: &str, planted: &[(Site, String)]) -> Option<S
 
         if let Some((site, comment)) = planted.iter().find(|(_, c)| !kept.contains(c.as_str())) {
             return Some(format!(
-                "render_comments(true) at {name} lost a comment planted {site:?}\
+                "render_comments(true) at {name} lost a comment planted {site:?}: {comment:?}\
                  \n--- source ---\n{source}\n--- rendered ---\n{kept}"
             ));
         }
@@ -3010,19 +3714,45 @@ fn document_api_edits_reach_the_output() {
 fn number_accessors_agree(number: &tjson::Number) -> Option<String> {
     let text = number.as_str();
 
-    // `is_integer` is documented as "no fractional or exponent part".
-    let looks_integral = !text.contains('.') && !text.contains('e') && !text.contains('E');
-    if number.is_integer() != looks_integral {
+    // The spelling predicates, each checked against the text read independently --
+    // the point of a law is to derive the answer a second way, so these deliberately
+    // do not call the crate's own marker constants.
+    let has_exponent = text.contains('e') || text.contains('E');
+    let has_decimal = text.contains('.');
+    let sign_negative = text.starts_with('-');
+
+    for (name, got, expected) in [
+        ("has_exponent", number.has_exponent(), has_exponent),
+        ("has_decimal", number.has_decimal(), has_decimal),
+        ("is_sign_negative", number.is_sign_negative(), sign_negative),
+    ] {
+        if got != expected {
+            return Some(format!("{name}() says {got} for {text:?}, but the text says {expected}"));
+        }
+    }
+
+    // A plain integer is one whose written form says nothing the integer value does
+    // not -- so no fraction, no exponent, and not the signed zero.
+    let plain = !has_decimal && !has_exponent && text != "-0";
+    if number.is_plain_integer() != plain {
         return Some(format!(
-            "is_integer() says {} for {text:?}, which {} a fractional or exponent part",
-            number.is_integer(),
-            if looks_integral { "has no" } else { "has" }
+            "is_plain_integer() says {} for {text:?}, expected {plain}",
+            number.is_plain_integer()
         ));
     }
 
-    // Every valid JSON number is a float, possibly with lost precision.
-    if number.as_f64().is_none() {
-        return Some(format!("as_f64() is None for {text:?}, which parsed as a JSON number"));
+    // Every valid JSON number converts to a float, EXCEPT one naming a magnitude no
+    // f64 holds -- `as_f64` reports those as None rather than handing back infinity.
+    match number.as_f64() {
+        Some(f) if f.is_finite() => {}
+        Some(f) => return Some(format!("as_f64() gave the non-finite {f} for {text:?}")),
+        None => {
+            if text.parse::<f64>().is_ok_and(f64::is_finite) {
+                return Some(format!(
+                    "as_f64() is None for {text:?}, which does have a finite f64"
+                ));
+            }
+        }
     }
 
     // The integer accessors must agree with each other and with the text.
@@ -3217,4 +3947,113 @@ fn accessors_agree_with_the_data() {
         }
     }
     report("accessor agreement", checked, findings);
+}
+
+/// **Minified JSON is TJSON, or is refused for hiding something.**
+///
+/// The containment the format is built on: every simple JSON value is already a
+/// TJSON value verbatim, so the MINIMAL JSON rule closes the gap for the only two
+/// that were not -- nonempty objects and arrays.
+///
+/// Containment is not total, and the exception is the point rather than a defect.
+/// JSON requires escaping only below U+0020, so a JSON document may carry a
+/// literal ZWJ or DEL inside a string; TJSON refuses those, because a character
+/// that occupies no visible space lets someone hide data in a document a person is
+/// going to read. A parser cannot know whether a given document will be read, so
+/// it refuses in every case.
+///
+/// This law therefore pins the *size* of that exception. A refusal is allowed only
+/// when it names a forbidden character; a document turned away for any other
+/// reason -- a number spelling, an empty key, a nesting depth -- is a real
+/// containment bug, and this is the only law here that would catch one, because it
+/// is the only law that feeds the parser input this crate did not render itself.
+fn minified_json_is_tjson(json: &serde_json::Value, _options: &RenderOptions) -> Option<String> {
+    let minified = serde_json::to_string(json).expect("a Value always serializes");
+
+    let parsed: Value = match minified.parse() {
+        Ok(value) => value,
+        Err(e) => {
+            let message = e.to_string();
+            if message.contains("forbidden character") {
+                return None; // the sanctioned exception: it hid something
+            }
+            return Some(format!(
+                "minified JSON was refused for a reason other than a forbidden \
+                 character: {message}\n--- minified ---\n{minified}"
+            ));
+        }
+    };
+
+    let back = serde_json::Value::from(parsed);
+    (back != *json).then(|| {
+        format!(
+            "minified JSON parsed as TJSON to a different value\n--- minified ---\n\
+             {minified}\n--- became ---\n{back}"
+        )
+    })
+}
+
+/// **Our own minimal output is TJSON, and is a fixed point.**
+///
+/// The writer half of the rule above. Where the parser refuses a hidden character,
+/// the writer is obliged never to produce one -- it escapes the whole forbidden set
+/// even though JSON would pass it through, so the same data survives in a form a
+/// reader can see. The consequence is that everything this crate emits as MINIMAL
+/// JSON is also valid TJSON, which is what makes `--minimal` safe to pipe back in.
+///
+/// Idempotence comes with it: a document already at its minimal form has nowhere
+/// further to go, so a second pass must reproduce it byte for byte.
+fn minimal_output_is_tjson_and_a_fixed_point(
+    json: &serde_json::Value,
+    _options: &RenderOptions,
+) -> Option<String> {
+    let value: Value = json.clone().into();
+    let once = value.to_json();
+
+    let parsed: Value = match once.parse() {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return Some(format!("our own minimal output is not TJSON: {e}\n{once}"));
+        }
+    };
+
+    if parsed != value {
+        return Some(format!("minimal output did not reparse to itself\n{once}"));
+    }
+
+    let twice = parsed.to_json();
+    (twice != once).then(|| {
+        format!("minimal is not a fixed point\n--- once ---\n{once}\n--- twice ---\n{twice}")
+    })
+}
+
+/// **Our own minimal output is still JSON.**
+///
+/// Escaping more than JSON asks for is only safe because every escape we add is
+/// one JSON already understands, so the output stays readable by an ordinary JSON
+/// parser. That is the property at risk whenever the escaper changes, and it is
+/// checked against serde_json rather than argued.
+fn minimal_output_is_json(json: &serde_json::Value, _options: &RenderOptions) -> Option<String> {
+    let value: Value = json.clone().into();
+    let text = value.to_json();
+
+    serde_json::from_str::<serde_json::Value>(&text)
+        .err()
+        .map(|e| format!("our own minimal output is not valid JSON: {e}\n{text}"))
+}
+
+/// The containment set. None of the three depends on render options, so one set is
+/// enough -- the sweep varies the documents, which is the axis that matters here.
+#[test]
+fn minimal_json_and_tjson_contain_each_other() {
+    let sets = [("default", RenderOptions::default())];
+
+    for (name, check) in [
+        ("containment", minified_json_is_tjson as Check),
+        ("minimal is tjson", minimal_output_is_tjson_and_a_fixed_point as Check),
+        ("minimal is json", minimal_output_is_json as Check),
+    ] {
+        let (checked, findings) = sweep(name, check, &sets, true);
+        report(name, checked, findings);
+    }
 }

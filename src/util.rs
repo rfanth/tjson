@@ -1,3 +1,6 @@
+use crate::number::{DECIMAL_POINT, EXPONENT_MARKERS};
+use crate::position::{Columns, Marker};
+
 use crate::options::{ParseOptions, SPEC_FORMS};
 use unicode_general_category::{GeneralCategory, get_general_category};
 
@@ -5,13 +8,22 @@ pub(crate) fn count_leading_spaces(line: &str) -> usize {
     line.bytes().take_while(|byte| *byte == b' ').count()
 }
 
-pub(crate) fn spaces(count: usize) -> String {
-    " ".repeat(count)
-}
+/// The bytes of a `\uXXXX` escape: a backslash, a `u`, and four hex digits.
+///
+/// The surrogate-pair code below walks these offsets in both directions, and every
+/// one of them is this same fact -- where the hex starts, how far back the escape
+/// began, where the next one would. Written once so a reader checking one site is
+/// checking all of them, and so no future change can move some and not others.
+pub(crate) const UNICODE_ESCAPE_LEN: usize = 6;
 
+/// The hex digits in a `\uXXXX` escape.
+pub(crate) const UNICODE_ESCAPE_HEX: usize = 4;
+
+/// Where the hex digits begin within a `\uXXXX` escape, past the `\u`.
+pub(crate) const UNICODE_ESCAPE_HEX_START: usize = UNICODE_ESCAPE_LEN - UNICODE_ESCAPE_HEX;
 
 pub(crate) fn starts_with_marker_chain(content: &str) -> bool {
-    content.starts_with("[ ") || content.starts_with("{ ")
+    Marker::CHAIN.iter().any(|m| m.opens(content))
 }
 
 pub(crate) fn parse_json_string_prefix(content: &str) -> Option<(String, usize)> {
@@ -46,18 +58,38 @@ pub(crate) fn parse_json_string_prefix(content: &str) -> Option<(String, usize)>
     Some((parsed, end))
 }
 
-pub(crate) fn split_pipe_cells(row: &str) -> Option<Vec<String>> {
+/// One cell of a pipe row: its text, and where that text begins in the row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PipeCell<'a> {
+    /// Byte offset of `text` within the row that was split.
+    pub(crate) at: usize,
+    pub(crate) text: &'a str,
+}
+
+/// Split a pipe row into its cells, at the `|` characters that are not inside a
+/// quoted string.
+///
+/// Returns where each cell starts, because both callers need to point a caret at
+/// one. The header path used to rebuild these offsets after the fact by summing
+/// cell lengths and separator widths, and the row path gave up and pointed every
+/// cell error at column 1. The split already knows both, so it says both -- which
+/// also stops it copying every cell of every row into a `String` on the way out.
+///
+/// A cell is always a contiguous slice of `row`: this only finds boundaries, it
+/// never rewrites content.
+///
+/// `None` when `row` does not open with `|`, or ends inside a quoted string.
+pub(crate) fn split_pipe_cells(row: &str) -> Option<Vec<PipeCell<'_>>> {
     if !row.starts_with('|') {
         return None;
     }
     let mut cells = Vec::new();
-    let mut current = String::new();
+    let mut start = 0usize;
     let mut in_string = false;
     let mut escaped = false;
 
-    for ch in row.chars() {
+    for (index, ch) in row.char_indices() {
         if in_string {
-            current.push(ch);
             if escaped {
                 escaped = false;
                 continue;
@@ -71,14 +103,12 @@ pub(crate) fn split_pipe_cells(row: &str) -> Option<Vec<String>> {
         }
 
         match ch {
-            '"' => {
-                in_string = true;
-                current.push(ch);
-            }
+            '"' => in_string = true,
             '|' => {
-                cells.push(std::mem::take(&mut current));
+                cells.push(PipeCell { at: start, text: &row[start..index] });
+                start = index + '|'.len_utf8();
             }
-            _ => current.push(ch),
+            _ => {}
         }
     }
 
@@ -86,7 +116,7 @@ pub(crate) fn split_pipe_cells(row: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    cells.push(current);
+    cells.push(PipeCell { at: start, text: &row[start..] });
     Some(cells)
 }
 
@@ -200,7 +230,7 @@ pub(crate) fn parse_bare_key_prefix(content: &str, forms: &ParseOptions) -> Opti
         || forms.is_colon_like(first)
         || forms.is_underscore_like(first)
         || forms.is_foreslash_like(first)
-        || is_forbidden_bare_char(first)
+        || is_weird_class_char(first)
     {
         return None;
     }
@@ -211,7 +241,7 @@ pub(crate) fn parse_bare_key_prefix(content: &str, forms: &ParseOptions) -> Opti
         // Rule 6 forbids a COLONLIKE anywhere, rule 7 the weird classes. Both
         // can hide inside \p{L}, so neither is implied by the character set
         // below and both end the run rather than being accepted into it.
-        if forms.is_colon_like(ch) || (ch != ' ' && is_forbidden_bare_char(ch)) {
+        if forms.is_colon_like(ch) || (ch != ' ' && is_weird_class_char(ch)) {
             break;
         }
         if is_unicode_letter_or_number(ch)
@@ -240,11 +270,7 @@ pub(crate) fn parse_bare_key_prefix(content: &str, forms: &ParseOptions) -> Opti
     // what lets a folded key keep collecting continuations across a comma, where
     // returning `None` here reported "not a bare key at all".
     while let Some(last) = content[..end].chars().next_back() {
-        if last == ' '
-            || forms.is_comma_like(last)
-            || forms.is_quote_like(last)
-            || forms.is_pipe_like(last)
-        {
+        if is_held_back_from_run_end(last, forms) {
             end -= last.len_utf8();
         } else {
             break;
@@ -253,7 +279,22 @@ pub(crate) fn parse_bare_key_prefix(content: &str, forms: &ParseOptions) -> Opti
     if end == 0 { None } else { Some(end) }
 }
 
+/// May a bare key run end on `ch`, or is it held back?
+///
+/// One rule, asked from two directions: [`parse_bare_key_prefix`] strips this set
+/// off the end of a run, and `only_held_back_tail` asks whether what the run gave
+/// back is only this set. They were written separately and disagreed about
+/// PIPELIKE, which is reachable because U+01C0 is a PIPELIKE *and* a letter, so
+/// it gets into a run and is then stripped from it. A folded bare key ending in
+/// one was refused with `there is no colon on this line` -- and there was one, on
+/// the continuation. Neither side of the pair may hold this list alone.
+pub(crate) fn is_held_back_from_run_end(ch: char, forms: &ParseOptions) -> bool {
+    ch == ' ' || forms.is_comma_like(ch) || forms.is_quote_like(ch) || forms.is_pipe_like(ch)
+}
 
+
+/// True for `\p{L}` and `\p{N}`: the categories a BARE KEY may open with, and the
+/// bulk of what any bare run may continue with.
 pub(crate) fn is_unicode_letter_or_number(ch: char) -> bool {
     matches!(
         get_general_category(ch),
@@ -268,35 +309,167 @@ pub(crate) fn is_unicode_letter_or_number(ch: char) -> bool {
     )
 }
 
-pub(crate) fn is_forbidden_literal_tjson_char(ch: char) -> bool {
-    // Almost every character of almost every document is ASCII, and no ASCII
-    // character can reach any test below the first: the default-ignorable set
-    // begins at U+034F, private use at U+E000, the noncharacters at U+FDD0, and
-    // the two separators are U+2028/9. So for ASCII the control ranges are the
-    // whole answer, and taking it here skips a Unicode general-category lookup
-    // per character. That lookup was 17% of the time spent rendering a 46 MB
-    // document, which is what makes an early return worth writing down.
-    //
-    // `forbidden_literal_ascii_matches_the_general_path` pins the equivalence
-    // over the entire ASCII range, so this cannot drift from the code below.
-    if ch.is_ascii() {
-        return is_forbidden_control_char(ch);
-    }
-    is_forbidden_control_char(ch)
-        || is_default_ignorable_code_point(ch)
-        || is_private_use_code_point(ch)
-        || is_noncharacter_code_point(ch)
-        || matches!(ch, '\u{2028}' | '\u{2029}')
+/// Which rule of the specification's FORBIDDEN CHARACTERS a character breaks.
+///
+/// Carried rather than collapsed to a bool because the six answers want six
+/// different sentences: a C1 control is almost always an encoding mistake, a
+/// private use code point is a private agreement that cannot survive being
+/// shared, and a line separator is a character that makes the reader and the
+/// parser disagree about where the lines are. "Forbidden" alone tells a reader
+/// none of that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForbiddenLiteral {
+    /// Rule 1, ASCII half: C0 other than TAB, LF and CR, or DEL.
+    Control,
+    /// Rule 1, non-ASCII half: the C1 block, U+0080..=U+009F.
+    C1Control,
+    /// Rule 2, and rule 4 with it -- every Bidi_Control character is `Cf`.
+    DefaultIgnorable,
+    /// Rule 5.
+    PrivateUse,
+    /// Rule 6.
+    Noncharacter,
+    /// Rule 7: U+2028 and U+2029.
+    LineSeparator,
 }
 
-pub(crate) fn is_forbidden_bare_char(ch: char) -> bool {
+impl ForbiddenLiteral {
+    /// What went wrong and what to do about it, for `ch`.
+    ///
+    /// Every arm names an escape route, because every one of these characters is
+    /// legal escaped -- the document is rejected over how it was written, not over
+    /// what it holds.
+    pub(crate) fn describe(self, ch: char) -> String {
+        let code = format!("U+{:04X}", ch as u32);
+        match self {
+            Self::Control => format!(
+                "{code} is a control character, and only TAB, LF and CR may appear \
+                 literally -- write it as an escape inside a JSON string"
+            ),
+            Self::C1Control => format!(
+                "{code} is a C1 control character (U+0080 to U+009F), which is almost \
+                 always Windows-1252 text read as Latin-1 rather than anything intended \
+                 -- check the encoding of the source, and if it really is meant, write \
+                 it as an escape inside a JSON string"
+            ),
+            Self::DefaultIgnorable => format!(
+                "{code} is a default-ignorable code point, invisible where it is \
+                 rendered, so a reader cannot see what the parser is reading -- write \
+                 it as an escape inside a JSON string"
+            ),
+            Self::PrivateUse => format!(
+                "{code} is a private use code point, whose meaning is an agreement \
+                 between two particular parties and does not survive being read by \
+                 anyone else -- write it as an escape inside a JSON string"
+            ),
+            Self::Noncharacter => format!(
+                "{code} is a noncharacter, permanently reserved by Unicode and never \
+                 assigned to anything -- write it as an escape inside a JSON string"
+            ),
+            Self::LineSeparator => format!(
+                "{code} is a Unicode line separator, which a reader honoring Unicode \
+                 line breaking shows as a line break and this parser does not -- the \
+                 lines you see would not be the lines that are read; write it as an \
+                 escape inside a JSON string"
+            ),
+        }
+    }
+}
+
+/// Which FORBIDDEN CHARACTERS rule `ch` breaks, or `None` if it may appear
+/// literally.
+///
+/// The single decider for that question. [`is_forbidden_literal_tjson_char`] is
+/// this with the answer thrown away, never a second implementation.
+///
+/// Six of the specification's seven rules have a clause below. Rule 3, surrogates,
+/// has none and needs none: a Rust `char` is a Unicode scalar value, so a surrogate
+/// cannot be built and cannot appear in a `&str`. The type forbids what this
+/// function would otherwise have to. (Escaped surrogate pairs inside a JSON STRING
+/// are a separate question, settled where that string is decoded.)
+pub(crate) fn check_forbidden_literal(ch: char) -> Result<(), ForbiddenLiteral> {
+    if ch.is_ascii() {
+        // FAST PATH, ascii only.
+        //
+        // Rule 1's ASCII half is the whole answer here, because every other rule's
+        // set begins above ASCII: C1 at U+0080, default-ignorable at U+00AD, private
+        // use at U+E000, the noncharacters at U+FDD0, the separators at U+2028. So
+        // this skips a Unicode general-category lookup per character, and that
+        // lookup was 17% of the time spent rendering a 46 MB document.
+        //
+        // `forbidden_literal_ascii_matches_the_general_path` pins this against the
+        // general check below across all 128, reason and all, so they cannot drift.
+        if is_forbidden_ascii_control_char(ch) {
+            return Err(ForbiddenLiteral::Control);
+        }
+        return Ok(());
+    }
+
+    // General check, works for ASCII and not.
+    if is_forbidden_ascii_control_char(ch) {
+        return Err(ForbiddenLiteral::Control);          // rule 1, ASCII half
+    }
+    if is_c1_control_char(ch) {
+        return Err(ForbiddenLiteral::C1Control);        // rule 1, the half that is not ASCII
+    }
+    if is_default_ignorable_code_point(ch) {
+        return Err(ForbiddenLiteral::DefaultIgnorable); // rule 2, and rule 4 with it
+    }
+    if is_private_use_code_point(ch) {
+        return Err(ForbiddenLiteral::PrivateUse);       // rule 5
+    }
+    if is_noncharacter_code_point(ch) {
+        return Err(ForbiddenLiteral::Noncharacter);     // rule 6
+    }
+    if is_line_or_paragraph_separator(ch) {
+        return Err(ForbiddenLiteral::LineSeparator);    // rule 7
+    }
+    Ok(())
+}
+
+/// True for characters that may never appear literally anywhere in a TJSON
+/// document -- not in a bare run, not inside a JSON string, not in a comment.
+/// They can only be written as `\uXXXX` escapes. `scan_lines` rejects them across
+/// the whole input before parsing begins, so no later scan can meet one.
+///
+/// For callers that only need the verdict; [`check_forbidden_literal`] decides.
+pub(crate) fn is_forbidden_literal_tjson_char(ch: char) -> bool {
+    check_forbidden_literal(ch).is_err()
+}
+
+/// True for U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR, the two
+/// characters Unicode defines as line breaks that are neither CR nor LF.
+///
+/// TJSON splits lines on `\n` and reads indentation as structure, while a reader
+/// honoring Unicode's line breaking treats these as breaks too. A document holding
+/// one literally would show a person a different set of lines than the parser
+/// measures -- and in a format where location is depth, that is a document meaning
+/// two things at once.
+///
+/// `Zl` and `Zp` contain exactly one character each and always will, so matching
+/// the two literals is the whole of both categories and avoids a category lookup.
+fn is_line_or_paragraph_separator(ch: char) -> bool {
+    matches!(ch, '\u{2028}' | '\u{2029}')
+}
+
+/// True for the "weird" characters a BARE STRING -- and so a BARE KEY -- may not
+/// contain anywhere: `\p{C}`, `\p{Z}`, `\p{M}`, and Default_Ignorable_Code_Point.
+/// That is bare key rule 7, which the specification notes is fully implied by the
+/// bare string rules it comes from.
+///
+/// This is a *category* test and nothing more. It says nothing about the
+/// structural characters (`|`, `` ` ``, `"`, `:`, `[`, `{`, `\`), which a bare run
+/// excludes by not admitting them to its character class, and nothing about the
+/// lookalike sets, which are checked in their own right. Reading it as "the
+/// characters forbidden in a bare key" is wrong in both directions.
+pub(crate) fn is_weird_class_char(ch: char) -> bool {
     // Of the categories excluded below, only Control and SpaceSeparator reach
     // into ASCII -- Format, Unassigned, the two separators and the three mark
     // classes all begin above it. So for ASCII the answer is the controls plus
     // the space, and the general-category lookup can be skipped entirely. That
     // lookup sits in the innermost loop of every bare key and bare string scan.
     //
-    // `forbidden_bare_ascii_matches_the_general_path` checks this against the
+    // `weird_class_ascii_matches_the_general_path` checks this against the
     // general path for all 128, so it cannot drift.
     if ch.is_ascii() {
         return ch <= ' ' || ch == '\u{7F}';
@@ -318,16 +491,52 @@ pub(crate) fn is_forbidden_bare_char(ch: char) -> bool {
     )
 }
 
-pub(crate) fn is_forbidden_control_char(ch: char) -> bool {
+/// The ASCII half of rule 1: C0 except TAB, LF and CR, plus DEL.
+///
+/// TAB is absent on purpose. It is legal as a character and rejected separately as
+/// a layout error by `Parser::ensure_line_has_no_tabs`, because an indent measured
+/// in tabs is a different problem from a character that cannot be represented.
+pub(crate) fn is_forbidden_ascii_control_char(ch: char) -> bool {
     matches!(
         ch,
         '\u{0000}'..='\u{0008}'
             | '\u{000B}'..='\u{000C}'
             | '\u{000E}'..='\u{001F}'
-            | '\u{007F}'..='\u{009F}'
+            | '\u{007F}'
     )
 }
 
+/// The non-ASCII half of rule 1: the C1 controls, U+0080..=U+009F.
+///
+/// ECMA-48's 8-bit control block -- NEL, CSI, SS2, OSC and the rest. Two bytes each
+/// in UTF-8, so `char::is_ascii` is false for every one of them and an ASCII fast
+/// path cannot stand in for this test.
+///
+/// Two reasons beyond the rule. U+0085 NEL is a line break under Unicode's rules, so
+/// a literal one shows a reader lines the parser does not measure, exactly as
+/// [`is_line_or_paragraph_separator`] describes. And these byte values are printable
+/// in Windows-1252 (curly quotes, em dash, the euro sign) while being controls in
+/// Latin-1, so text mislabelled between the two lands here -- a literal C1 character
+/// almost always means an encoding went wrong upstream, and accepting it would
+/// preserve the damage.
+pub(crate) fn is_c1_control_char(ch: char) -> bool {
+    matches!(ch, '\u{0080}'..='\u{009F}')
+}
+
+/// True for Unicode's Default_Ignorable_Code_Point property: every `Format`
+/// character, plus the code points that carry the property without being `Format`
+/// and so have to be listed by hand.
+///
+/// Those listed ones are why the property is checked at all rather than the
+/// category alone. Several are `\p{L}` -- the Hangul fillers U+115F, U+1160,
+/// U+3164 and U+FFA0 are `OtherLetter` -- so a category test would admit an
+/// invisible letter wherever letters are allowed.
+///
+/// This also carries the specification's rule 4, Bidi_Control, which has no clause
+/// of its own anywhere: every character with that property is `Cf` and so is caught
+/// by the `Format` test below. That containment is a fact about Unicode rather than
+/// anything this code arranges, so narrowing this to the enumerated list alone would
+/// silently make bidi overrides legal, with nothing failing to say so.
 pub(crate) fn is_default_ignorable_code_point(ch: char) -> bool {
     matches!(get_general_category(ch), GeneralCategory::Format)
         || matches!(
@@ -348,10 +557,17 @@ pub(crate) fn is_default_ignorable_code_point(ch: char) -> bool {
         )
 }
 
+/// True for the three Private Use Areas, whose meaning is by definition an
+/// agreement between two parties and cannot survive being written to a document
+/// meant to be read by anyone else.
 pub(crate) fn is_private_use_code_point(ch: char) -> bool {
     matches!(get_general_category(ch), GeneralCategory::PrivateUse)
 }
 
+/// True for the 66 code points Unicode permanently reserves as noncharacters:
+/// U+FDD0..=U+FDEF, and the last two of every plane (`xxFFFE` and `xxFFFF`).
+/// They are valid `char` values in Rust and are guaranteed never to be assigned,
+/// so nothing legitimate can be trying to write one.
 pub(crate) fn is_noncharacter_code_point(ch: char) -> bool {
     let code_point = ch as u32;
     (0xFDD0..=0xFDEF).contains(&code_point)
@@ -360,24 +576,47 @@ pub(crate) fn is_noncharacter_code_point(ch: char) -> bool {
 
 pub(crate) fn render_json_string(value: &str) -> String {
     let mut rendered = String::with_capacity(value.len() + 2);
-    rendered.push('"');
+    push_json_string(&mut rendered, value);
+    rendered
+}
+
+/// Writes `value` as a quoted JSON STRING directly into `out`.
+///
+/// The single escaper for every JSON STRING this crate emits, in TJSON output
+/// and in MINIMAL JSON alike. Both must agree, because the spec requires the
+/// forbidden set to be escaped "EVERY TIME IN EVERY CONTEXT, INCLUDING MINIMAL
+/// JSON" -- a rule with two writers and one implementation is a rule that holds
+/// in one of them.
+///
+/// What it escapes is a strict superset of what JSON requires: the seven
+/// mandatory escapes, everything at or below U+001F, and additionally the TJSON
+/// forbidden set, which JSON is happy to pass through literally. So the output
+/// is always valid JSON *and* always valid TJSON. `json_output_still_satisfies_serde_json`
+/// pins the first half against serde_json as an oracle;
+/// `no_writer_emits_a_forbidden_literal` pins the second.
+///
+/// Writes in place rather than returning a `String`, because the callers are
+/// building one document out of many strings and an owned return would allocate
+/// and discard a buffer per string and per key.
+pub(crate) fn push_json_string(out: &mut String, value: &str) {
+    out.reserve(value.len() + 2);
+    out.push('"');
     for ch in value.chars() {
         match ch {
-            '"' => rendered.push_str("\\\""),
-            '\\' => rendered.push_str("\\\\"),
-            '\u{0008}' => rendered.push_str("\\b"),
-            '\u{000C}' => rendered.push_str("\\f"),
-            '\n' => rendered.push_str("\\n"),
-            '\r' => rendered.push_str("\\r"),
-            '\t' => rendered.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
             ch if ch <= '\u{001F}' || is_forbidden_literal_tjson_char(ch) => {
-                push_json_unicode_escape(&mut rendered, ch);
+                push_json_unicode_escape(out, ch);
             }
-            _ => rendered.push(ch),
+            _ => out.push(ch),
         }
     }
-    rendered.push('"');
-    rendered
+    out.push('"');
 }
 
 pub(crate) fn push_json_unicode_escape(rendered: &mut String, ch: char) {
@@ -423,15 +662,19 @@ pub(crate) fn safe_json_split(s: &str, split_at: usize) -> usize {
 
 /// Attempt to fold a bare string into multiple lines with `/ ` continuations.
 /// Returns None if folding is not needed or not possible.
-/// The first element is the first line (`{spaces(indent)} {first_segment}`),
-/// subsequent elements are fold lines (`{spaces(indent)}/ {segment}`).
+/// The first element is the first line (the indent, then the first segment);
+/// subsequent elements are fold lines (the indent, then `/ `, then a segment).
 /// Smallest run of bare digits worth a line of its own. A shorter chunk says
 /// nothing about where in the number it sits, so it reads as debris rather
 /// than as part of a value.
 const MIN_NUMBER_FOLD_CHUNK: usize = 10;
 
-pub(crate) fn find_number_fold_point(s: &str, avail: usize, auto_mode: bool) -> usize {
-    let avail = avail.min(s.len());
+pub(crate) fn find_number_fold_point(s: &str, avail: Columns, auto_mode: bool) -> usize {
+    // The budget spent along the text, which is where it runs out in bytes. A
+    // JSON number is ASCII, so this equalled `avail` itself before the crossing
+    // existed -- true by what the data happens to be rather than by anything
+    // stated, which is the kind of agreement that stops holding quietly.
+    let avail = avail.spent_in(s);
     if avail == 0 || avail >= s.len() {
         return 0;
     }
@@ -449,7 +692,7 @@ pub(crate) fn find_number_fold_point(s: &str, avail: usize, auto_mode: bool) -> 
         // room for a single division, the exponent is the meaningful place to
         // put it.
         let candidate = &s[..avail];
-        for markers in [&['e', 'E'][..], &['.'][..]] {
+        for markers in [&EXPONENT_MARKERS[..], &[DECIMAL_POINT][..]] {
             if let Some(pos) = candidate.rfind(markers)
                 && pos >= MIN_NUMBER_FOLD_CHUNK {
                     return pos;
@@ -580,11 +823,11 @@ fn leading_unicode_escape(tail: &str) -> Option<char> {
         if b.len() < 6 || b[0] != b'\\' || b[1] != b'u' {
             return None;
         }
-        u32::from_str_radix(t.get(2..6)?, 16).ok()
+        u32::from_str_radix(t.get(UNICODE_ESCAPE_HEX_START..UNICODE_ESCAPE_LEN)?, 16).ok()
     };
     let high = one(tail)?;
     if (0xD800..0xDC00).contains(&high) {
-        let low = one(tail.get(6..)?)?;
+        let low = one(tail.get(UNICODE_ESCAPE_LEN..)?)?;
         if (0xDC00..0xE000).contains(&low) {
             let scalar = 0x1_0000 + ((high - 0xD800) << 10) + (low - 0xDC00);
             return char::from_u32(scalar);
@@ -616,12 +859,15 @@ fn trailing_unicode_escape(head: &str) -> Option<char> {
     let one = |h: &str| -> Option<u32> {
         let bytes = h.as_bytes();
         let n = bytes.len();
-        if n < 6 || bytes[n - 6] != b'\\' || bytes[n - 5] != b'u' {
+        if n < UNICODE_ESCAPE_LEN
+            || bytes[n - UNICODE_ESCAPE_LEN] != b'\\'
+            || bytes[n - UNICODE_ESCAPE_LEN + 1] != b'u'
+        {
             return None;
         }
         // An odd run of backslashes before the `u` means this one is escaped.
         let mut slashes = 0;
-        let mut k = n - 6;
+        let mut k = n - UNICODE_ESCAPE_LEN;
         while k > 0 && head.as_bytes()[k - 1] == b'\\' {
             slashes += 1;
             k -= 1;
@@ -629,13 +875,13 @@ fn trailing_unicode_escape(head: &str) -> Option<char> {
         if slashes % 2 == 1 {
             return None;
         }
-        u32::from_str_radix(&h[n - 4..], 16).ok()
+        u32::from_str_radix(&h[n - UNICODE_ESCAPE_HEX..], 16).ok()
     };
 
     let low = one(head)?;
     if (0xDC00..0xE000).contains(&low) {
         // Low surrogate: pull the high one in front of it to rebuild the pair.
-        let high = one(&head[..head.len() - 6])?;
+        let high = one(&head[..head.len() - UNICODE_ESCAPE_LEN])?;
         if (0xD800..0xDC00).contains(&high) {
             let scalar = 0x1_0000 + ((high - 0xD800) << 10) + (low - 0xDC00);
             return char::from_u32(scalar);
@@ -663,12 +909,12 @@ fn splits_an_escape(s: &str, i: usize) -> bool {
         }
         let len = if b.get(k + 1) == Some(&b'u') {
             let high = s
-                .get(k + 2..k + 6)
+                .get(k + UNICODE_ESCAPE_HEX_START..k + UNICODE_ESCAPE_LEN)
                 .and_then(|h| u32::from_str_radix(h, 16).ok())
                 .unwrap_or(0);
             let paired = (0xD800..0xDC00).contains(&high)
-                && b.get(k + 6) == Some(&b'\\')
-                && b.get(k + 7) == Some(&b'u');
+                && b.get(k + UNICODE_ESCAPE_LEN) == Some(&b'\\')
+                && b.get(k + UNICODE_ESCAPE_LEN + 1) == Some(&b'u');
             if paired { 12 } else { 6 }
         } else {
             2
@@ -800,8 +1046,8 @@ fn is_separable_ideograph(ch: char) -> bool {
 
 /// Largest byte index at or before `budget` where a fold is provably safe, or 0
 /// when there is none -- in which case the caller must not fold at all.
-pub(crate) fn floor_safe_fold_point(s: &str, budget: usize) -> usize {
-    let mut i = floor_char_boundary(s, budget);
+pub(crate) fn floor_safe_fold_point(s: &str, budget: Columns) -> usize {
+    let mut i = budget.spent_in(s);
     while i > 0 {
         if is_known_safe_fold_point(s, i) || is_extended_safe_fold_point(s, i) {
             return i;
@@ -812,25 +1058,6 @@ pub(crate) fn floor_safe_fold_point(s: &str, budget: usize) -> usize {
         }
     }
     0
-}
-
-/// Largest byte index at or before `budget` that is a character boundary in `s`.
-///
-/// Fold budgets are measured in columns but used to slice a `&str`, which is
-/// indexed in bytes. The two coincide only for ASCII, so a budget landing inside
-/// a multi-byte character would panic on the slice. Clamping down to the nearest
-/// boundary keeps the cut legal.
-///
-/// Note this makes the cut *safe*, not *correct* for width: a character wider
-/// than one column (CJK, emoji) still consumes more display columns than the
-/// budget accounts for, so folded lines can overflow the requested width. Fixing
-/// that needs east-asian-width data and is deliberately out of scope here.
-pub(crate) fn floor_char_boundary(s: &str, budget: usize) -> usize {
-    let mut i = budget.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 /// Find a fold point in a bare string candidate slice.
@@ -980,22 +1207,39 @@ pub(crate) fn find_json_fold_point(s: &str) -> usize {
 ///
 /// Always folds at `\n` boundaries — each newline in the original value becomes a `/ `
 /// continuation point. Within-piece width folding follows `string_multiline_fold_style`.
-pub(crate) fn split_table_row_for_fold(row: &str, max_len: usize) -> Option<(String, String)> {
-    if row.len() <= max_len {
+/// Split a table row for a `/ ` continuation, at a space inside a cell's value.
+///
+/// `max_columns` is a budget in columns, not a byte length. The two coincide only
+/// for ASCII, and comparing a byte length against a column budget folded a row of
+/// CJK at a third of the intended width while the same table in Latin text did
+/// not fold at all.
+///
+/// **The space at the split rides with the second half.** A fold joins its two
+/// lines by concatenation and contributes nothing of its own, so a character
+/// dropped here is a character gone from the document: this used to skip the
+/// space, and `"alpha beta"` came back from a folded row as `"alphabeta"`
+/// whenever the split landed inside a value rather than in a cell's padding.
+pub(crate) fn split_table_row_for_fold(
+    row: &str,
+    max_columns: Columns,
+) -> Option<(String, String)> {
+    if Columns::of(row) <= max_columns {
         return None;
     }
     let bytes = row.as_bytes();
-    // Walk backwards from max_len to find a split point inside a string cell.
-    // A valid fold point is a space character that is inside a cell value
-    // (not the padding spaces right after `|`, and not the leading space of a bare string).
-    let scan_end = max_len.min(bytes.len());
-    // Find the last space that is preceded by a non-space (i.e., inside content)
+    // Where the budget runs out, in bytes: the start of the character one past
+    // it, or the end of the row if it has fewer characters than that.
+    let scan_end = max_columns.spent_in(row);
+    // Walk back for a split point inside a cell value -- a space preceded by
+    // something other than the `|` that opens a cell or the padding after it.
     let mut pos = scan_end;
     while pos > 0 {
         pos -= 1;
         if bytes[pos] == b' ' && pos > 0 && bytes[pos - 1] != b'|' && bytes[pos - 1] != b' ' {
             let before = row[..pos].to_owned();
-            let after = row[pos + ' '.len_utf8()..].to_owned(); // skip the space itself
+            // `pos` is an ASCII space, so it is a character boundary and this
+            // slice cannot split one.
+            let after = row[pos..].to_owned();
             return Some((before, after));
         }
     }
@@ -1032,6 +1276,10 @@ pub(crate) enum BareStringFault {
     TrailingQuote,
     LeadingComma,
     TrailingComma,
+    LeadingSquareBracket,
+    TrailingSquareBracket,
+    LeadingCurlyBracket,
+    TrailingCurlyBracket,
     ConsecutiveSpaces,
     ForbiddenChar(char),
 }
@@ -1114,6 +1362,51 @@ impl BareStringFault {
             Self::TrailingComma => {
                 "a bare string cannot end with a comma or be packed with commas, as we may \
                  not know what was meant -- double quote this string, or give it its own line"
+                    .to_owned()
+            }
+            // What a bracket is mistaken for is not the same at the two ends, so
+            // the two messages are not the same message.
+            //
+            // A *leading* one has three readings to be confused with: the `[ `
+            // marker that opens a level, the first half of `[]`, and the opening
+            // of MINIMAL JSON.
+            //
+            // A *trailing* one closes something in exactly one place: the end of
+            // MINIMAL JSON. Nowhere else does TJSON close a container with a
+            // bracket -- containers close by indentation -- and `[]` is a
+            // two-character spelling of the empty array rather than an open and a
+            // close. Saying "it would read as an array closing here" would
+            // describe a construct the format does not have.
+            //
+            // Interior brackets stay legal and both messages say so, since `a[b`
+            // being fine is otherwise surprising next to `[ab` not being.
+            Self::LeadingSquareBracket => {
+                "a bare string cannot begin with `[` or `]`, or a character shaped like one; \
+                 `[ ` opens an array level, `[]` is the whole spelling of an empty array, and \
+                 MINIMAL JSON opens with `[` -- so this reads as nesting that is not there. \
+                 Double quote it. Inside the string they are fine: `a[b` is a bare string."
+                    .to_owned()
+            }
+            Self::TrailingSquareBracket => {
+                "a bare string cannot end with `[` or `]`, or a character shaped like one; the \
+                 one place a trailing `]` closes anything is the end of MINIMAL JSON, as in \
+                 `k:[90,85,92]`, and that is enough for a reader to take this for one. Double \
+                 quote it. Inside the string they are fine: `a[b` is a bare string."
+                    .to_owned()
+            }
+            Self::LeadingCurlyBracket => {
+                "a bare string cannot begin with `{` or `}`, or a character shaped like one; \
+                 `{ ` opens an object level, `{}` is the whole spelling of an empty object, \
+                 and MINIMAL JSON opens with `{` -- so this reads as nesting that is not \
+                 there. Double quote it. Inside the string they are fine: `a{b` is a bare \
+                 string."
+                    .to_owned()
+            }
+            Self::TrailingCurlyBracket => {
+                "a bare string cannot end with `{` or `}`, or a character shaped like one; the \
+                 one place a trailing `}` closes anything is the end of MINIMAL JSON, as in \
+                 `k:{\"a\":1}`, and that is enough for a reader to take this for one. Double \
+                 quote it. Inside the string they are fine: `a{b` is a bare string."
                     .to_owned()
             }
             Self::ConsecutiveSpaces => {
@@ -1227,7 +1520,7 @@ fn show(ch: char) -> String {
     if ch == ' ' {
         return "a space".to_owned();
     }
-    if is_forbidden_bare_char(ch) || ch.is_control() {
+    if is_weird_class_char(ch) || ch.is_control() {
         return format!("U+{:04X}", ch as u32);
     }
     format!("`{}` (U+{:04X})", ch, ch as u32)
@@ -1235,59 +1528,59 @@ fn show(ch: char) -> String {
 
 /// The first rule a candidate bare key breaks, under `forms`.
 ///
-/// Mirrors [`bare_string_fault`], and checks the rules in the order the
+/// Mirrors [`check_bare_string`], and checks the rules in the order the
 /// specification states them so the message names the first thing a reader
 /// would notice.
-pub(crate) fn bare_key_fault(key: &str, forms: &ParseOptions) -> Option<BareKeyFault> {
+pub(crate) fn check_bare_key(key: &str, forms: &ParseOptions) -> Result<(), BareKeyFault> {
     let Some(first) = key.chars().next() else {
-        return Some(BareKeyFault::Empty);
+        return Err(BareKeyFault::Empty);
     };
     let last = key.chars().next_back().expect("non-empty");
 
     if forms.is_pipe_like(first) {
-        return Some(BareKeyFault::LeadingPipe(first));
+        return Err(BareKeyFault::LeadingPipe(first));
     }
     if forms.is_comma_like(first) {
-        return Some(BareKeyFault::LeadingComma(first));
+        return Err(BareKeyFault::LeadingComma(first));
     }
     if forms.is_quote_like(first) {
-        return Some(BareKeyFault::LeadingQuote(first));
+        return Err(BareKeyFault::LeadingQuote(first));
     }
     if !is_unicode_letter_or_number(first) {
-        return Some(BareKeyFault::LeadingNotLetterOrNumber(first));
+        return Err(BareKeyFault::LeadingNotLetterOrNumber(first));
     }
 
     if last == ' ' {
-        return Some(BareKeyFault::TrailingSpace);
+        return Err(BareKeyFault::TrailingSpace);
     }
     if forms.is_pipe_like(last) {
-        return Some(BareKeyFault::TrailingPipe(last));
+        return Err(BareKeyFault::TrailingPipe(last));
     }
     if forms.is_comma_like(last) {
-        return Some(BareKeyFault::TrailingComma(last));
+        return Err(BareKeyFault::TrailingComma(last));
     }
     if forms.is_quote_like(last) {
-        return Some(BareKeyFault::TrailingQuote(last));
+        return Err(BareKeyFault::TrailingQuote(last));
     }
 
     let mut previous_space = false;
     for ch in key.chars() {
         if forms.is_colon_like(ch) {
-            return Some(BareKeyFault::Colonlike(ch));
+            return Err(BareKeyFault::Colonlike(ch));
         }
-        if ch != ' ' && is_forbidden_bare_char(ch) {
-            return Some(BareKeyFault::ForbiddenChar(ch));
+        if ch != ' ' && is_weird_class_char(ch) {
+            return Err(BareKeyFault::ForbiddenChar(ch));
         }
         if ch == ' ' {
             if previous_space {
-                return Some(BareKeyFault::ConsecutiveSpaces);
+                return Err(BareKeyFault::ConsecutiveSpaces);
             }
             previous_space = true;
         } else {
             previous_space = false;
         }
     }
-    None
+    Ok(())
 }
 
 
@@ -1296,53 +1589,73 @@ pub(crate) fn bare_key_fault(key: &str, forms: &ParseOptions) -> Option<BareKeyF
 ///
 /// Emptying the PIPELIKE set lets `abc\u{2502}` through; `abc|` still fails,
 /// because the vertical line is tested here directly and is in no set.
-pub(crate) fn bare_string_fault(
+pub(crate) fn check_bare_string(
     value: &str,
     forms: &ParseOptions,
-) -> Option<BareStringFault> {
+) -> Result<(), BareStringFault> {
     let Some(first) = value.chars().next() else {
-        return Some(BareStringFault::Empty);
+        return Err(BareStringFault::Empty);
     };
     let last = value.chars().next_back().unwrap();
 
     if first == ' ' {
-        return Some(BareStringFault::LeadingSpace);
+        return Err(BareStringFault::LeadingSpace);
     }
     if last == ' ' {
-        return Some(BareStringFault::TrailingSpace);
+        return Err(BareStringFault::TrailingSpace);
     }
     // Start only, both of these. A `/` or a `_` inside a bare string sits in
     // running text where nothing structural begins, and neither one closes
     // anything -- unlike the pipe and the quote, which are barred at both ends
     // because a reader meets them as edges.
     if forms.is_foreslash_like(first) {
-        return Some(BareStringFault::LeadingSlash);
+        return Err(BareStringFault::LeadingSlash);
     }
     if forms.is_underscore_like(first) {
-        return Some(BareStringFault::LeadingUnderscore);
+        return Err(BareStringFault::LeadingUnderscore);
     }
     if forms.is_pipe_like(first) {
-        return Some(BareStringFault::LeadingPipe);
+        return Err(BareStringFault::LeadingPipe);
     }
     if forms.is_pipe_like(last) {
-        return Some(BareStringFault::TrailingPipe);
+        return Err(BareStringFault::TrailingPipe);
     }
     // Before the quotelike test, which would otherwise swallow it: `"` is a
     // member of the quotelike set as well as being the real thing.
     if first == '"' {
-        return Some(BareStringFault::LeadingDoubleQuote);
+        return Err(BareStringFault::LeadingDoubleQuote);
     }
     if forms.is_quote_like(first) {
-        return Some(BareStringFault::LeadingQuote);
+        return Err(BareStringFault::LeadingQuote);
     }
     if forms.is_quote_like(last) {
-        return Some(BareStringFault::TrailingQuote);
+        return Err(BareStringFault::TrailingQuote);
     }
     if forms.is_comma_like(first) {
-        return Some(BareStringFault::LeadingComma);
+        return Err(BareStringFault::LeadingComma);
     }
     if forms.is_comma_like(last) {
-        return Some(BareStringFault::TrailingComma);
+        return Err(BareStringFault::TrailingComma);
+    }
+    // Spec, BARE STRINGS: "the limitation is not sided, in that neither side of a
+    // square bracket or curly brace can appear at the beginning, and neither side
+    // ... at the end". So both characters are barred in both positions, and the
+    // four tests below are the whole rule rather than an opener/closer pairing.
+    //
+    // Interior brackets stay legal: `a[b` is a bare string and reads as one,
+    // because nothing structural begins in the middle of a value. This is the
+    // same start-and-end shape the pipe and the quote have.
+    if forms.is_square_bracket_like(first) {
+        return Err(BareStringFault::LeadingSquareBracket);
+    }
+    if forms.is_square_bracket_like(last) {
+        return Err(BareStringFault::TrailingSquareBracket);
+    }
+    if forms.is_curly_bracket_like(first) {
+        return Err(BareStringFault::LeadingCurlyBracket);
+    }
+    if forms.is_curly_bracket_like(last) {
+        return Err(BareStringFault::TrailingCurlyBracket);
     }
 
     let mut previous_space = false;
@@ -1350,35 +1663,35 @@ pub(crate) fn bare_string_fault(
         // Not governed by the lookalike sets: these are characters that cannot
         // be seen at all rather than characters that resemble syntax, so there
         // is no set to empty and no reading under which they are safe unquoted.
-        if ch != ' ' && is_forbidden_bare_char(ch) {
-            return Some(BareStringFault::ForbiddenChar(ch));
+        if ch != ' ' && is_weird_class_char(ch) {
+            return Err(BareStringFault::ForbiddenChar(ch));
         }
         if ch == ' ' {
             if previous_space {
-                return Some(BareStringFault::ConsecutiveSpaces);
+                return Err(BareStringFault::ConsecutiveSpaces);
             }
             previous_space = true;
         } else {
             previous_space = false;
         }
     }
-    None
+    Ok(())
 }
 
 /// The generator's question: may this string be written bare in specification
 /// TJSON? Always the specification's reading -- what tjson emits does not
 /// depend on how some caller elsewhere configured a parser.
 pub(crate) fn is_allowed_bare_string(value: &str) -> bool {
-    bare_string_fault(value, &SPEC_FORMS).is_none()
+    check_bare_string(value, &SPEC_FORMS).is_ok()
 }
 
 #[cfg(test)]
 mod character_class_tests {
     use super::*;
 
-    /// The ASCII shortcut in `is_forbidden_bare_char`, against the general path.
+    /// The ASCII shortcut in `is_weird_class_char`, against the general path.
     #[test]
-    fn forbidden_bare_ascii_matches_the_general_path() {
+    fn weird_class_ascii_matches_the_general_path() {
         for cp in 0u32..0x80 {
             let ch = char::from_u32(cp).expect("ASCII is always a char");
             let full = is_forbidden_literal_tjson_char(ch)
@@ -1394,7 +1707,7 @@ mod character_class_tests {
                         | GeneralCategory::SpacingMark
                         | GeneralCategory::EnclosingMark
                 );
-            assert_eq!(is_forbidden_bare_char(ch), full, "U+{cp:04X}");
+            assert_eq!(is_weird_class_char(ch), full, "U+{cp:04X}");
         }
     }
 
@@ -1430,20 +1743,32 @@ mod character_class_tests {
     fn forbidden_literal_ascii_matches_the_general_path() {
         for cp in 0u32..0x80 {
             let ch = char::from_u32(cp).expect("ASCII is always a char");
-            let full = is_forbidden_control_char(ch)
-                || is_default_ignorable_code_point(ch)
-                || is_private_use_code_point(ch)
-                || is_noncharacter_code_point(ch)
-                || matches!(ch, '\u{2028}' | '\u{2029}');
+            // The general path written out, reasons and all, so the shortcut is
+            // pinned to *which rule* fires and not merely to the verdict. A fast
+            // path returning the right answer for the wrong reason would now be a
+            // failure, because the reason reaches the user's error message.
+            let general = if is_forbidden_ascii_control_char(ch) {
+                Err(ForbiddenLiteral::Control)
+            } else if is_c1_control_char(ch) {
+                Err(ForbiddenLiteral::C1Control)
+            } else if is_default_ignorable_code_point(ch) {
+                Err(ForbiddenLiteral::DefaultIgnorable)
+            } else if is_private_use_code_point(ch) {
+                Err(ForbiddenLiteral::PrivateUse)
+            } else if is_noncharacter_code_point(ch) {
+                Err(ForbiddenLiteral::Noncharacter)
+            } else if matches!(ch, '\u{2028}' | '\u{2029}') {
+                Err(ForbiddenLiteral::LineSeparator)
+            } else {
+                Ok(())
+            };
             assert_eq!(
-                is_forbidden_literal_tjson_char(ch),
-                full,
+                check_forbidden_literal(ch),
+                general,
                 "U+{cp:04X} disagrees with the general path"
             );
         }
     }
-
-    use super::*;
 
     /// Spec, QUOTELIKE CHARACTER DEFINITION -- the whole set on one line, so a
     /// spec change is a one-line diff here and the two cannot drift apart

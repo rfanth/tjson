@@ -219,6 +219,32 @@ pub(crate) const SPEC_UNDERSCORELIKE: &[char] = &[
     '\u{02CD}', '\u{23BC}', '\u{23BD}', '\u{2581}', '\u{FF3F}',
 ];
 
+/// The SQUAREBRACKETLIKE set as the specification enumerates it, less the two
+/// square brackets.
+///
+/// The test is shape, and only shape: a character whose outline a reader would
+/// take for a square bracket, whatever its width, weight or name. That is a
+/// narrower question than the one [`SPEC_QUOTELIKE`] asks, which admits
+/// characters that do a quote's *job* without looking like one.
+///
+/// `[` opens an array level as `[ ` and spells the empty array as `[]`, so a
+/// lookalike at either end of a BARE STRING reads as nesting that is not there.
+pub(crate) const SPEC_SQUAREBRACKETLIKE: &[char] = &[
+    '\u{2772}', '\u{2773}', '\u{27E6}', '\u{27E7}', '\u{298B}', '\u{298C}', '\u{3010}',
+    '\u{3011}', '\u{301A}', '\u{301B}', '\u{FF3B}', '\u{FF3D}',
+];
+
+/// The CURLYBRACKETLIKE set as the specification enumerates it, less the two
+/// curly brackets.
+///
+/// The same shape test as [`SPEC_SQUAREBRACKETLIKE`], applied to a brace: a
+/// vertical stroke with a mid-height point and curled ends. Smaller than its
+/// neighbour because fewer characters are drawn that way.
+///
+/// `{` opens an object level as `{ ` and spells the empty object as `{}`.
+pub(crate) const SPEC_CURLYBRACKETLIKE: &[char] =
+    &['\u{2774}', '\u{2775}', '\u{FF5B}', '\u{FF5D}'];
+
 /// The characters the format is actually built on, paired with the set of
 /// impostors each one attracts. A caller may replace a set; it may never touch
 /// this column, and `ParseOptions::checked` refuses a set that tries.
@@ -234,6 +260,12 @@ const STRUCTURAL_UNDERSCORE: &[char] = &['_'];
 /// One, because the solidus is the only character that opens a fold or an
 /// indent offset glyph.
 const STRUCTURAL_FORESLASH: &[char] = &['/'];
+/// Two, and the pair is why: the specification bars *both* from *both* ends of a
+/// BARE STRING -- "the limitation is not sided" -- so a closer opening a string
+/// is as much a misreading as an opener does.
+const STRUCTURAL_SQUAREBRACKET: &[char] = &['[', ']'];
+/// Two, for the same reason as [`STRUCTURAL_SQUAREBRACKET`].
+const STRUCTURAL_CURLYBRACKET: &[char] = &['{', '}'];
 
 /// How the parser reads bare strings and bare keys.
 ///
@@ -261,6 +293,8 @@ pub(crate) struct ParseOptions {
     quotelike: &'static [char],
     underscorelike: &'static [char],
     foreslashlike: &'static [char],
+    squarebracketlike: &'static [char],
+    curlybracketlike: &'static [char],
 
     /// Spaces at the end of a line, where they carry nothing. No reading of
     /// this reaches inside a multiline string body, where a trailing space is
@@ -481,6 +515,8 @@ pub(crate) const SPEC_FORMS: ParseOptions = ParseOptions {
     quotelike: SPEC_QUOTELIKE,
     underscorelike: SPEC_UNDERSCORELIKE,
     foreslashlike: SPEC_FORESLASHLIKE,
+    squarebracketlike: SPEC_SQUAREBRACKETLIKE,
+    curlybracketlike: SPEC_CURLYBRACKETLIKE,
     trailing_spaces: TrailingSpaces::Reject,
     comment_placement_error: CommentPlacementError::Reject,
     byte_order_mark: ByteOrderMark::Reject,
@@ -500,13 +536,15 @@ impl Default for ParseOptions {
 /// never checked -- [`SPEC_FORMS`] is a struct literal and goes nowhere near a
 /// builder.
 #[cfg(test)]
-const LOOKALIKE_SETS: [(&str, &[char], &[char]); 6] = [
+const LOOKALIKE_SETS: [(&str, &[char], &[char]); 8] = [
     ("commalike", STRUCTURAL_COMMA, SPEC_COMMALIKE),
     ("colonlike", STRUCTURAL_COLON, SPEC_COLONLIKE),
     ("pipelike", STRUCTURAL_PIPE, SPEC_PIPELIKE),
     ("quotelike", STRUCTURAL_QUOTE, SPEC_QUOTELIKE),
     ("underscorelike", STRUCTURAL_UNDERSCORE, SPEC_UNDERSCORELIKE),
     ("foreslashlike", STRUCTURAL_FORESLASH, SPEC_FORESLASHLIKE),
+    ("squarebracketlike", STRUCTURAL_SQUAREBRACKET, SPEC_SQUAREBRACKETLIKE),
+    ("curlybracketlike", STRUCTURAL_CURLYBRACKET, SPEC_CURLYBRACKETLIKE),
 ];
 
 impl ParseOptions {
@@ -648,6 +686,26 @@ impl ParseOptions {
         Ok(self)
     }
 
+    /// Replace the SQUAREBRACKETLIKE set.
+    #[allow(dead_code)]
+    pub(crate) fn squarebracketlike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.squarebracketlike = Self::checked("squarebracketlike", STRUCTURAL_SQUAREBRACKET, set)?;
+        Ok(self)
+    }
+
+    /// Replace the CURLYBRACKETLIKE set.
+    #[allow(dead_code)]
+    pub(crate) fn curlybracketlike(
+        mut self,
+        set: &'static [char],
+    ) -> std::result::Result<Self, String> {
+        self.curlybracketlike = Self::checked("curlybracketlike", STRUCTURAL_CURLYBRACKET, set)?;
+        Ok(self)
+    }
+
     /// How to read spaces at the end of a line that carry no data.
     #[allow(dead_code)] // Awaiting the presets these are here to be assembled into.
     pub(crate) fn trailing_spaces(mut self, policy: TrailingSpaces) -> Self {
@@ -746,6 +804,28 @@ impl ParseOptions {
             return ch == '_';
         }
         self.underscorelike.binary_search(&ch).is_ok()
+    }
+
+    /// Would a reader take `ch` for a square bracket? Not how to find one; see
+    /// [`Self::is_comma_like`].
+    ///
+    /// Both brackets answer true, in either position. The specification bars
+    /// both from both ends of a BARE STRING, so there is no side to this
+    /// question and no caller that wants only one of them.
+    pub(crate) fn is_square_bracket_like(&self, ch: char) -> bool {
+        if ch.is_ascii() {
+            return STRUCTURAL_SQUAREBRACKET.contains(&ch);
+        }
+        self.squarebracketlike.binary_search(&ch).is_ok()
+    }
+
+    /// Would a reader take `ch` for a curly bracket? Not how to find one; see
+    /// [`Self::is_comma_like`]. Unsided, like [`Self::is_square_bracket_like`].
+    pub(crate) fn is_curly_bracket_like(&self, ch: char) -> bool {
+        if ch.is_ascii() {
+            return STRUCTURAL_CURLYBRACKET.contains(&ch);
+        }
+        self.curlybracketlike.binary_search(&ch).is_ok()
     }
 }
 

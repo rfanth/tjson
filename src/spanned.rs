@@ -7,6 +7,7 @@
 //! and never feeds the renderer. A tree built programmatically has no spans — that case
 //! is served by deserializing from `&Value` instead.
 
+use crate::position::{ByteOffset, Line};
 use crate::number::Number;
 use crate::tree::{
     ContainerFacts, EntryFacts, NodeRef, ScalarFacts, Span, StringFacts, Tree,
@@ -126,8 +127,12 @@ fn from_json_with_span(value: serde_json::Value, span: Span) -> SpannedValue {
 }
 
 /// Resolve a span back to 1-based line/column plus the source line's text, for
-/// ParseError-style display. Columns are counted in characters to match the parser's
-/// error convention. O(input) — called only when an error is actually being reported.
+/// ParseError-style display. O(input) — called only when an error is actually
+/// being reported.
+///
+/// The column comes from [`Column::at`], which is where what a column *is* gets
+/// decided. This used to count characters itself, which agreed with the parser
+/// only for as long as nobody changed either one.
 pub(crate) fn locate(input: &str, span: Span) -> (usize, usize, String) {
     let target = span.start as usize;
     let mut line_start = 0usize;
@@ -138,8 +143,8 @@ pub(crate) fn locate(input: &str, span: Span) -> (usize, usize, String) {
         // (line-ending bytes included), or when this is the final line.
         if target <= line_start + content_len || input.len() <= line_end {
             let offset_in_line = target.saturating_sub(line_start).min(content_len);
-            let column = raw[..offset_in_line].chars().count() + 1;
-            return (line_index + 1, column, raw[..content_len].to_owned());
+            let column = Line::new(&raw[..content_len]).column_at(ByteOffset::new(offset_in_line));
+            return (line_index + 1, column.number(), raw[..content_len].to_owned());
         }
         line_start = line_end + 1;
     }

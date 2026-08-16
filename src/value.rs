@@ -8,7 +8,7 @@ use crate::parse::MultilineLocalEol;
 use crate::render::Renderer;
 use crate::util::{
     is_allowed_bare_string, is_forbidden_literal_tjson_char,
-    is_reserved_word, parse_bare_key_prefix,
+    is_reserved_word, parse_bare_key_prefix, push_json_string,
 };
 
 /// Single-pass string classifier. Carries the original `&str` plus all renderer-relevant
@@ -255,10 +255,9 @@ fn write_json(value: &Value, out: &mut String) {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => out.push_str(&n.to_string()),
-        Value::String(s) => {
-            // serde_json handles all JSON string escaping correctly.
-            out.push_str(&serde_json::to_string(s).expect("string serialization is infallible"))
-        }
+        // Not serde_json: it escapes what JSON requires, and TJSON requires more.
+        // See `push_json_string`.
+        Value::String(s) => push_json_string(out, s),
         Value::Array(values) => {
             out.push('[');
             for (i, v) in values.iter().enumerate() {
@@ -271,7 +270,7 @@ fn write_json(value: &Value, out: &mut String) {
             out.push('{');
             for (i, Entry { key, value }) in entries.iter().enumerate() {
                 if i > 0 { out.push(','); }
-                out.push_str(&serde_json::to_string(key).expect("string serialization is infallible"));
+                push_json_string(out, key);
                 out.push(':');
                 write_json(value, out);
             }

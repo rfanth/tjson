@@ -5,6 +5,10 @@ use serde_json::Value as JsonValue;
 use crate::number::Number;
 
 use crate::error::ParseError;
+use crate::position::{
+    ARRAY_STARTER, ByteOffset, Column, DocumentOffset, FileIndent, Glyph, Leading, Line,
+    LogicalIndent, Marker, OffColumnMarker, Opener,
+};
 use crate::tree::{NodeRef,
     ContainerFacts, EntryFacts, KeyForm, MultilineFlavor, RawComment, ScalarFacts, Span,
     BareForm, StringFacts, StringForm, Tree,
@@ -15,9 +19,50 @@ use crate::options::{
 };
 use crate::util::*;
 
+/// How a packed array line separates its elements.
+///
+/// `Undetermined` is not a missing answer, it is the first element's real state:
+/// the separator that decides the packing comes *after* it. Naming a packing
+/// before one has been seen is guessing, and the guess used to be "comma" --
+/// which told the writer of a space packed line, containing no commas at all,
+/// that the comma after a bare string becomes part of it.
+/// How deeply a document may nest before the parser refuses it.
+///
+/// Recursive descent turns nesting depth into stack depth, and a document can
+/// ask for more of it than the process has: past a few thousand levels the
+/// parser died with a segmentation fault, which is not a failure a library may
+/// hand its caller.
+///
+/// 128 because that is serde_json's own recursion limit. MINIMAL JSON inside a
+/// document is parsed by serde_json and already stops there, so the two agree
+/// rather than disagreeing somewhere past here. A floor, not a ceiling -- a
+/// later release can raise it once descending costs less than a stack frame per
+/// level.
+///
+/// Counted, not derived from the indent. Those are different quantities: a
+/// ` /<` re-anchors the frame at a value's position and so adds a level of
+/// indentation with no container behind it, which makes a document of true
+/// depth 89 measure about 131 logical levels.
+const MAX_DEPTH: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Packing {
+    Undetermined,
+    Comma,
+    Space,
+}
+
+/// Where a value sits, for the parts of the reading that depend on it -- which
+/// are mostly the diagnostics, because the advice for a badly spelled element is
+/// different on each kind of line.
+///
+/// `ArrayLine` carries its packing rather than standing alone: the two packings
+/// have opposite rules about bare strings (one forbids them, the other requires
+/// them), so a message that knows only "some array line" has to guess which rule
+/// it is explaining.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArrayLineValueContext {
-    ArrayLine,
+    ArrayLine(Packing),
     ObjectValue,
     SingleValue,
 }
@@ -28,6 +73,24 @@ pub(crate) enum ContainerKind {
     Object,
 }
 
+/// What a multiline string's line breaks *mean* when its body is put back
+/// together into data.
+///
+/// Not the file's line ending. Those are two independent things and keeping them
+/// apart is what lets a TJSON file survive a whole-file EOL conversion with its
+/// data intact:
+///
+/// - The **file EOL** is a render option ([`crate::options::Eol`]). It
+///   terminates every physical line, multiline body lines included, and it is
+///   presentation -- disposable, and safe for `unix2dos` or `dos2unix` to change.
+/// - The **LOCAL EOL INDICATOR** is this. It is written as *text* after the
+///   opening backticks -- the four characters `\r\n`, or nothing for LF -- and
+///   says what to join the body lines with when reconstructing the value.
+///
+/// The indicator being text rather than bytes is the whole trick. A tool that
+/// rewrites every line ending in the file cannot touch it, so a string whose data
+/// holds CRLF still reassembles as CRLF after the file has been converted to LF,
+/// and vice versa. The data's EOL is a property of the data and travels with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum MultilineLocalEol {
     #[default]
@@ -46,6 +109,24 @@ enum FoldNext<'a> {
         Comment,
     /// Anything else: the fold is over.
     Ends,
+    /// A `/ ` continuation is on this line, but not at the indent that was asked
+    /// about.
+    ///
+    /// Split out from [`Self::Ends`] because the two are opposite facts wearing
+    /// one answer. `Ends` means the value finished; this means the value did
+    /// *not* finish and the caller was looking in the wrong column. Merged, a
+    /// caller asking "is this a folded key" hears "no" and builds an array
+    /// element out of an object entry -- no error, a different document. That
+    /// bug has been found once already, at the `child_indent` call site, and
+    /// was fixed there rather than here.
+    ///
+    /// Carries nothing. It briefly held the indent it was found at, which no
+    /// caller ever read: the one error built from this variant is
+    /// [`Parser::stray_fold_marker`], which takes the line number and measures
+    /// the column itself. A marker at an odd column has no structural indent to
+    /// report anyway -- that line is refused by [`Leading::of`] before any fold
+    /// walk reaches it.
+    ContinuesElsewhere,
 }
 
 /// If `content` looks like an attempted key -- there is a colon on the line --
@@ -55,19 +136,37 @@ enum FoldNext<'a> {
 /// colonlike character -- otherwise `ab\u{02D0}cd:1` would be measured as the
 /// key `ab`, which is perfectly valid, and the colonlike that actually caused
 /// the rejection would never be named.
-fn attempted_bare_key_fault(content: &str, forms: &ParseOptions) -> Option<BareKeyFault> {
-    let end = content.find(':')?;
-    bare_key_fault(&content[..end], forms)
+fn check_attempted_bare_key(content: &str, forms: &ParseOptions) -> Result<(), BareKeyFault> {
+    // No colon means this was never a key attempt, which reports as `Ok` for the
+    // same reason a valid key does: the caller only wants a fault when there is one
+    // to name, and "nothing to say about this line" is the same answer either way.
+    let Some(end) = content.find(':') else {
+        return Ok(());
+    };
+    check_bare_key(&content[..end], forms)
 }
 
 impl MultilineLocalEol {
-    fn as_str(self) -> &'static str {
+    /// The bytes to join body lines with when rebuilding the value: `0A`, or
+    /// `0D 0A`. Used only on the data side, never written to a file.
+    ///
+    /// [`Self::opener_suffix`] is the same fact spelled as text for a document to
+    /// carry. Two representations, one meeting point, so the names say which is
+    /// which rather than leaving a reader to compare the bodies.
+    fn bytes(self) -> &'static str {
         match self {
             Self::Lf => "\n",
             Self::CrLf => "\r\n",
         }
     }
 
+    /// How the LOCAL EOL INDICATOR is spelled after the opening backticks: the
+    /// literal characters `\r\n`, four of them, not the two bytes they name. LF
+    /// is the default and writes nothing.
+    ///
+    /// Text on purpose. An EOL converter run over the whole file rewrites every
+    /// line ending in it and leaves this untouched, which is why the data's EOL
+    /// survives a conversion that changes the file's.
     pub(crate) fn opener_suffix(self) -> &'static str {
         match self {
             Self::Lf => "",
@@ -78,10 +177,36 @@ impl MultilineLocalEol {
 
 
 pub(crate) struct IndentFrame {
-    /// Amount added to raw file indents to get logical (structural) indents.
+    /// Amount added to file indents to get logical (structural) indents.
     offset: usize,
-    /// Raw file column where the matching ` />` close glyph must appear.
-    close_file_indent: usize,
+    /// File column where the matching ` />` close glyph must appear.
+    close_file_indent: FileIndent,
+}
+
+/// What a line turned out to be, when asked whether it closes the open frame.
+///
+/// [`Self::Misplaced`] carries where the closer belonged, because that is the
+/// number the reader needs and the only place that knows it is the frame -- an
+/// error raised further out has to guess, and the one that used to be raised
+/// guessed the enclosing object's indent instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CloseGlyph {
+    /// The frame closed. The caller advances past this line.
+    Closed,
+    /// Not a close glyph. Ordinary content, to be parsed as such.
+    NotACloser,
+    /// A ` />` that is not where this frame's closer belongs.
+    Misplaced { expected: FileIndent },
+    /// A ` />` with no ` /<` open to close.
+    ///
+    /// Split from [`Self::NotACloser`] for the reason [`Self::Misplaced`] was:
+    /// the two are opposite facts. `NotACloser` means the line is ordinary
+    /// content, which is legal wherever it sits; this means the line is a closer
+    /// and there is nothing for it to close, which is legal nowhere. Merged, it
+    /// reached whichever parser claimed the line next and was reported as that
+    /// parser's disappointment -- `invalid object key` at one indent, a decent
+    /// message at another, decided by position rather than by the fault.
+    NothingOpen,
 }
 
 /// Tracks the active indent offset caused by ` /<` / ` />` glyphs.
@@ -99,30 +224,65 @@ impl IndentTracker {
         self.stack.last().map_or(0, |f| f.offset)
     }
 
-    /// Convert a raw file indent to the logical (structural) indent.
-    fn logical(&self, file_indent: usize) -> usize {
-        file_indent + self.offset()
+    /// Cross from the file frame into the structural one. The only way in.
+    fn to_logical(&self, file: FileIndent) -> LogicalIndent {
+        file.shifted_right(self.offset())
     }
 
-    /// Push a glyph context.  `glyph_file_indent` is the raw column of the ` /<` line.
-    fn push_glyph(&mut self, glyph_file_indent: usize) {
+    /// Cross back out, for the column a glyph or a span must actually occupy.
+    fn to_file(&self, logical: LogicalIndent) -> FileIndent {
+        logical.shifted_left(self.offset())
+    }
+
+    /// Push a glyph context. `glyph` is the file column of the ` /<` line's
+    /// structure, not counting the glyph's own leading space.
+    ///
+    /// Everything nested inside shifts by the glyph's *logical* column, which is
+    /// why this goes through [`Self::to_logical`] rather than adding the current
+    /// offset a second time by hand.
+    fn push_glyph(&mut self, glyph: FileIndent) {
         self.stack.push(IndentFrame {
-            offset: glyph_file_indent + self.offset(),
-            close_file_indent: glyph_file_indent,
+            offset: self.to_logical(glyph).as_shift(),
+            close_file_indent: glyph,
         });
     }
 
-    /// If `line` is the close glyph ` />` for the current context, pop and return true.
-    fn try_pop_close(&mut self, line: &str) -> bool {
-        if let Some(f) = self.stack.last()
-            && line.len() == f.close_file_indent + 3
-            && line[..f.close_file_indent].bytes().all(|b| b == b' ')
-            && &line[f.close_file_indent..] == " />"
-        {
-            self.stack.pop();
-            return true;
+    /// Does `line` close the current indent context? Pops the frame if so.
+    ///
+    /// Answers in three cases rather than yes/no. A ` />` at the wrong column is
+    /// neither a close nor ordinary content, and a `bool` forces it to be read as
+    /// one of the two -- it used to come back `false` and be reparsed as content,
+    /// which is legal at any deeper indent, so a closer written two columns too
+    /// far in silently became an array element and the document changed meaning
+    /// with no diagnostic at all. The third case is that bug made unrepresentable.
+    fn try_pop_close(&mut self, line: Line<'_>) -> CloseGlyph {
+        // Spaces and then `/>` and nothing else: the shape of a closer, wherever
+        // it happens to sit. Where it sits is the next question, not this one.
+        if line.text().trim_start_matches(' ') != Glyph::IndentClose.body() {
+            return CloseGlyph::NotACloser;
         }
-        false
+        let Some(frame) = self.stack.last() else {
+            // A closer with nothing open is a different complaint, and it used to
+            // be deferred to "the caller that knows there is no frame to talk
+            // about" -- which all three callers then dropped with
+            // `NotACloser => {}`, leaving the line to be read as ordinary content
+            // and diagnosed by whatever tried to claim it next. An obligation
+            // stated in a comment and enforced nowhere; a variant instead, so the
+            // caller has to answer for it.
+            return CloseGlyph::NothingOpen;
+        };
+        let expected = frame.close_file_indent;
+        // One test covers both halves: the line must reach the frame's indent,
+        // and what sits there must be exactly the glyph -- whose own leading
+        // space is the column the frame's indent names.
+        let sits_where_it_belongs = line
+            .byte_offset_of(expected)
+            .is_some_and(|at| &line[at..] == Glyph::IndentClose.text());
+        if sits_where_it_belongs {
+            self.stack.pop();
+            return CloseGlyph::Closed;
+        }
+        CloseGlyph::Misplaced { expected }
     }
 }
 
@@ -133,6 +293,21 @@ pub(crate) struct Parser<'a, T: Tree> {
     /// The caller's reading of the format. Consulted rather than copied apart:
     /// the lookalike sets it carries are what `is_*_like` here means.
     options: ParseOptions,
+    /// The document's outermost structural level, crossed out of
+    /// [`ParseOptions::start_indent`] once.
+    ///
+    /// That field is a bare `usize` because it is configuration; this is the same
+    /// number as a position, and the crossing asserts what the rest of the parser
+    /// then relies on -- that the outermost level is even, like every other. Done
+    /// here rather than at each use, where eleven `LogicalIndent::new` calls each
+    /// re-asserted it and any one of them could have been handed something else.
+    start: LogicalIndent,
+    /// How many containers deep the parse currently is.
+    ///
+    /// Held rather than derived, and kept in step with the call stack by the two
+    /// tail wrappers alone -- neither has a `?` in it, so no path can skip the
+    /// decrement.
+    depth: usize,
     idt: IndentTracker,
     /// Comment lines seen but not yet attached to a node. Only populated when
     /// `T::KEEPS_COMMENTS`; drained at the next node-creating site, so a comment
@@ -143,9 +318,22 @@ pub(crate) struct Parser<'a, T: Tree> {
 
 pub(crate) struct LineSpan {
     /// Byte offset of the first character of the line in the original input.
-    start: usize,
+    start: DocumentOffset,
     /// Byte length of the line content, excluding any line-ending bytes (`\r\n` or `\n`).
     len: usize,
+}
+
+impl LineSpan {
+    /// This line's content, borrowed from the input it was scanned from.
+    ///
+    /// The one place a document offset and a byte length are added together.
+    /// Both are unambiguously bytes here -- the offset came from scanning this
+    /// input and the length was measured on this line -- which is the only
+    /// condition under which the arithmetic means anything.
+    fn text<'a>(&self, input: &'a str) -> Line<'a> {
+        let start = self.start.bytes();
+        Line::new(&input[start..start + self.len])
+    }
 }
 
 pub(crate) fn scan_lines(input: &str) -> std::result::Result<Vec<LineSpan>, ParseError> {
@@ -155,17 +343,36 @@ pub(crate) fn scan_lines(input: &str) -> std::result::Result<Vec<LineSpan>, Pars
         let len = if raw.ends_with('\r') { raw.len() - 1 } else { raw.len() };
         let content = &raw[..len];
         for (col, ch) in content.chars().enumerate() {
-            if is_forbidden_literal_tjson_char(ch) {
+            // The reason travels into the message: which of the FORBIDDEN
+            // CHARACTERS rules caught this is the whole of what a reader needs,
+            // and `forbidden character U+200E` on its own tells them nothing
+            // about what U+200E is or why it is out.
+            if let Err(reason) = check_forbidden_literal(ch) {
                 return Err(ParseError::new(
                     line_index + 1,
-                    col + 1,
-                    format!("forbidden character U+{:04X} must be escaped", ch as u32),
+                    Column::one_based(col + 1),
+                    format!("forbidden character: {}", reason.describe(ch)),
                     None,
                 ));
             }
         }
-        offsets.push(LineSpan { start: pos, len });
-        pos += raw.len() + 1; // +1 for the '\n'
+        // A final newline terminates the last line rather than starting another, so
+        // the empty tail `split('\n')` hands back is not a line of the document.
+        // Keeping it made every loop that walks lines see one line that is not
+        // there -- which is how an unterminated `` reported "body lines must start
+        // with '| '" against a line that does not exist, instead of the
+        // unterminated-string error that was already written and simply never
+        // reached for any file ending the way files normally end.
+        let is_phantom_tail = raw.is_empty() && line_index > 0 && pos == input.len();
+        if !is_phantom_tail {
+            offsets.push(LineSpan { start: DocumentOffset::new(pos), len });
+        }
+        // `split('\n')` consumes exactly the one byte it split on, and a CRLF
+        // line's `\r` is still inside `raw` -- `len` above excludes it from the
+        // content, `raw.len()` here does not. So this advances by the whole
+        // physical line under either line ending, and the `1` is the separator
+        // the split ate, not an assumption that a line ending is one byte.
+        pos += raw.len() + 1;
     }
     Ok(offsets)
 }
@@ -178,7 +385,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         // Span offsets are stored as u32 (see tree::Span); bound the input before any
         // are produced so an oversized document fails loudly instead of mis-spanning.
         if input.len() > u32::MAX as usize {
-            return Err(ParseError::new(1, 1, "input larger than 4 GiB is not supported", None));
+            return Err(ParseError::new(1, Column::FIRST, "input larger than 4 GiB is not supported", None));
         }
 
         // Settled here, before anything reads a line, so the rest of the parser
@@ -190,11 +397,11 @@ impl<'a, T: Tree> Parser<'a, T> {
             (Some(_), ByteOrderMark::Reject) => {
                 return Err(ParseError::new(
                     1,
-                    1,
+                    Column::FIRST,
                     "this input opens with a byte order mark (U+FEFF), which TJSON has no \
                      place for. It is invisible, so the file looks identical to one that \
                      loads -- save it as UTF-8 without a BOM, which most editors offer as \
-                     an encoding choice",
+                     an encoding choice.",
                     None,
                 ));
             }
@@ -205,6 +412,8 @@ impl<'a, T: Tree> Parser<'a, T> {
             input,
             line_offsets: scan_lines(input)?,
             line: 0,
+            start: LogicalIndent::new(options.start_indent),
+            depth: 0,
             options,
             idt: IndentTracker::new(),
             pending_comments: Vec::new(),
@@ -212,12 +421,27 @@ impl<'a, T: Tree> Parser<'a, T> {
         };
         parser.skip_ignorable_lines()?;
         if parser.line >= parser.line_offsets.len() {
-            return Err(ParseError::new(1, 1, "empty input", None));
+            // A file with comments in it is not empty on screen, so saying only
+            // "empty input" reads as the parser being broken. It is still the right
+            // verdict -- comments have no JSON representation, so a document of
+            // nothing but comments carries no value -- and saying which of the two
+            // cases this is costs a `trim`.
+            let only_comments = !input.trim().is_empty();
+            return Err(ParseError::new(
+                1,
+                Column::FIRST,
+                if only_comments {
+                    "empty input: a TJSON document must contain a value, and this one has only comments"
+                } else {
+                    "empty input: a TJSON document must contain a value"
+                },
+                None,
+            ));
         }
         let root_pending = parser.take_pending_comments();
         let mut value = parser.parse_root_value()?;
         if T::KEEPS_COMMENTS && !root_pending.is_empty() {
-            T::attach_comments_before(&mut value, root_pending, options.start_indent);
+            T::attach_comments_before(&mut value, root_pending, parser.start);
         }
         parser.skip_ignorable_lines()?;
         if T::KEEPS_COMMENTS {
@@ -227,10 +451,10 @@ impl<'a, T: Tree> Parser<'a, T> {
             }
         }
         if parser.line < parser.line_offsets.len() {
-            let current = parser.current_line().unwrap_or("").trim_start();
+            let current = parser.current_line().map_or("", Line::text).trim_start();
             let msg = if current.starts_with("/>") {
                 "unexpected /> indent offset glyph: no previous matching /< indent offset glyph"
-            } else if current.starts_with("/ ") {
+            } else if current.starts_with(Marker::Fold.text()) {
                 "unexpected fold marker: no open string to fold"
             } else {
                 // Two different mistakes arrive here and the line alone cannot
@@ -243,7 +467,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 "unexpected trailing content: the document's value ended above this line, so \
                  nothing on it belongs to that value. A TJSON document holds exactly one value \
                  -- either this line's indent is wrong and it should sit under the value above, \
-                 or it is a second value and needs a document of its own"
+                 or it is a second value and needs a document of its own."
             };
             return Err(parser.error_current(msg));
         }
@@ -261,7 +485,7 @@ impl<'a, T: Tree> Parser<'a, T> {
 
     fn line_span(&self, index: usize) -> Span {
         match self.line_offsets.get(index) {
-            Some(line) => Span::new(line.start, line.len),
+            Some(line) => Span::new(line.start.bytes(), line.len),
             None => Span::default(),
         }
     }
@@ -272,20 +496,20 @@ impl<'a, T: Tree> Parser<'a, T> {
 
     /// Span of `len` bytes at byte column `col` of the current line; the whole current
     /// line when the caller lost column tracking (`col == None`).
-    fn span_at(&self, col: Option<usize>, len: usize) -> Span {
+    fn span_at(&self, col: Option<ByteOffset>, len: usize) -> Span {
         match (col, self.line_offsets.get(self.line)) {
-            (Some(col), Some(line)) if col <= line.len => {
-                Span::new(line.start + col, len.min(line.len - col))
+            (Some(col), Some(line)) if col.bytes() <= line.len => {
+                Span::new(line.start.plus(col.bytes()).bytes(), len.min(line.len - col.bytes()))
             }
             _ => self.current_span(),
         }
     }
 
-    fn scalar_facts_at(&self, col: Option<usize>, len: usize) -> ScalarFacts {
+    fn scalar_facts_at(&self, col: Option<ByteOffset>, len: usize) -> ScalarFacts {
         ScalarFacts { span: self.span_at(col, len) }
     }
 
-    fn string_facts_at(&self, form: StringForm, col: Option<usize>, len: usize) -> StringFacts {
+    fn string_facts_at(&self, form: StringForm, col: Option<ByteOffset>, len: usize) -> StringFacts {
         StringFacts { form, span: self.span_at(col, len) }
     }
 
@@ -304,39 +528,64 @@ impl<'a, T: Tree> Parser<'a, T> {
     fn parse_root_value(&mut self) -> std::result::Result<T, ParseError> {
         let line = self
             .current_line()
-            .ok_or_else(|| ParseError::new(1, 1, "empty input", None))?
+            // Defensive: the constructor rejects a valueless document before this
+            // runs, so reaching here means the line cursor moved without a line to
+            // move to. Worded the same as that check so the two cannot look like
+            // different faults.
+            .ok_or_else(|| {
+                ParseError::new(
+                    1,
+                    Column::FIRST,
+                    "empty input: a TJSON document must contain a value",
+                    None,
+                )
+            })?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let file_indent = count_leading_spaces(&line);
-        let indent = self.idt.logical(file_indent);
-        let content = &line[file_indent..];
+        let leading = line
+            .leading()
+            .map_err(|fault| self.marker_off_column(self.line, line, fault))?;
+        let indent = self.idt.to_logical(leading.indent);
 
-        if indent == self.options.start_indent && starts_with_marker_chain(content) {
-            return self.parse_marker_chain_line(content, indent);
+        // An opener means the value is a bare string, whatever its text looks
+        // like: `  [ [ 1` after an opening quote is the string "[ [ 1", not a
+        // marker chain. `unopened` is that rule rather than a guard beside it --
+        // there is no way to reach the text without answering the question.
+        if indent == self.start
+            && let Some(unopened) = leading.unopened(line)
+            && starts_with_marker_chain(unopened)
+        {
+            return self.parse_marker_chain_line(unopened, indent);
         }
 
-        // Standalone root-level start glyph: ` /<` at structural indent start_indent+2.
-        // Structural indent is always even; file_indent is structural+1 (the glyph's leading space).
-        let root_glyph_struct = (self.options.start_indent + 2).saturating_sub(self.idt.offset());
-        if file_indent == root_glyph_struct + 1 && content == "/<" {
-            self.idt.push_glyph(root_glyph_struct);
+        // Standalone root-level start glyph: ` /<` one level below the root.
+        let root_glyph = self.idt.to_file(self.start.deeper(1));
+        if leading.opener == Opener::Glyph && leading.indent == root_glyph {
+            self.idt.push_glyph(root_glyph);
             self.line += 1;
             self.skip_ignorable_lines()?;
             return self.parse_root_value();
         }
 
-        if indent <= self.options.start_indent + 1 {
+        // `<=` alone, where this used to allow one more column. Both operands are
+        // even -- the type says so now -- so the slack could only ever have
+        // mattered for an odd starting level, which cannot be constructed.
+        if indent <= self.start {
             return self
-                .parse_standalone_scalar_line(&line[self.options.start_indent..], self.options.start_indent);
+                .parse_standalone_scalar_line(
+                    self.content_at(line, self.start),
+                    self.byte_offset_of(line, self.start)
+                        .unwrap_or_else(|| line.end()),
+                    self.start,
+                );
         }
 
-        if indent >= self.options.start_indent + 2 {
-            let child_file_pos = (self.options.start_indent + 2).saturating_sub(self.idt.offset());
-            let child_content = &line[child_file_pos..];
-            if self.looks_like_object_start(child_content, self.options.start_indent + 2) {
-                return self.parse_implicit_object(self.options.start_indent);
+        if indent >= self.start.deeper(1) {
+            let child_content = self.content_at(line, self.start.deeper(1));
+            if self.looks_like_object_start(child_content, self.start.deeper(1))? {
+                return self.parse_implicit_object(self.start);
             }
-            return self.parse_implicit_array(self.options.start_indent);
+            return self.parse_implicit_array(self.start);
         }
 
         Err(self.error_current("expected a value at the starting indent"))
@@ -358,22 +607,32 @@ impl<'a, T: Tree> Parser<'a, T> {
             "this container has no nesting marker, and the reading in force requires one at \
              every level. Write `{glyph}` at the start of this line -- a marker in this \
              position names the container the indentation already implies, so it does not \
-             change the value or move anything deeper"
+             change the value or move anything deeper."
+        ))
+    }
+
+    fn too_deep(&self) -> ParseError {
+        self.error_current(format!(
+            "this document nests more than {MAX_DEPTH} containers deep, which is as \
+             far as this parser goes for now. The limit is serde_json's: MINIMAL JSON \
+             inside a document is parsed by serde_json, which stops at {MAX_DEPTH} \
+             itself, so this parser stops in the same place rather than somewhere \
+             past it. Expect it to be raised in a future release."
         ))
     }
 
     fn parse_implicit_object(
         &mut self,
-        parent_indent: usize,
+        parent_indent: LogicalIndent,
     ) -> std::result::Result<T, ParseError> {
         if self.options.missing_indent_marker == MissingIndentMarker::RequireForced {
-            return Err(self.require_marker_error("{ "));
+            return Err(self.require_marker_error(Marker::Object.text()));
         }
         // Implicit containers have no opener token; their span is the line their first
         // entry starts on, captured before parsing moves past it.
         let open_span = self.current_span();
         let mut entries = Vec::new();
-        self.parse_object_tail(parent_indent + 2, &mut entries)?;
+        self.parse_object_tail(parent_indent.deeper(1), &mut entries)?;
         if entries.is_empty() {
             return Err(self.error_current("expected at least one object entry"));
         }
@@ -382,25 +641,31 @@ impl<'a, T: Tree> Parser<'a, T> {
 
     fn parse_implicit_array(
         &mut self,
-        parent_indent: usize,
+        parent_indent: LogicalIndent,
     ) -> std::result::Result<T, ParseError> {
         if self.options.missing_indent_marker == MissingIndentMarker::RequireForced {
-            return Err(self.require_marker_error("[ "));
+            return Err(self.require_marker_error(Marker::Array.text()));
         }
         self.skip_ignorable_lines()?;
-        let elem_indent = parent_indent + 2;
+        let elem_indent = parent_indent.deeper(1);
         let line = self
             .current_line()
             .ok_or_else(|| self.error_current("expected array contents"))?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let file_indent = count_leading_spaces(&line);
-        let indent = self.idt.logical(file_indent);
+        let leading = line
+            .leading()
+            .map_err(|fault| self.marker_off_column(self.line, line, fault))?;
+        let indent = self.idt.to_logical(leading.indent);
         if indent < elem_indent {
             return Err(self.error_current("expected array elements indented by two spaces"));
         }
-        let content = &line[file_indent..];
-        if content.starts_with('|') {
+        // A table's `|` is a cell edge and so structure, which means it only
+        // counts where indentation ended. On a line that opened a value the `|`
+        // is the value's first character, and a bare string may not begin with
+        // one -- that is `check_bare_string`'s business to report, not a reason
+        // to read the line as a table header.
+        if leading.unopened(line).is_some_and(|content| content.starts_with('|')) {
             return self.parse_table_array(elem_indent);
         }
         let open_span = self.current_span();
@@ -414,47 +679,83 @@ impl<'a, T: Tree> Parser<'a, T> {
 
     fn parse_table_array(
         &mut self,
-        elem_indent: usize,
+        elem_indent: LogicalIndent,
     ) -> std::result::Result<T, ParseError> {
         let header_line = self
             .current_line()
             .ok_or_else(|| self.error_current("expected a table header"))?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let header_file_indent = elem_indent.saturating_sub(self.idt.offset());
-        let header = &header_line[header_file_indent..];
+        let header = self.content_at(header_line, elem_indent);
         let header_span = self.current_span();
         let columns = self.parse_table_header(header, elem_indent)?;
         self.line += 1;
         let mut rows = Vec::new();
         loop {
             self.skip_ignorable_lines()?;
-            let Some(line) = self.current_line().map(str::to_owned) else {
+            let Some(line) = self.current_line() else {
                 break;
             };
-            if self.idt.try_pop_close(&line) {
-                self.line += 1;
-                continue;
+            match self.idt.try_pop_close(line) {
+                CloseGlyph::Closed => {
+                    self.line += 1;
+                    continue;
+                }
+                CloseGlyph::Misplaced { expected } => {
+                    return Err(self.misplaced_closer(line, expected));
+                }
+                CloseGlyph::NothingOpen => {
+                    return Err(self.closer_with_nothing_open(line));
+                }
+                CloseGlyph::NotACloser => {}
             }
             self.ensure_line_has_no_tabs(self.line)?;
-            let file_indent = count_leading_spaces(&line);
-            let indent = self.idt.logical(file_indent);
+            let leading = line
+                .leading()
+                .map_err(|fault| self.marker_off_column(self.line, line, fault))?;
+            let indent = self.idt.to_logical(leading.indent);
             if indent < elem_indent {
                 break;
             }
             if indent != elem_indent {
                 return Err(self.error_current("expected a table row at the array indent"));
             }
-            let row = &line[file_indent..];
-            if !row.starts_with('|') {
-                return Err(self.error_current("table arrays may only contain table rows"));
-            }
+            // `unopened`, not `text_start`: a row's leading `|` is structure and
+            // has to sit where the indent ended. Reading it one column right --
+            // past a bare string's opening quote -- accepted a row misaligned
+            // from its own header and produced the same table either way.
+            //
+            // The two failures are told apart rather than merged: a line that
+            // opened a value *is* a row, written one column over, and telling its
+            // author that a table may only contain rows would be answering a
+            // question they did not ask.
+            let row = match leading.unopened(line) {
+                Some(row) if row.starts_with('|') => row,
+                Some(_) => {
+                    return Err(self.error_current("table arrays may only contain table rows"));
+                }
+                None => {
+                    let column = line.column_at(leading.content_start(line)).number();
+                    return Err(self.error_current(format!(
+                        "this row's `|` is at column {}, one column right of the table. A row's \
+                         cell edges line up with the header's or the columns stop being columns, \
+                         so every `|` on this line is one past where it belongs. Delete the space \
+                         before it.",
+                        column + 1,
+                    )));
+                }
+            };
             // Collect fold continuation lines: `/ ` marker at pair_indent (elem_indent - 2),
             // two characters to the left of the opening `|` per spec.
             // Blank lines and `//` comments between a partial row and its continuation are
             // skipped. A parser would also be within its rights to reject them.
-            let pair_indent = elem_indent.saturating_sub(2);
+            let pair_indent = elem_indent.shallower(1);
             let mut row_owned = row.to_owned();
+            // Taken before the fold loop, which advances `self.line` to the last
+            // continuation. A row that stays on one line keeps this position; one
+            // that folds gives it up below, because by then it names the wrong line.
+            let row_start = self.byte_offset_past(elem_indent, 0);
+            let mut folded = false;
             loop {
                 // Peek past comments to find the next meaningful line, and
                 // remember where the first one was.
@@ -469,7 +770,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 let mut offset = 1usize;
                 let mut comment_line: Option<usize> = None;
                 while let Some(peek) = self.line_str(self.line + offset) {
-                    let trimmed = peek.trim_start_matches(' ');
+                    let trimmed = peek.text().trim_start_matches(' ');
                     if trimmed.starts_with("//") {
                         if comment_line.is_none() {
                             comment_line = Some(self.line + offset);
@@ -483,16 +784,24 @@ impl<'a, T: Tree> Parser<'a, T> {
                     let Some(next_line) = self.line_str(self.line + offset) else {
                         break;
                     };
-                    let next_file_indent = count_leading_spaces(next_line);
-                    let next_indent = self.idt.logical(next_file_indent);
+                    let next_leading = Leading::of(next_line).map_err(|fault| {
+                        self.marker_off_column(self.line + offset, next_line, fault)
+                    })?;
+                    let next_indent = self.idt.to_logical(next_leading.indent);
                     if next_indent != pair_indent {
                         break;
                     }
-                    let next_content = &next_line[next_file_indent..];
-                    if !next_content.starts_with("/ ") {
+                    // Measured on `next_line` and read from `next_line`. This
+                    // used to slice with a position taken from `line`, the row
+                    // above -- the two agreed only because both lines' leading
+                    // columns happen to be spaces.
+                    let Some(continued) = next_leading
+                        .unopened(next_line)
+                        .and_then(|content| Marker::Fold.strip(content))
+                    else {
                         break;
-                    }
-                    next_content[2..].to_owned()
+                    };
+                    continued.to_owned()
                 };
                 // A continuation was found, so any comment skipped to reach it
                 // was inside this row's fold.
@@ -510,9 +819,15 @@ impl<'a, T: Tree> Parser<'a, T> {
                 self.line += offset;
                 self.ensure_line_has_no_tabs(self.line)?;
                 row_owned.push_str(&cont_suffix);
+                folded = true;
             }
             let pending = self.take_pending_comments();
-            let mut parsed_row = self.parse_table_row(&columns, &row_owned, elem_indent)?;
+            let mut parsed_row = self.parse_table_row(
+                &columns,
+                &row_owned,
+                elem_indent,
+                (!folded).then_some(row_start),
+            )?;
             if T::KEEPS_COMMENTS && !pending.is_empty() {
                 T::attach_comments_before(&mut parsed_row, pending, elem_indent);
             }
@@ -525,31 +840,35 @@ impl<'a, T: Tree> Parser<'a, T> {
         Ok(T::new_array(rows, ContainerFacts { span: header_span, table: true }))
     }
 
-    fn parse_table_header(&self, row: &str, indent: usize) -> std::result::Result<Vec<(String, KeyForm)>, ParseError> {
+    fn parse_table_header(&self, row: &str, indent: LogicalIndent) -> std::result::Result<Vec<(String, KeyForm)>, ParseError> {
         let mut cells = split_pipe_cells(row)
-            .ok_or_else(|| self.error_at_line(self.line, indent + 1, "invalid table header"))?;
-        if cells.first().is_some_and(String::is_empty) {
+            .ok_or_else(|| self.error_at_indent(self.line, indent, "invalid table header"))?;
+        if cells.first().is_some_and(|cell| cell.text.is_empty()) {
             cells.remove(0);
         }
-        if !cells.last().is_some_and(String::is_empty) {
-            return Err(self.error_at_line(self.line, indent + row.len() + 1, "table header must end with \"  |\" (two spaces of padding then pipe)"));
+        if !cells.last().is_some_and(|cell| cell.text.is_empty()) {
+            return Err(self.error_at_line(self.line, self.byte_offset_past(indent, row.len()), "table header must end with \"  |\" (two spaces of padding then pipe)"));
         }
         cells.pop();
         if cells.is_empty() {
-            return Err(self.error_at_line(self.line, 1, "table headers must list columns"));
+            return Err(self.error_at_line(self.line, ByteOffset::START, "table headers must list columns"));
         }
-        let mut col = indent + 2; // skip leading |
+        // Each cell says where it starts, so the row's own position in the file is
+        // the only crossing left. This used to walk a running total of cell lengths
+        // and separator widths, which had to stay in step with the empty leading
+        // cell removed above; and before that it was derived from the logical
+        // indent, which left it unshifted under an active ` /<` and one column
+        // right of the truth.
         cells
             .into_iter()
             .map(|cell| {
-                let cell_col = col;
-                col += cell.len() + 1; // +1 for the | separator
-                self.parse_table_header_key(cell.trim_end(), cell_col)
+                let cell_col = self.byte_offset_past(indent, cell.at);
+                self.parse_table_header_key(cell.text.trim_end(), cell_col)
             })
             .collect()
     }
 
-    fn parse_table_header_key(&self, cell: &str, col: usize) -> std::result::Result<(String, KeyForm), ParseError> {
+    fn parse_table_header_key(&self, cell: &str, col: ByteOffset) -> std::result::Result<(String, KeyForm), ParseError> {
         if let Some(end) = parse_bare_key_prefix(cell, &self.options)
             && end == cell.len() {
                 return Ok((cell.to_owned(), KeyForm::Bare));
@@ -576,7 +895,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 ),
             ));
         }
-        if let Some(fault) = bare_key_fault(cell, &self.options) {
+        if let Err(fault) = check_bare_key(cell, &self.options) {
             return Err(self.error_at_line(
                 self.line,
                 col,
@@ -586,47 +905,63 @@ impl<'a, T: Tree> Parser<'a, T> {
         Err(self.error_at_line(self.line, col, "invalid table header key"))
     }
 
+    /// `row_start` is where `row` begins in the current line's bytes, and `None`
+    /// when the row was reassembled across a fold. A folded row's text spans
+    /// several physical lines, so an offset into it points at no single line --
+    /// and the parser has advanced to the last of them by now, so resolving one
+    /// against `self.line` would land somewhere real and wrong. Cells carry no
+    /// position in that case rather than a plausible false one.
     fn parse_table_row(
         &self,
         columns: &[(String, KeyForm)],
         row: &str,
-        indent: usize,
+        indent: LogicalIndent,
+        row_start: Option<ByteOffset>,
     ) -> std::result::Result<T, ParseError> {
         let mut cells = split_pipe_cells(row)
-            .ok_or_else(|| self.error_at_line(self.line, indent + 1, "invalid table row"))?;
-        if cells.first().is_some_and(String::is_empty) {
+            .ok_or_else(|| self.error_at_indent(self.line, indent, "invalid table row"))?;
+        if cells.first().is_some_and(|cell| cell.text.is_empty()) {
             cells.remove(0);
         }
-        if !cells.last().is_some_and(String::is_empty) {
-            return Err(self.error_at_line(self.line, indent + row.len() + 1, "table row must end with \"  |\" (two spaces of padding then pipe)"));
+        if !cells.last().is_some_and(|cell| cell.text.is_empty()) {
+            return Err(self.error_at_line(self.line, self.byte_offset_past(indent, row.len()), "table row must end with \"  |\" (two spaces of padding then pipe)"));
         }
         cells.pop();
         if cells.len() != columns.len() {
             return Err(self.error_at_line(
                 self.line,
-                indent + row.len() + 1,
+                self.byte_offset_past(indent, row.len()),
                 "table row has wrong number of cells",
             ));
         }
         let mut entries = Vec::new();
         for (index, (key, key_form)) in columns.iter().enumerate() {
-            let cell = cells[index].trim_end();
-            if cell.is_empty() {
+            let cell = cells[index];
+            let text = cell.text.trim_end();
+            if text.is_empty() {
                 continue;
             }
-            let value = self.parse_table_cell_value(cell)?;
+            // `trim_end` cannot move where the cell starts, so the offset still
+            // stands. `row_start` is `None` for a folded row, and then so is this.
+            let at = row_start.map(|start| start.plus(cell.at));
+            let value = self.parse_table_cell_value(text, at)?;
             entries.push(T::new_entry(key.clone(), value, self.entry_facts(*key_form)));
         }
         Ok(T::new_object(entries, self.container_facts()))
     }
 
-    fn parse_table_cell_value(&self, cell: &str) -> std::result::Result<T, ParseError> {
+    /// `at` is where `cell` begins in the current line's bytes, or `None` when the
+    /// row it came from was reassembled across a fold and no position in it maps
+    /// to the file. Every fault below points at the cell, not at the row: which
+    /// cell is wrong is the first thing a reader needs and the hardest to count
+    /// out by eye in a wide table.
+    fn parse_table_cell_value(
+        &self,
+        cell: &str,
+        at: Option<ByteOffset>,
+    ) -> std::result::Result<T, ParseError> {
         if cell.is_empty() {
-            return Err(self.error_at_line(
-                self.line,
-                1,
-                "empty table cells mean the key is absent",
-            ));
+            return Err(self.error_at_col(at, "empty table cells mean the key is absent"));
         }
         // Cell facts carry row-line spans: folded rows are reassembled strings, so
         // per-cell byte columns are not reliably recoverable from the physical line.
@@ -643,22 +978,20 @@ impl<'a, T: Tree> Parser<'a, T> {
                 let content = cell.trim_start_matches(' ');
                 let width = cell.len();
                 let padded = format!(" {content}{}", " ".repeat(width.saturating_sub(content.len() + 1)));
-                return Err(self.error_at_line(
-                    self.line,
-                    1,
+                return Err(self.error_at_col(
+                    at,
                     format!(
                         "a table cell is padded on the right, not the left. The first \
                          space after the `|` is the bare string's opening quote, so the \
                          second one starts a second value -- write `|{padded}|` rather \
                          than `|{cell}|`, or `|{content}` with no space at all for a \
-                         number or a boolean"
+                         number or a boolean."
                     ),
                 ));
             }
-            if let Some(fault) = bare_string_fault(value, &self.options) {
-                return Err(self.error_at_line(
-                    self.line,
-                    1,
+            if let Err(fault) = check_bare_string(value, &self.options) {
+                return Err(self.error_at_col(
+                    at,
                     format!("invalid bare string in table cell: {}", fault.describe()),
                 ));
             }
@@ -702,42 +1035,99 @@ impl<'a, T: Tree> Parser<'a, T> {
             let span = self.span_at(None, cell.len());
             return self.parse_minimal_json_line(cell, span);
         }
-        Err(self.error_at_line(self.line, 1, "invalid table cell value"))
+        Err(self.error_at_col(at, "invalid table cell value"))
     }
 
+    /// Read an object's entries, one container deeper.
+    ///
+    /// The whole wrapper is the depth accounting: increment, run the body, put it
+    /// back. It carries no `?` deliberately -- every early return lives in
+    /// [`Self::object_tail`], so there is no path out of here that skips the
+    /// decrement, and the count cannot drift from the call stack.
     fn parse_object_tail(
         &mut self,
-        pair_indent: usize,
+        pair_indent: LogicalIndent,
+        entries: &mut Vec<T::Entry>,
+    ) -> std::result::Result<(), ParseError> {
+        self.depth += 1;
+        let result = if self.depth > MAX_DEPTH {
+            Err(self.too_deep())
+        } else {
+            self.object_tail(pair_indent, entries)
+        };
+        self.depth -= 1;
+        result
+    }
+
+    fn object_tail(
+        &mut self,
+        pair_indent: LogicalIndent,
         entries: &mut Vec<T::Entry>,
     ) -> std::result::Result<(), ParseError> {
         loop {
             self.skip_ignorable_lines()?;
-            let Some(line) = self.current_line().map(str::to_owned) else {
+            let Some(line) = self.current_line() else {
                 break;
             };
             self.ensure_line_has_no_tabs(self.line)?;
             // Close glyph: pop offset and continue so the loop re-evaluates indent.
-            if self.idt.try_pop_close(&line) {
-                self.line += 1;
-                continue;
+            match self.idt.try_pop_close(line) {
+                CloseGlyph::Closed => {
+                    self.line += 1;
+                    continue;
+                }
+                CloseGlyph::Misplaced { expected } => {
+                    return Err(self.misplaced_closer(line, expected));
+                }
+                CloseGlyph::NothingOpen => {
+                    return Err(self.closer_with_nothing_open(line));
+                }
+                CloseGlyph::NotACloser => {}
             }
-            let file_indent = count_leading_spaces(&line);
-            let indent = self.idt.logical(file_indent);
+            let leading = line
+                .leading()
+                .map_err(|fault| self.marker_off_column(self.line, line, fault))?;
+            let indent = self.idt.to_logical(leading.indent);
             if indent < pair_indent {
                 break;
             }
             if indent != pair_indent {
-                let content = line[file_indent..].to_owned();
-                let msg = if content.starts_with("/>") {
-                    format!("misplaced /> indent offset glyph: found at column {}, expected at column {}", indent + 1, pair_indent + 1)
-                } else if content.starts_with("/ ") {
-                    format!("misplaced fold marker: found at column {}, expected at column {}", indent + 1, pair_indent + 1)
+                let content = line[leading.text_start(line)..].to_owned();
+                // Both indents are structural; a message names a column on the
+                // page, and under an active ` /<` those are not the same number.
+                let found_col = Column::of_indent(self.idt.to_file(indent));
+                let want_col = Column::of_indent(self.idt.to_file(pair_indent));
+                let msg = if content.starts_with(Glyph::IndentClose.body()) {
+                    format!(
+                        "misplaced {} indent offset glyph: found at column {}, expected at column {}",
+                        Glyph::IndentClose.body(), found_col.number(), want_col.number(),
+                    )
+                } else if content.starts_with(Marker::Fold.text()) {
+                    format!(
+                        "misplaced fold marker: found at column {}, expected at column {}",
+                        found_col.number(), want_col.number(),
+                    )
                 } else {
                     "expected an object entry at this indent".to_owned()
                 };
-                return Err(self.error_current(msg));
+                // At the indent the message names, not at the text after it. Both
+                // numbers here are structural -- a glyph's leading space belongs to
+                // the glyph, so its column is where the indent ends -- while
+                // `error_current` points at the first character *past* that space.
+                // The caret then sat one column right of the number in its own
+                // prose, which is the one place a reader has no way to tell which
+                // to believe.
+                return Err(self.error_at_indent(self.line, indent, msg));
             }
-            let content = &line[file_indent..];
+            // An entry begins where the indentation ends. A line carrying an
+            // opener has spent that column on a value, and a value is not an
+            // entry -- an object holds nothing else -- so there is no reading
+            // under which this line belongs here. It used to be sliced at
+            // `text_start`, which handed the key parser the text one column
+            // right and accepted every key written a space too far in.
+            let Some(content) = leading.unopened(line) else {
+                return Err(self.opener_where_an_entry_belongs(line, leading));
+            };
             if content.is_empty() {
                 return Err(self.error_current("blank lines are not valid inside objects"));
             }
@@ -745,7 +1135,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             // captured while parsing nested values drain at deeper sites.
             let pending = self.take_pending_comments();
             let mut line_entries =
-                self.parse_object_line_content(content, pair_indent, Some(file_indent))?;
+                self.parse_object_line_content(content, pair_indent, Some(leading.content_start(line)))?;
             if T::KEEPS_COMMENTS
                 && !pending.is_empty()
                 && let Some(first) = line_entries.first_mut()
@@ -760,8 +1150,8 @@ impl<'a, T: Tree> Parser<'a, T> {
     fn parse_object_line_content(
         &mut self,
         content: &str,
-        pair_indent: usize,
-        col0: Option<usize>,
+        pair_indent: LogicalIndent,
+        col0: Option<ByteOffset>,
     ) -> std::result::Result<Vec<T::Entry>, ParseError> {
         let mut rest = content.to_owned();
         // Byte column of `rest`'s first byte within the current physical line. Lost
@@ -786,7 +1176,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 // Raw source extent of the key: everything before the colon, quotes included.
                 let key_raw_len = prev_len - after_colon.len() - 1;
                 key_facts = EntryFacts { key_form, key_span: self.span_at(col, key_raw_len) };
-                col = col.map(|c| c + key_raw_len + 1);
+                col = col.map(|c| c.plus(key_raw_len + 1));
             }
             rest = after_colon;
 
@@ -798,9 +1188,9 @@ impl<'a, T: Tree> Parser<'a, T> {
             }
 
             // Inline indent glyph: `key: /<` — value follows on next lines at shifted indent.
-            if rest == " /<" {
-                let glyph_file_indent = pair_indent.saturating_sub(self.idt.offset());
-                self.idt.push_glyph(glyph_file_indent);
+            if rest == Glyph::IndentOpen.text() {
+                let glyph = self.idt.to_file(pair_indent);
+                self.idt.push_glyph(glyph);
                 self.line += 1;
                 let value = self.parse_value_after_key(pair_indent)?;
                 entries.push(T::new_entry(key, value, key_facts));
@@ -855,7 +1245,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             // a parser would be within its rights to reject an odd number of spaces here.
             let space_count = rest.bytes().take_while(|&b| b == b' ').count();
             rest = rest[space_count..].to_owned();
-            col = col.map(|c| c + consumed + space_count);
+            col = col.map(|c| c.plus(consumed + space_count));
             if rest.is_empty() {
                 match self.options.trailing_spaces {
                     TrailingSpaces::Discard => {
@@ -876,42 +1266,52 @@ impl<'a, T: Tree> Parser<'a, T> {
 
     fn parse_value_after_key(
         &mut self,
-        pair_indent: usize,
+        pair_indent: LogicalIndent,
     ) -> std::result::Result<T, ParseError> {
         self.skip_ignorable_lines()?;
-        let child_indent = pair_indent + 2;
+        let child_indent = pair_indent.deeper(1);
         let line = self
             .current_line()
-            .ok_or_else(|| self.error_at_line(self.line, 1, "expected a nested value"))?
+            .ok_or_else(|| self.error_at_line(self.line, ByteOffset::START, "expected a nested value"))?
             .to_owned();
         self.ensure_line_has_no_tabs(self.line)?;
-        let file_indent = count_leading_spaces(&line);
-        let indent = self.idt.logical(file_indent);
-        let content = &line[file_indent..];
-        if starts_with_marker_chain(content) && (indent == pair_indent || indent == child_indent) {
-            return self.parse_marker_chain_line(content, indent);
+        let leading = line
+            .leading()
+            .map_err(|fault| self.marker_off_column(self.line, line, fault))?;
+        let indent = self.idt.to_logical(leading.indent);
+        // Both branches below look for a marker, so both ask `unopened`: a marker
+        // stands in the indent, and on a line that opened a value the indent is
+        // already spent.
+        let unopened = leading.unopened(line);
+        if let Some(unopened) = unopened
+            && starts_with_marker_chain(unopened)
+            && (indent == pair_indent || indent == child_indent)
+        {
+            return self.parse_marker_chain_line(unopened, indent);
         }
         // Fold after colon: value starts on a "/ " continuation line at pair_indent.
         // Spec: key and basic value are folded as a single unit; fold marker is allowed
         // immediately after the ":" (preferred), treating the junction at pair_indent+2 indent.
-        if indent == pair_indent && content.starts_with("/ ") {
-            let continuation_content = &content[2..];
+        if indent == pair_indent
+            && let Some(continuation_content) = unopened.and_then(|it| Marker::Fold.strip(it))
+        {
             let (value, consumed) = self.parse_inline_value(
                 continuation_content,
                 pair_indent,
                 ArrayLineValueContext::ObjectValue,
-                Some(file_indent + 2),
+                Some(leading.content_start(line).plus(Marker::Fold.width())),
             )?;
             if consumed.is_some() {
                 self.line += 1;
             }
             return Ok(value);
         }
-        // Own-line indent glyph: ` /<` at pair_indent (file_indent + 1 with content "/<").
-        // The glyph's leading space sits at position pair_indent - offset in the file.
-        if indent == pair_indent + 1 && content == "/<" {
-            let glyph_file_indent = pair_indent.saturating_sub(self.idt.offset());
-            self.idt.push_glyph(glyph_file_indent);
+        // Own-line indent glyph: ` /<` whose structure sits at pair_indent. The
+        // glyph's leading space is its own first character, not indentation, so
+        // the indent here is pair_indent exactly rather than one past it.
+        if leading.opener == Opener::Glyph && indent == pair_indent {
+            let glyph = self.idt.to_file(pair_indent);
+            self.idt.push_glyph(glyph);
             self.line += 1;
             return self.parse_value_after_key(pair_indent);
         }
@@ -928,47 +1328,53 @@ impl<'a, T: Tree> Parser<'a, T> {
         // an array, and the deepest is settled by recursing, which puts it
         // through the very test that settles an ordinary one-level nesting.
         //
-        // Halving rounds an odd column down on purpose. A bare string sits one
-        // column right of its structural position, that column being its
-        // one-sided opening quote, so a gap of 3 is one level plus a quote and
-        // not a level and a half. The recursion then sees the same odd gap it
-        // would have seen without any jump, and reads the quote as it always
-        // does.
-        let extra_levels = (indent - child_indent) / 2;
+        // The gap is a whole number of levels: `Leading` has already taken any
+        // opening quote out of `indent`, so a bare string's one-sided quote is
+        // not in this arithmetic and there is nothing to round away.
+        let extra_levels =
+            indent.levels_below(child_indent);
         if extra_levels > 0 && self.options.missing_indent_marker == MissingIndentMarker::Infer {
             // The synthesized arrays have no line of their own, so they take the
             // span of the line their one element starts on -- which is what every
             // other implicit container here does.
             let open_span = self.current_span();
-            let mut value = self.parse_value_after_key(child_indent + 2 * extra_levels - 2)?;
+            // One level short of the gap: the loop below wraps the value once per
+            // level, and this is the innermost of them. Guarded by `extra_levels > 0`
+            // above, so there is a level to step back from.
+            let mut value = self.parse_value_after_key(child_indent.deeper(extra_levels - 1))?;
             for _ in 0..extra_levels {
                 value = T::new_array(vec![value], self.container_facts_from(open_span));
             }
             return Ok(value);
         }
-        let child_file_indent = child_indent.saturating_sub(self.idt.offset());
-        let content = &line[child_file_indent..];
+        let content = self.content_at(line, child_indent);
         // `content` sits at `child_indent`, so that is where its fold continuations
         // are too. Passing `pair_indent` here looked for them two columns to the
         // left and never found them, so a folded key on a nested line was not
         // recognised as opening an object.
-        if self.looks_like_object_start(content, child_indent) {
+        if self.looks_like_object_start(content, child_indent)? {
             self.parse_implicit_object(pair_indent)
         } else {
             self.parse_implicit_array(pair_indent)
         }
     }
 
+    /// `content_at` is where `content` begins in its line's bytes. It is a
+    /// parameter rather than something rederived here because only the caller
+    /// holds the line, and the two numbers it would otherwise be guessed from --
+    /// a logical indent and a byte position -- agree only when no ` /<` is active
+    /// and the indent is ASCII.
     fn parse_standalone_scalar_line(
         &mut self,
         content: &str,
-        line_indent: usize,
+        content_at: ByteOffset,
+        line_indent: LogicalIndent,
     ) -> std::result::Result<T, ParseError> {
         // Spec: MINIMAL JSON "must be on a line by itself ... nothing may come after
         // it on that line". So a candidate takes the whole line; if it does not parse
         // as such, that is an error rather than a packed element.
         if is_minimal_json_candidate(content) {
-            let span = self.span_at(Some(self.options.start_indent), content.len());
+            let span = self.span_at(Some(content_at), content.len());
             let value = self.parse_minimal_json_line(content, span)?;
             self.line += 1;
             return Ok(value);
@@ -977,7 +1383,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             content,
             line_indent,
             ArrayLineValueContext::SingleValue,
-            Some(self.options.start_indent),
+            Some(content_at),
         )?;
         if let Some(consumed) = consumed {
             if consumed != content.len() {
@@ -988,53 +1394,82 @@ impl<'a, T: Tree> Parser<'a, T> {
         Ok(value)
     }
 
+    /// Read an array's elements, one container deeper. See
+    /// [`Self::parse_object_tail`] for why the wrapper has no `?` in it.
     fn parse_array_tail(
         &mut self,
-        parent_indent: usize,
+        parent_indent: LogicalIndent,
         elements: &mut Vec<T>,
     ) -> std::result::Result<(), ParseError> {
-        let elem_indent = parent_indent + 2;
+        self.depth += 1;
+        let result = if self.depth > MAX_DEPTH {
+            Err(self.too_deep())
+        } else {
+            self.array_tail(parent_indent, elements)
+        };
+        self.depth -= 1;
+        result
+    }
+
+    fn array_tail(
+        &mut self,
+        parent_indent: LogicalIndent,
+        elements: &mut Vec<T>,
+    ) -> std::result::Result<(), ParseError> {
+        let elem_indent = parent_indent.deeper(1);
         loop {
             self.skip_ignorable_lines()?;
-            let Some(line) = self.current_line().map(str::to_owned) else {
+            let Some(line) = self.current_line() else {
                 break;
             };
             self.ensure_line_has_no_tabs(self.line)?;
             // Close glyph: pop offset and continue.
-            if self.idt.try_pop_close(&line) {
-                self.line += 1;
-                continue;
+            match self.idt.try_pop_close(line) {
+                CloseGlyph::Closed => {
+                    self.line += 1;
+                    continue;
+                }
+                CloseGlyph::Misplaced { expected } => {
+                    return Err(self.misplaced_closer(line, expected));
+                }
+                CloseGlyph::NothingOpen => {
+                    return Err(self.closer_with_nothing_open(line));
+                }
+                CloseGlyph::NotACloser => {}
             }
-            let file_indent = count_leading_spaces(&line);
-            let indent = self.idt.logical(file_indent);
-            let content = &line[file_indent..];
+            let leading = line
+                .leading()
+                .map_err(|fault| self.marker_off_column(self.line, line, fault))?;
+            let indent = self.idt.to_logical(leading.indent);
             if indent < parent_indent {
                 break;
             }
-            if starts_with_marker_chain(content) && indent == elem_indent {
-                elements.push(self.parse_marker_chain_line(content, indent)?);
+            if let Some(unopened) = leading.unopened(line)
+                && starts_with_marker_chain(unopened)
+                && indent == elem_indent
+            {
+                elements.push(self.parse_marker_chain_line(unopened, indent)?);
                 continue;
             }
             if indent < elem_indent {
                 break;
             }
-            // Structural indents are always even; an odd file_indent means the extra space is part
-            // of the content (glyph leading space or bare string leading space).
-            let elem_struct_pos = elem_indent.saturating_sub(self.idt.offset());
-            if file_indent == elem_struct_pos + 1 {
-                // Bare strings can never start with `/`, so content=="/<" is unambiguously a glyph.
-                if content == "/<" {
-                    self.idt.push_glyph(elem_struct_pos);
+            // An opener is the value's own first column, not indentation, so a
+            // line carrying one sits at `elem_indent` exactly. Which kind it is
+            // was settled when the line was measured.
+            if leading.opener.is_present() && indent == elem_indent {
+                if leading.opener == Opener::Glyph {
+                    self.idt.push_glyph(leading.indent);
                     self.line += 1;
                     continue;
                 }
                 let pending = self.take_pending_comments();
                 let first_new = elements.len();
                 self.parse_array_line_content(
-                    &line[elem_struct_pos..],
+                    &line[leading.content_start(line)..],
                     elem_indent,
                     elements,
-                    Some(elem_struct_pos),
+                    Some(leading.content_start(line)),
                 )?;
                 if T::KEEPS_COMMENTS
                     && !pending.is_empty()
@@ -1044,10 +1479,9 @@ impl<'a, T: Tree> Parser<'a, T> {
                 }
                 continue;
             }
-            // Standalone glyph at structural indent elem_indent+2: introduces a nested sub-array.
-            let sub_glyph_struct = (elem_indent + 2).saturating_sub(self.idt.offset());
-            if file_indent == sub_glyph_struct + 1 && content == "/<" {
-                self.idt.push_glyph(sub_glyph_struct);
+            // Standalone glyph one level below the elements: introduces a nested sub-array.
+            if leading.opener == Opener::Glyph && indent == elem_indent.deeper(1) {
+                self.idt.push_glyph(leading.indent);
                 let open_span = self.current_span();
                 let pending = self.take_pending_comments();
                 self.line += 1;
@@ -1083,10 +1517,21 @@ impl<'a, T: Tree> Parser<'a, T> {
             // nothing at this column yet, the first thing on the page is already
             // deeper than the level it belongs to, and no step is visible -- that
             // is a jump, and jumps are spelled with markers.
-            if indent == elem_indent + 2 && !elements.is_empty() {
-                let nested_content = &line[file_indent..];
+            //
+            // What the step contains is settled from `unopened`, so a line that
+            // opened a value never gets asked. An opener says the line is a bare
+            // string and says it before any of its text is read; slicing past it
+            // handed `x: y` to the object test and made ` x: y` a container while
+            // `_x: y` -- the same opener written as a marker -- stayed a string.
+            // Two spellings of one thing have to read alike, so the `None` arm
+            // takes the array branch, which is where a scalar element belongs.
+            if indent == elem_indent.deeper(1) && !elements.is_empty() {
+                let opens_object = match leading.unopened(line) {
+                    Some(unopened) => self.looks_like_object_start(unopened, indent)?,
+                    None => false,
+                };
                 let pending = self.take_pending_comments();
-                let mut nested = if self.looks_like_object_start(nested_content, indent) {
+                let mut nested = if opens_object {
                     self.parse_implicit_object(elem_indent)?
                 } else {
                     self.parse_implicit_array(elem_indent)?
@@ -1100,7 +1545,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             if indent != elem_indent {
                 return Err(self.error_current("invalid indent level: array elements must be indented by exactly two spaces"));
             }
-            let content = &line[file_indent..];
+            let content = &line[leading.text_start(line)..];
             if content.is_empty() {
                 return Err(self.error_current("blank lines are not valid inside arrays"));
             }
@@ -1112,11 +1557,11 @@ impl<'a, T: Tree> Parser<'a, T> {
             // Spec: MINIMAL JSON owns its line -- it may never be packed with
             // another value, so it is never an element of a packed array.
             if is_minimal_json_candidate(content) {
-                let span = self.span_at(Some(file_indent), content.len());
+                let span = self.span_at(Some(leading.text_start(line)), content.len());
                 elements.push(self.parse_minimal_json_line(content, span)?);
                 self.line += 1;
             } else {
-                self.parse_array_line_content(content, elem_indent, elements, Some(file_indent))?;
+                self.parse_array_line_content(content, elem_indent, elements, Some(leading.text_start(line)))?;
             }
             // Comments preceding this line attach to the line's first element.
             if T::KEEPS_COMMENTS
@@ -1129,12 +1574,40 @@ impl<'a, T: Tree> Parser<'a, T> {
         Ok(())
     }
 
+    /// Apply the trailing-space policy to a line remainder that is nothing but
+    /// spaces, reporting whether the line is finished because they were discarded.
+    ///
+    /// One home for the question, because it is asked from several points along a
+    /// line and the answer must not depend on which one arrived first.
+    ///
+    /// Only ever asked about text *between* values. Spaces that are data never
+    /// reach here: a multiline body consumes its own lines, and a fold's two
+    /// halves are joined by whatever sits at the end of the first one -- `hello `
+    /// folded onto `world` is "hello world", and the same run held alone is a
+    /// string of spaces. Those are values, not leftovers.
+    fn trailing_spaces_end_the_line(
+        &self,
+        rest: &str,
+        at: Option<ByteOffset>,
+    ) -> std::result::Result<bool, ParseError> {
+        if rest.is_empty() || !rest.bytes().all(|b| b == b' ') {
+            return Ok(false);
+        }
+        match self.options.trailing_spaces {
+            TrailingSpaces::Discard => Ok(true),
+            TrailingSpaces::Reject => Err(self.error_at_col(
+                at,
+                "this line ends with spaces that carry nothing -- delete them",
+            )),
+        }
+    }
+
     fn parse_array_line_content(
         &mut self,
         content: &str,
-        elem_indent: usize,
+        elem_indent: LogicalIndent,
         elements: &mut Vec<T>,
-        col0: Option<usize>,
+        col0: Option<ByteOffset>,
     ) -> std::result::Result<(), ParseError> {
         let mut rest = content;
         // Both packed formats are homogeneous, in opposite directions, and the parser
@@ -1162,13 +1635,35 @@ impl<'a, T: Tree> Parser<'a, T> {
         let mut bare_scalar: Option<String> = None;
         let mut saw_non_bare = false;
         let mut bare_holds_comma = false;
+        // `rest` is always a suffix of `content`, so where it currently starts is
+        // recoverable from how much has been consumed.
+        //
+        // Asked at each fault rather than once per element, because the two are
+        // different positions: the element's column goes stale the moment `rest`
+        // advances past it, and the separator faults below are about what comes
+        // after. They used to answer that by pointing at the start of the line --
+        // a trailing space at column 22 reported at column 3.
+        let at = |rest: &str| col0.map(|c| c.plus(content.len() - rest.len()));
         loop {
-            // `rest` is always a suffix of `content`, so the element's byte column is
-            // recoverable from how much has been consumed.
-            let col = col0.map(|c| c + (content.len() - rest.len()));
+            let col = at(rest);
+            // What this element can be told about the line it is on. Both flags
+            // can be set at once by a line that mixes separators; the checks below
+            // reject that, and the space packed rule is the stricter of the two,
+            // so it is the one worth explaining.
+            let packing = if space_packed {
+                Packing::Space
+            } else if comma_packed {
+                Packing::Comma
+            } else {
+                Packing::Undetermined
+            };
             let element_is_bare = rest.starts_with(' ') || rest.starts_with('_');
-            let (value, consumed) =
-                self.parse_inline_value(rest, elem_indent, ArrayLineValueContext::ArrayLine, col)?;
+            let (value, consumed) = self.parse_inline_value(
+                rest,
+                elem_indent,
+                ArrayLineValueContext::ArrayLine(packing),
+                col,
+            )?;
             if element_is_bare {
                 saw_bare = true;
                 if let NodeRef::String(text) = value.node() {
@@ -1212,11 +1707,27 @@ impl<'a, T: Tree> Parser<'a, T> {
                 self.line += 1;
                 return Ok(());
             }
+            // Nothing but spaces left, so no element follows and no separator was
+            // intended: these are the line's trailing spaces, and what happens to
+            // them is the caller's policy.
+            //
+            // The object entry loop has asked this since the option existed; the
+            // element loop never did, so trailing spaces here reached the
+            // separator tests and came back as a complaint about separators --
+            // and `Discard` could not discard them, because nothing on this path
+            // ever consulted it.
+            if self.trailing_spaces_end_the_line(rest, at(rest))? {
+                self.line += 1;
+                return Ok(());
+            }
             if rest == "," {
                 self.line += 1;
                 return Ok(());
             }
             if let Some(next) = rest.strip_prefix(", ") {
+                // Taken before the advance: the fault below is the separator, not
+                // whatever follows it.
+                let separator_at = at(rest);
                 rest = next;
                 comma_packed = true;
                 // Re-check the elements already seen now that we know the array is
@@ -1227,12 +1738,22 @@ impl<'a, T: Tree> Parser<'a, T> {
                 if bare_holds_comma {
                     return Err(self.bare_comma_error(col));
                 }
+                // Spaces after a separator are still the line's trailing spaces.
+                // Discarding them leaves the separator with nothing after it,
+                // which is the next thing wrong with the line rather than the
+                // same thing said twice.
+                if self.trailing_spaces_end_the_line(rest, at(rest))? {
+                    rest = "";
+                }
                 if rest.is_empty() {
-                    return Err(self.error_current("array lines cannot end with a separator"));
+                    return Err(
+                        self.error_at_col(separator_at, "array lines cannot end with a separator")
+                    );
                 }
                 continue;
             }
             if let Some(next) = rest.strip_prefix("  ") {
+                let separator_at = at(rest);
                 rest = next;
                 space_packed = true;
                 // Re-check the elements already seen now that we know the line is
@@ -1244,12 +1765,20 @@ impl<'a, T: Tree> Parser<'a, T> {
                          string; consider unpacking this line onto multiple lines",
                     ));
                 }
+                if self.trailing_spaces_end_the_line(rest, at(rest))? {
+                    rest = "";
+                }
                 if rest.is_empty() {
-                    return Err(self.error_current("array lines cannot end with a separator"));
+                    return Err(
+                        self.error_at_col(separator_at, "array lines cannot end with a separator")
+                    );
                 }
                 continue;
             }
-            return Err(self.error_current(
+            // `rest` starts at the text that is not a separator, which is the
+            // offender itself -- most often one space where two belong.
+            return Err(self.error_at_col(
+                at(rest),
                 "array elements on the same line are separated by ', ' or by two spaces in \
                  all-bare-string arrays",
             ));
@@ -1259,7 +1788,7 @@ impl<'a, T: Tree> Parser<'a, T> {
     fn parse_marker_chain_line(
         &mut self,
         content: &str,
-        line_indent: usize,
+        line_indent: LogicalIndent,
     ) -> std::result::Result<T, ParseError> {
         // Every container introduced by this marker line carries the marker line's span.
         let open_span = self.current_span();
@@ -1306,7 +1835,10 @@ impl<'a, T: Tree> Parser<'a, T> {
         // at render time; it is never stored as a column.
         let pending = self.take_pending_comments();
         // `line_indent` is logical; spans need the raw byte column of `content`'s start.
-        let base_col = line_indent.saturating_sub(self.idt.offset());
+        let base_col = self
+            .current_line()
+            .and_then(|line| self.byte_offset_of(line, line_indent))
+            .unwrap_or(ByteOffset::START);
         let mut rest = content;
         let mut markers = Vec::new();
         // Which levels the writer typed and which this read in. An explicit
@@ -1315,13 +1847,13 @@ impl<'a, T: Tree> Parser<'a, T> {
         // missing part is the glyph that would have told a reader about it.
         let mut inferred = Vec::new();
         loop {
-            if let Some(next) = rest.strip_prefix("[ ") {
+            if let Some(next) = Marker::Array.strip(rest) {
                 markers.push(ContainerKind::Array);
                 inferred.push(false);
                 rest = next;
                 continue;
             }
-            if let Some(next) = rest.strip_prefix("{ ") {
+            if let Some(next) = Marker::Object.strip(rest) {
                 markers.push(ContainerKind::Object);
                 inferred.push(false);
                 rest = next;
@@ -1345,7 +1877,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             if rest.starts_with("  ") {
                 if self.options.missing_indent_marker != MissingIndentMarker::Infer {
                     return Err(self.missing_marker_error(
-                        base_col + (content.len() - rest.len()),
+                        base_col.plus(content.len() - rest.len()),
                         markers.len(),
                     ));
                 }
@@ -1359,16 +1891,33 @@ impl<'a, T: Tree> Parser<'a, T> {
         if markers.is_empty() {
             return Err(self.error_current("expected an explicit nesting marker"));
         }
+        // A marker chain nests without recursing: the levels are built by the loops
+        // below, so they never pass through the tails that count depth. Charged
+        // here in one go instead, which is possible precisely because the whole
+        // chain's depth is known before any of it is built.
+        //
+        // Without this a chain was the one way past the limit, and the crash it
+        // led to was not even in the parser -- the tree it built was deep enough
+        // that walking it to drop or serialize it overflowed the stack later, far
+        // from the line responsible.
+        if self.depth + markers.len() > MAX_DEPTH {
+            return Err(self.too_deep());
+        }
         // Only the deepest level can be an object, and an inferred one has no
         // glyph saying which it is, so it answers the same question an ordinary
         // one-level nesting answers: a key and a colon make it an object, and
         // anything else leaves it the array it was assumed to be.
         if *inferred.last().unwrap()
-            && self.looks_like_object_start(rest, line_indent + 2 * markers.len())
+            && self.looks_like_object_start(rest, line_indent.deeper(markers.len()))?
         {
             *markers.last_mut().unwrap() = ContainerKind::Object;
         }
-        if markers[..markers.len().saturating_sub(1)]
+        // Non-empty from here down: the two `unwrap`s above establish it, and the
+        // `len() - 1` slices below rely on it. Stated once so the two readings
+        // agree -- previously this line defended against an empty vector three
+        // lines after two others insisted it could not be.
+        debug_assert!(!markers.is_empty(), "a marker chain line has at least one marker");
+        if markers[..markers.len() - 1]
             .iter()
             .any(|kind| *kind != ContainerKind::Array)
         {
@@ -1376,12 +1925,12 @@ impl<'a, T: Tree> Parser<'a, T> {
                 self.error_current("only the final explicit nesting marker on a line may be '{'")
             );
         }
-        let deepest_parent_indent = line_indent + 2 * markers.len().saturating_sub(1);
+        let deepest_parent_indent = line_indent.deeper(markers.len().saturating_sub(1));
 
         // Indent glyph after markers: `[ [ /<` — content follows on next lines at shifted indent.
-        if rest == " /<" {
-            let glyph_file_indent = (deepest_parent_indent + 2).saturating_sub(self.idt.offset());
-            self.idt.push_glyph(glyph_file_indent);
+        if rest == Glyph::IndentOpen.text() {
+            let glyph = self.idt.to_file(deepest_parent_indent.deeper(1));
+            self.idt.push_glyph(glyph);
             self.line += 1;
             // The deepest container's content starts on the next lines.
             let mut value = match *markers.last().unwrap() {
@@ -1394,7 +1943,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                     T::new_array(elements, self.container_facts_from(open_span))
                 }
                 ContainerKind::Object => {
-                    let pair_indent = deepest_parent_indent + 2;
+                    let pair_indent = deepest_parent_indent.deeper(1);
                     let mut entries = Vec::new();
                     self.parse_object_tail(pair_indent, &mut entries)?;
                     if entries.is_empty() {
@@ -1404,7 +1953,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 }
             };
             for level in (0..markers.len().saturating_sub(1)).rev() {
-                let parent_indent = line_indent + 2 * level;
+                let parent_indent = line_indent.deeper(level);
                 let mut wrapped = vec![value];
                 self.parse_array_tail(parent_indent, &mut wrapped)?;
                 value = T::new_array(wrapped, self.container_facts_from(open_span));
@@ -1435,7 +1984,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 if leading_spaces != 0 {
                     return Err(self.error_at_line(
                         self.line,
-                        base_col + (content.len() - rest.len()) + 1,
+                        base_col.plus(content.len() - rest.len()),
                         "a table header is one space right of the level it belongs to. A \
                          single space before a value opens a bare string, and a bare string \
                          cannot begin with a pipe, so nothing here explains the space -- \
@@ -1443,10 +1992,14 @@ impl<'a, T: Tree> Parser<'a, T> {
                          the table a level deeper",
                     ));
                 }
-                let table_elem_indent = deepest_parent_indent + 2 + leading_spaces;
+                // `leading_spaces` is zero here and cannot be anything else: the guard
+                // above returns on any non-zero count. Adding it made this look like a
+                // position that could land off a level, which is the one thing a
+                // structural indent may never do.
+                let table_elem_indent = deepest_parent_indent.deeper(1);
                 let mut value = self.parse_table_array(table_elem_indent)?;
                 for level in (0..markers.len().saturating_sub(1)).rev() {
-                    let parent_indent = line_indent + 2 * level;
+                    let parent_indent = line_indent.deeper(level);
                     let mut wrapped = vec![value];
                     self.parse_array_tail(parent_indent, &mut wrapped)?;
                     value = T::new_array(wrapped, self.container_facts_from(open_span));
@@ -1458,7 +2011,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             }
         }
 
-        let rest_col = base_col + (content.len() - rest.len());
+        let rest_col = base_col.plus(content.len() - rest.len());
         let mut value = match *markers.last().unwrap() {
             ContainerKind::Array => {
                 let mut elements = Vec::new();
@@ -1470,7 +2023,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 } else {
                     self.parse_array_line_content(
                         rest,
-                        deepest_parent_indent + 2,
+                        deepest_parent_indent.deeper(1),
                         &mut elements,
                         Some(rest_col),
                     )?;
@@ -1479,7 +2032,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 T::new_array(elements, self.container_facts_from(open_span))
             }
             ContainerKind::Object => {
-                let pair_indent = line_indent + 2 * markers.len();
+                let pair_indent = line_indent.deeper(markers.len());
                 let mut entries =
                     self.parse_object_line_content(rest, pair_indent, Some(rest_col))?;
                 self.parse_object_tail(pair_indent, &mut entries)?;
@@ -1487,7 +2040,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             }
         };
         for level in (0..markers.len().saturating_sub(1)).rev() {
-            let parent_indent = line_indent + 2 * level;
+            let parent_indent = line_indent.deeper(level);
             let mut wrapped = vec![value];
             self.parse_array_tail(parent_indent, &mut wrapped)?;
             value = T::new_array(wrapped, self.container_facts_from(open_span));
@@ -1504,7 +2057,7 @@ impl<'a, T: Tree> Parser<'a, T> {
     fn parse_key(
         &mut self,
         content: &str,
-        fold_indent: usize,
+        fold_indent: LogicalIndent,
     ) -> std::result::Result<(String, KeyForm, String), ParseError> {
         // Bare key on this line
         if let Some(end) = parse_bare_key_prefix(content, &self.options) {
@@ -1531,12 +2084,22 @@ impl<'a, T: Tree> Parser<'a, T> {
                                 next,
                                 "this comment sits in the middle of a key that \
                                  continues below it -- move the comment above the \
-                                 whole key, or below its value",
+                                 whole key, where it still comments the same thing",
                             )?;
                             next += 1;
                             continue;
                         }
                         FoldNext::Ends => break,
+                        // Not merged with `Ends`: a marker at another column is
+                        // the opposite fact from the value having finished, and
+                        // merging them is what sent this line 2700 lines on to
+                        // be guessed at from its text. Nothing shallower can be
+                        // open here -- folding continues a scalar, and a scalar
+                        // has no children -- so any other column is a mistake,
+                        // and `stray_fold_marker` names the one it belonged at.
+                        FoldNext::ContinuesElsewhere => {
+                            return Err(self.stray_fold_marker(next, fold_indent));
+                        }
                     };
                     next += 1;
                     if let Some(colon_pos) = colon_pos {
@@ -1570,12 +2133,22 @@ impl<'a, T: Tree> Parser<'a, T> {
                             next,
                             "this comment sits in the middle of a quoted key that \
                              continues below it -- move the comment above the whole \
-                             key, or below its value",
+                             key, where it still comments the same thing",
                         )?;
                         next += 1;
                         continue;
                     }
                     FoldNext::Ends => break,
+                        // Not merged with `Ends`: a marker at another column is
+                        // the opposite fact from the value having finished, and
+                        // merging them is what sent this line 2700 lines on to
+                        // be guessed at from its text. Nothing shallower can be
+                        // open here -- folding continues a scalar, and a scalar
+                        // has no children -- so any other column is a mistake,
+                        // and `stray_fold_marker` names the one it belonged at.
+                        FoldNext::ContinuesElsewhere => {
+                            return Err(self.stray_fold_marker(next, fold_indent));
+                        }
                 };
                 json_acc.push_str(rest);
                 next += 1;
@@ -1596,13 +2169,13 @@ impl<'a, T: Tree> Parser<'a, T> {
         // with one is not merely irregular, it is a line that already reads as
         // something else.
         if self.options.is_underscore_like(content.chars().next().unwrap_or(' ')) {
-            return Err(self.error_at_line(
+            return Err(self.error_at_indent(
                 self.line,
-                fold_indent + 1,
+                fold_indent,
                 "a bare key cannot begin with `_` or a character shaped like one. Keys \
                  follow the bare string rules, and this column is where a bare string's \
                  opening marker goes -- so a key starting here would be read as a marked \
-                 string rather than a key. Double quote it",
+                 string rather than a key. Double quote it.",
             ));
         }
         // A marker standing where a key belongs is worth naming, because the
@@ -1614,25 +2187,25 @@ impl<'a, T: Tree> Parser<'a, T> {
         // the key above and the writer carried it down, but a marker cannot
         // continue a container, only begin one.
         if starts_with_marker_chain(content) {
-            return Err(self.error_at_line(
+            return Err(self.error_at_indent(
                 self.line,
-                fold_indent + 1,
+                fold_indent,
                 "a nesting marker here says a container starts at this column, but this is \
                  where this object's keys go and a container cannot be an entry without a \
                  key. If this is meant to continue a value from the line above, a marker \
                  cannot do that -- it can only start something new; indent the continuation \
-                 instead. If it is meant to be a new entry, give it a key",
+                 instead. If it is meant to be a new entry, give it a key.",
             ));
         }
-        Err(self.error_at_line(self.line, fold_indent + 1, "invalid object key"))
+        Err(self.error_at_indent(self.line, fold_indent, "invalid object key"))
     }
 
     fn parse_inline_value(
         &mut self,
         content: &str,
-        line_indent: usize,
+        line_indent: LogicalIndent,
         context: ArrayLineValueContext,
-        col: Option<usize>,
+        col: Option<ByteOffset>,
     ) -> std::result::Result<(T, Option<usize>), ParseError> {
         let first = content
             .chars()
@@ -1655,14 +2228,19 @@ impl<'a, T: Tree> Parser<'a, T> {
                 // "[]" and "{}" among the values allowed as bare strings, so they get
                 // no special case: fall through to the bare string path below.
                 if context == ArrayLineValueContext::ObjectValue
-                    && let Some(rest) = content.strip_prefix("  ")
+                    && let Some(rest) = content.strip_prefix(ARRAY_STARTER)
                 {
-                    let value = self.parse_inline_array(rest, line_indent, col.map(|c| c + 2))?;
+                    let consumed = content.len() - rest.len();
+                    let value = self.parse_inline_array(rest, line_indent, col.map(|c| c.plus(consumed)))?;
                     return Ok((value, None));
                 }
-                if content.starts_with(" `") {
-                    // Opener facts are captured before the body parse moves past it.
-                    let opener_span = self.span_at(col.map(|c| c + 1), content.len().saturating_sub(1));
+                if let Some((opener_len, body_len)) =
+                    Glyph::MultilineSingle.split_opener(content)
+                {
+                    // Opener facts are captured before the body parse moves past
+                    // it. Both numbers come from the split, so neither site says
+                    // how wide the opener is.
+                    let opener_span = self.span_at(col.map(|c| c.plus(opener_len)), body_len);
                     let (value, flavor) = self.parse_multiline_string(content, line_indent)?;
                     let facts = StringFacts { form: StringForm::Multiline(flavor), span: opener_span };
                     return Ok((T::new_string(value, facts), None));
@@ -1686,7 +2264,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                              array (`k:  1, 2`), and a third opens a bare string inside \
                              that array (`k:   x` is an array holding the string x). \
                              Nothing is left for a fourth to open -- delete the extra \
-                             spaces, or put the value on its own line below the key",
+                             spaces, or put the value on its own line below the key.",
                         ));
                     }
                     return Err(self.error_at_col(
@@ -1718,6 +2296,16 @@ impl<'a, T: Tree> Parser<'a, T> {
                             FoldNext::Continues(rest) => Some(rest.to_owned()),
                             FoldNext::Comment => None,
                             FoldNext::Ends => break,
+                        // Not merged with `Ends`: a marker at another column is
+                        // the opposite fact from the value having finished, and
+                        // merging them is what sent this line 2700 lines on to
+                        // be guessed at from its text. Nothing shallower can be
+                        // open here -- folding continues a scalar, and a scalar
+                        // has no children -- so any other column is a mistake,
+                        // and `stray_fold_marker` names the one it belonged at.
+                        FoldNext::ContinuesElsewhere => {
+                            return Err(self.stray_fold_marker(next, line_indent));
+                        }
                         };
                         let Some(rest) = continuation else {
                             self.comment_in_fold(
@@ -1738,15 +2326,31 @@ impl<'a, T: Tree> Parser<'a, T> {
                     }
                 }
                 let complete = folded.as_ref().map_or(value, |(acc, _)| acc.as_str());
-                if let Some(fault) = bare_string_fault(complete, &self.options) {
+                if let Err(fault) = check_bare_string(complete, &self.options) {
+                    // `describe` speaks for the string on its own, and for a leading
+                    // `"` it says to delete the opening space -- correct everywhere
+                    // except here, where doing so leaves a quoted element on a line
+                    // that admits none, and trades this error for that one. The
+                    // element cannot be spelled on this line at all, so say that
+                    // instead of handing over a fix that fails.
+                    if let (ArrayLineValueContext::ArrayLine(Packing::Space),
+                            BareStringFault::LeadingDoubleQuote) = (context, fault)
+                    {
+                        return Err(self.error_at_col(
+                            col,
+                            "a space separated packed array holds bare strings only, so a \
+                             double quoted element has no spelling on this line -- give \
+                             the array one element per line, or write this element bare",
+                        ));
+                    }
                     return Err(self.error_at_col(col, fault.describe()));
                 }
                 if let Some((acc, next)) = folded {
                     // Facts before the line advance so the span lands on the opener line.
                     let facts = self.string_facts_at(
                         StringForm::Bare(bare_form),
-                        col.map(|c| c + 1),
-                        end.saturating_sub(1),
+                        col.map(|c| c.plus(Opener::BareString.width())),
+                        end.saturating_sub(Opener::BareString.width()),
                     );
                     self.line = next;
                     return Ok((T::new_string(acc, facts), None));
@@ -1754,7 +2358,11 @@ impl<'a, T: Tree> Parser<'a, T> {
                 Ok((
                     T::new_string(
                         value.to_owned(),
-                        self.string_facts_at(StringForm::Bare(bare_form), col.map(|c| c + 1), end.saturating_sub(1)),
+                        self.string_facts_at(
+                            StringForm::Bare(bare_form),
+                            col.map(|c| c.plus(Opener::BareString.width())),
+                            end.saturating_sub(Opener::BareString.width()),
+                        ),
                     ),
                     Some(end),
                 ))
@@ -1791,9 +2399,10 @@ impl<'a, T: Tree> Parser<'a, T> {
                 // not worth the machinery to carry. Nothing should be built on
                 // the normalization -- it is free to change.
                 if context == ArrayLineValueContext::ObjectValue
-                    && let Some(rest) = content.strip_prefix("[ ")
+                    && let Some(rest) = Marker::Array.strip(content)
                 {
-                    let value = self.parse_inline_array(rest, line_indent, col.map(|c| c + 2))?;
+                    let consumed = content.len() - rest.len();
+                    let value = self.parse_inline_array(rest, line_indent, col.map(|c| c.plus(consumed)))?;
                     return Ok((value, None));
                 }
                 if is_minimal_json_candidate(content) {
@@ -1802,7 +2411,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                     // quoted key immediately before [it] on its same line". So it is
                     // allowed as an object value or alone, never as an element of a
                     // packed array.
-                    if context == ArrayLineValueContext::ArrayLine {
+                    if matches!(context, ArrayLineValueContext::ArrayLine(_)) {
                         return Err(self.error_current(
                             "MINIMAL JSON may not be packed with other values; \
                              it must be alone on its line, or follow a key",
@@ -1834,7 +2443,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                     // quoted key immediately before [it] on its same line". So it is
                     // allowed as an object value or alone, never as an element of a
                     // packed array.
-                    if context == ArrayLineValueContext::ArrayLine {
+                    if matches!(context, ArrayLineValueContext::ArrayLine(_)) {
                         return Err(self.error_current(
                             "MINIMAL JSON may not be packed with other values; \
                              it must be alone on its line, or follow a key",
@@ -1868,7 +2477,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 Ok((T::new_null(self.scalar_facts_at(col, 4)), Some(4)))
             }
             '-' | '0'..='9' => {
-                let end = simple_token_end(content, context);
+                let end = token_end(content, context);
                 let token = &content[..end];
                 // Check for fold continuations when the number fills the rest of the line
                 if end == content.len() {
@@ -1883,6 +2492,16 @@ impl<'a, T: Tree> Parser<'a, T> {
                             FoldNext::Continues(rest) => Some(rest.to_owned()),
                             FoldNext::Comment => None,
                             FoldNext::Ends => break,
+                        // Not merged with `Ends`: a marker at another column is
+                        // the opposite fact from the value having finished, and
+                        // merging them is what sent this line 2700 lines on to
+                        // be guessed at from its text. Nothing shallower can be
+                        // open here -- folding continues a scalar, and a scalar
+                        // has no children -- so any other column is a mistake,
+                        // and `stray_fold_marker` names the one it belonged at.
+                        FoldNext::ContinuesElsewhere => {
+                            return Err(self.stray_fold_marker(next, line_indent));
+                        }
                         };
                         let Some(rest) = continuation else {
                             self.comment_in_fold(
@@ -1912,7 +2531,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 Ok((T::new_number(n, self.scalar_facts_at(col, end)), Some(end)))
             }
             '.' if content[1..].starts_with(|c: char| c.is_ascii_digit()) => {
-                let end = simple_token_end(content, context);
+                let end = token_end(content, context);
                 let token = &content[..end];
                 Err(self.error_at_col(col, format!("invalid JSON number: \"{token}\" (numbers must start with a digit)")))
             }
@@ -1921,7 +2540,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 // line the writer probably meant a key, so report what is wrong
                 // with the key rather than a generic value fault that points at
                 // the wrong construct and names no rule.
-                if let Some(fault) = attempted_bare_key_fault(content, &self.options) {
+                if let Err(fault) = check_attempted_bare_key(content, &self.options) {
                     return Err(self.error_at_col(col, fault.describe()));
                 }
                 // The text would be a perfectly good bare string if a space came
@@ -1935,12 +2554,28 @@ impl<'a, T: Tree> Parser<'a, T> {
                 // one where a value should start means the line above it did not
                 // leave a value open. "invalid value start" describes the text,
                 // which is fine; the fault is the missing thing above it.
-                if content.starts_with("/ ") || content == "/" {
+                // Before both the no-colon reading and the spacing ladder, because
+                // it is the more specific fault and the only one of the three that
+                // mentions the case rule the writer actually broke.
+                let token = &content[..token_end(content, context)];
+                if let Some(literal) = miscased_literal(token) {
+                    return Err(self.error_at_col(
+                        col,
+                        format!(
+                            "`{token}` is not a TJSON literal -- the literals are \
+                             lowercase, so write `{literal}`. Putting a space in front \
+                             of it instead is valid TJSON, but it writes the string \
+                             \"{token}\" rather than the {}.",
+                            if literal == "null" { "null value" } else { "boolean" }
+                        ),
+                    ));
+                }
+                if content.starts_with(Marker::Fold.text()) || content == "/" {
                     return Err(self.error_at_col(
                         col,
                         "a `/ ` line continues a value from the line above it, and \
                          nothing above this line is left open. Remove the `/ `, or \
-                         put the value it was meant to continue on the line above",
+                         put the value it was meant to continue on the line above.",
                     ));
                 }
                 // No colon anywhere on the line: an entry needs one, and that is a
@@ -1949,7 +2584,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 // The whole physical line, not this value fragment: a fragment
                 // after a colon naturally has none of its own, and reading that
                 // as "no colon on this line" hijacks every value fault.
-                if self.current_line().is_some_and(|line| !line.contains(':'))
+                if self.current_line().is_some_and(|line| !line.text().contains(':'))
                     && content.starts_with(|c: char| is_unicode_letter_or_number(c))
                 {
                     return Err(self.error_at_col(
@@ -1957,22 +2592,43 @@ impl<'a, T: Tree> Parser<'a, T> {
                         "there is no colon on this line, so it is not a key and a \
                          value. An object entry is written `key: value`. If the whole \
                          line was meant as a string, it needs a space in front of it \
-                         -- the space is what opens a bare string",
+                         -- the space is what opens a bare string.",
                     ));
                 }
-                if bare_string_fault(content, &self.options).is_none() {
+                // `check_bare_string` works out exactly which rule the text breaks
+                // and has a written message for each. Asking it `is_ok()` and then
+                // falling through to "invalid value start" threw that away and named
+                // nothing -- while the bare-string arm of this same match already
+                // reports the fault. It matters most for the lookalike sets: an
+                // ASCII `[` reaches its own arm above, but a character merely shaped
+                // like one arrives here, and "invalid value start" is the least
+                // useful thing to say to someone who cannot see the difference.
+                let Err(fault) = check_bare_string(content, &self.options) else {
                     let ladder = match context {
                         // Deliberately not "add a space": inside a *comma* packed
                         // array that produces a bare string among non-bare
                         // elements, which the all-or-none rule then rejects. The
                         // advice would trade this error for another one, and a
                         // suggestion that does not work is worse than none.
-                        ArrayLineValueContext::ArrayLine =>
+                        ArrayLineValueContext::ArrayLine(Packing::Comma) =>
                             "A comma packed array cannot hold a bare string at all: the \
                              space that opens one makes the comma after it part of the \
                              string rather than a separator, so there is no spacing that \
                              works here. Double quote this element, or put the array on \
                              multiple lines",
+                        // The opposite line, and the opposite advice: here a bare
+                        // string is the only thing allowed, so adding the opening
+                        // space is the fix and it works. This used to get the
+                        // sentence above, which explained commas to a writer whose
+                        // line had none.
+                        ArrayLineValueContext::ArrayLine(Packing::Space) =>
+                            "In a space separated packed array every element carries its \
+                             own opening space, on top of the two that separate it from \
+                             the element before -- so this one wants three spaces in \
+                             front of it rather than two",
+                        // The first element on the line, parsed before any separator
+                        // has said how the line is packed. The general rule is the
+                        // honest thing to give, since either packing is still open.
                         _ =>
                             "Counting from the colon: one space writes the string \
                              (`k: x`), two open a packed array (`k:  1, 2`), and \
@@ -1985,8 +2641,8 @@ impl<'a, T: Tree> Parser<'a, T> {
                              opening quote, and there is none here. {ladder}"
                         ),
                     ));
-                }
-                Err(self.error_at_col(col, "invalid value start"))
+                };
+                Err(self.error_at_col(col, fault.describe()))
             }
         }
     }
@@ -1994,12 +2650,12 @@ impl<'a, T: Tree> Parser<'a, T> {
     fn parse_inline_array(
         &mut self,
         content: &str,
-        parent_indent: usize,
-        col0: Option<usize>,
+        parent_indent: LogicalIndent,
+        col0: Option<ByteOffset>,
     ) -> std::result::Result<T, ParseError> {
         let open_span = self.span_at(col0, content.len());
         let mut values = Vec::new();
-        self.parse_array_line_content(content, parent_indent + 2, &mut values, col0)?;
+        self.parse_array_line_content(content, parent_indent.deeper(1), &mut values, col0)?;
         self.parse_array_tail(parent_indent, &mut values)?;
         Ok(T::new_array(values, self.container_facts_from(open_span)))
     }
@@ -2042,7 +2698,7 @@ impl<'a, T: Tree> Parser<'a, T> {
             };
             return Err(self.error_at_line(
                 closer,
-                1,
+                ByteOffset::START,
                 format!(
                     "A multiline must contain at least one data character, and this one \
                      does not -- {cause}.  An empty multiline string is not allowed: \
@@ -2060,7 +2716,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         if self.options.multiline_minimum == MultilineMinimum::Eol && !value.contains('\n') {
             return Err(self.error_at_line(
                 closer,
-                1,
+                ByteOffset::START,
                 format!(
                     "this multiline string holds no real linefeed, which the strict \
                      reading refuses; write the value as an ordinary string, or read it \
@@ -2074,15 +2730,15 @@ impl<'a, T: Tree> Parser<'a, T> {
     fn parse_multiline_string(
         &mut self,
         content: &str,
-        line_indent: usize,
+        line_indent: LogicalIndent,
     ) -> std::result::Result<(String, MultilineFlavor), ParseError> {
-        let (glyph, suffix) = if let Some(rest) = content.strip_prefix(" ```") {
-            ("```", rest)
-        } else if let Some(rest) = content.strip_prefix(" ``") {
-            ("``", rest)
-        } else if let Some(rest) = content.strip_prefix(" `") {
-            ("`", rest)
-        } else {
+        // Longest first: ` `` ` is a prefix of ` ``` `. Each glyph carries its own
+        // leading space, so this matches the same text the closer is built from
+        // and the renderer emits -- one spelling, three uses.
+        let opener = [Glyph::MultilineTriple, Glyph::MultilineDouble, Glyph::MultilineSingle]
+            .into_iter()
+            .find_map(|g| content.strip_prefix(g.text()).map(|rest| (g, rest)));
+        let Some((opener, suffix)) = opener else {
             return Err(self.error_current("invalid multiline string opener"));
         };
 
@@ -2096,25 +2752,34 @@ impl<'a, T: Tree> Parser<'a, T> {
             }
         };
 
-        // Closer must exactly match opener glyph including any explicit suffix
-        let closer = format!("{} {}{}", spaces(line_indent), glyph, suffix);
+        // Closer must exactly match opener glyph including any explicit suffix.
+        //
+        // Built in the file frame, because it is compared literally against source
+        // lines and those are what the file says. `line_indent` is structural, so
+        // under an active ` /<` it sits `offset` columns right of where the text
+        // actually is -- which made a correctly written closer read as a body line
+        // and lost the document.
+        let closer_indent = self.idt.to_file(line_indent).spaces();
+        let closer = opener.at_with_suffix(closer_indent, suffix);
         let opener_line = self.line;
         self.line += 1;
 
-        let (body, flavor) = match glyph {
-            "```" => (
+        let (body, flavor) = match opener {
+            Glyph::MultilineTriple => (
                 self.parse_triple_backtick_body(local_eol, &closer, opener_line)?,
                 MultilineFlavor::Triple,
             ),
-            "``" => (
+            Glyph::MultilineDouble => (
                 self.parse_double_backtick_body(local_eol, &closer, opener_line)?,
                 MultilineFlavor::Double,
             ),
-            "`" => (
+            Glyph::MultilineSingle => (
                 self.parse_single_backtick_body(line_indent, local_eol, &closer, opener_line)?,
                 MultilineFlavor::Single,
             ),
-            _ => unreachable!(),
+            Glyph::IndentOpen | Glyph::IndentClose => {
+                unreachable!("only multiline glyphs reach here; the opener match cannot yield these")
+            }
         };
         Ok((body, flavor))
     }
@@ -2128,21 +2793,21 @@ impl<'a, T: Tree> Parser<'a, T> {
         let mut value = String::new();
         let mut line_count = 0usize;
         loop {
-            let Some(line) = self.current_line().map(str::to_owned) else {
+            let Some(line) = self.current_line() else {
                 return Err(self.unterminated_multiline(opener_line, closer));
             };
-            if line == closer {
+            if line.text() == closer {
                 self.line += 1;
                 break;
             }
             if line_count > 0 {
-                value.push_str(local_eol.as_str());
+                value.push_str(local_eol.bytes());
             }
-            value.push_str(&line);
+            value.push_str(line.text());
             line_count += 1;
             self.line += 1;
         }
-        self.check_multiline_minimum(&value, "```", line_count)?;
+        self.check_multiline_minimum(&value, Glyph::MultilineTriple.body(), line_count)?;
         Ok(value)
     }
 
@@ -2154,90 +2819,135 @@ impl<'a, T: Tree> Parser<'a, T> {
     ) -> std::result::Result<String, ParseError> {
         let mut value = String::new();
         let mut line_count = 0usize;
+        // The column the margin sits at, taken from the first body line. Any
+        // column is accepted -- the margin points at space rather than carrying
+        // depth, so where it sits is not structural -- but every line of one
+        // string has to agree, because a margin's whole job is to give the reader
+        // a straight edge to run down. A ragged one keeps the marker and destroys
+        // what the marker is for. A folded line's `/ ` replaces the columns the
+        // `| ` occupies -- the specification's "replaces the last two spaces of
+        // the indent of `| `" -- so it sits at the margin too, not beside it.
+        let mut margin: Option<ByteOffset> = None;
         loop {
-            let Some(line) = self.current_line().map(str::to_owned) else {
+            let Some(line) = self.current_line() else {
                 return Err(self.unterminated_multiline(opener_line, closer));
             };
-            if line == closer {
+            if line.text() == closer {
                 self.line += 1;
                 break;
             }
-            let trimmed = line.trim_start_matches(' ');
-            if let Some(content_part) = trimmed.strip_prefix("| ") {
+            let at = ByteOffset::new(count_leading_spaces(line.text()));
+            let trimmed = &line[at..];
+            if let Some(content_part) = trimmed.strip_prefix(Marker::Body.text()) {
+                match margin {
+                    None => margin = Some(at),
+                    Some(expected) if at != expected => {
+                        return Err(self.ragged_margin_error(at, expected, Marker::Body));
+                    }
+                    Some(_) => {}
+                }
                 if line_count > 0 {
-                    value.push_str(local_eol.as_str());
+                    value.push_str(local_eol.bytes());
                 }
                 value.push_str(content_part);
                 line_count += 1;
-            } else if let Some(cont_part) = trimmed.strip_prefix("/ ") {
-                if line_count == 0 {
+            } else if let Some(cont_part) = trimmed.strip_prefix(Marker::Fold.text()) {
+                let Some(expected) = margin else {
                     return Err(self.error_current(
                         "fold continuation cannot appear before any content in a `` multiline string",
                     ));
+                };
+                if at != expected {
+                    return Err(self.ragged_margin_error(at, expected, Marker::Fold));
                 }
                 value.push_str(cont_part);
-            } else if let Some(detail) = self.closer_misindent(&line, closer) {
+            } else if let Some(detail) = self.closer_fault(
+                line,
+                closer,
+                "it reads as a body line -- and a body line has to start with '| ' or '/ '",
+            ) {
                 return Err(self.error_current(detail));
             } else {
                 return Err(self.error_current(
-                    "`` multiline string body lines must start with '| ' or '/ '",
+                    format!("`` multiline string body lines must start with '{}' or '{}'", Marker::Body.text(), Marker::Fold.text()),
                 ));
             }
             self.line += 1;
         }
-        self.check_multiline_minimum(&value, "``", line_count)?;
+        self.check_multiline_minimum(&value, Glyph::MultilineDouble.body(), line_count)?;
         Ok(value)
     }
 
     fn parse_single_backtick_body(
         &mut self,
-        n: usize,
+        line_indent: LogicalIndent,
         local_eol: MultilineLocalEol,
         closer: &str,
         opener_line: usize,
     ) -> std::result::Result<String, ParseError> {
-        let content_indent = n + 2;
-        let fold_marker = format!("{}{}", spaces(n), "/ ");
+        // Everything below measures and slices the file's own lines, so cross to
+        // the file frame once here. `n` arrives structural, and under an active
+        // ` /<` that is `offset` columns right of where the text is -- which made
+        // the indent check reject good bodies and, worse, sliced the value itself
+        // at the wrong column.
+        let body_indent = self.idt.to_file(line_indent);
+        let content_indent = body_indent.deeper(1);
+        let fold_marker = format!("{}{}", body_indent.spaces(), Marker::Fold.text());
         let mut value = String::new();
         let mut line_count = 0usize;
         loop {
-            let Some(line) = self.current_line().map(str::to_owned) else {
+            let Some(line) = self.current_line() else {
                 return Err(self.unterminated_multiline(opener_line, closer));
             };
-            if line == closer {
+            if line.text() == closer {
                 self.line += 1;
                 break;
             }
-            if line.starts_with(&fold_marker) {
+            if line.text().starts_with(&fold_marker) {
                 if line_count == 0 {
                     return Err(self.error_current(
                         "fold continuation cannot appear before any content in a ` multiline string",
                     ));
                 }
-                value.push_str(&line[content_indent..]);
+                value.push_str(line.byte_offset_of(content_indent).map_or("", |at| line.from(at)));
                 self.line += 1;
                 continue;
             }
-            if count_leading_spaces(&line) < content_indent {
+            // Asked before the indent complaint below, which would otherwise
+            // answer a plainly-written closer with a lecture about content lines.
+            if let Some(detail) = self.closer_fault(
+                line,
+                closer,
+                "it reads as one more line of the string's content",
+            ) {
+                return Err(self.error_current(detail));
+            }
+            // A line that does not reach the content indent at all is under it,
+            // which is the same complaint -- `None` is the far side of `<`, not a
+            // case with nothing to say.
+            let under_indented = line
+                .byte_offset_of(content_indent)
+                .is_none_or(|at| ByteOffset::new(count_leading_spaces(line.text())) < at);
+            if under_indented {
                 return Err(self.error_current(
                     "` multiline string content lines must be indented at n+2 spaces",
                 ));
             }
             if line_count > 0 {
-                value.push_str(local_eol.as_str());
+                value.push_str(local_eol.bytes());
             }
-            value.push_str(&line[content_indent..]);
+            value.push_str(line.byte_offset_of(content_indent).map_or("", |at| line.from(at)));
             line_count += 1;
             self.line += 1;
         }
-        self.check_multiline_minimum(&value, "`", line_count)?;
+        self.check_multiline_minimum(&value, Glyph::MultilineSingle.body(), line_count)?;
         Ok(value)
     }
 
     fn parse_folded_json_string(
         &mut self,
         content: &str,
-        fold_indent: usize,
+        fold_indent: LogicalIndent,
     ) -> std::result::Result<String, ParseError> {
         let mut json = content.to_owned();
         let start_line = self.line;
@@ -2245,14 +2955,14 @@ impl<'a, T: Tree> Parser<'a, T> {
         loop {
             let line = self
                 .current_line()
-                .ok_or_else(|| self.error_at_line(start_line, fold_indent + 1, "unterminated JSON string"))?
+                .ok_or_else(|| self.error_at_indent(start_line, fold_indent, "unterminated JSON string"))?
                 .to_owned();
             self.ensure_line_has_no_tabs(self.line)?;
             // Spec: "A comment may not be within a fold." Checked before the
             // indent test, because a comment may sit at any indentation and
             // would otherwise be reported as an unterminated string, blaming
             // the line where the string opened rather than the comment.
-            if line.trim_start_matches(' ').starts_with("//") {
+            if line.text().trim_start_matches(' ').starts_with("//") {
                 self.comment_in_fold(
                     self.line,
                     "this comment sits in the middle of a quoted string that \
@@ -2262,15 +2972,15 @@ impl<'a, T: Tree> Parser<'a, T> {
                 self.line += 1;
                 continue;
             }
-            let raw_fi = count_leading_spaces(&line);
-            if self.idt.logical(raw_fi) != fold_indent {
-                return Err(self.error_at_line(start_line, fold_indent + 1, "unterminated JSON string"));
+            let raw_fi = ByteOffset::new(count_leading_spaces(line.text()));
+            if self.byte_offset_of(line, fold_indent) != Some(raw_fi) {
+                return Err(self.error_at_indent(start_line, fold_indent, "unterminated JSON string"));
             }
             let rest = &line[raw_fi..];
-            if !rest.starts_with("/ ") {
-                return Err(self.error_at_line(start_line, fold_indent + 1, "unterminated JSON string"));
-            }
-            json.push_str(&rest[2..]);
+            let Some(continued) = rest.strip_prefix(Marker::Fold.text()) else {
+                return Err(self.error_at_indent(start_line, fold_indent, "unterminated JSON string"));
+            };
+            json.push_str(continued);
             self.line += 1;
             if let Some((value, end)) = parse_json_string_prefix(&json) {
                 if end != json.len() {
@@ -2288,16 +2998,37 @@ impl<'a, T: Tree> Parser<'a, T> {
         content: &str,
         span: Span,
     ) -> std::result::Result<T, ParseError> {
+        // Both errors below report a position inside `content`, and `content` is a
+        // slice of the line -- six callers hand it a different one. Adding the
+        // fragment's own start is what turns those into positions in the line;
+        // without it every caret is short by however far in the fragment began.
+        // Derived from the span the value already carries, so the two cannot
+        // disagree. `within` is what enforces that: it takes two document offsets
+        // and yields a position inside the line, or `None` when the span starts
+        // before the line said to contain it -- which is not a small number, it
+        // is a caller that paired an offset with the wrong line. Falling back to
+        // the line's start is a choice made here, in the open, rather than an
+        // underflow quietly becoming zero inside the arithmetic.
+        let fragment_start = self
+            .line_offsets
+            .get(self.line)
+            .and_then(|line| DocumentOffset::new(span.start as usize).within(line.start))
+            .unwrap_or(ByteOffset::START);
         if let Err(col) = is_valid_minimal_json(content) {
             return Err(self.error_at_line(
                 self.line,
-                col + 1,
+                fragment_start.plus(col),
                 "invalid MINIMAL JSON (whitespace outside strings is forbidden)",
             ));
         }
         let value: JsonValue = serde_json::from_str(content).map_err(|error| {
-            let col = error.column();
-            self.error_at_line(self.line, col, format!("minimal JSON error: {error}"))
+            // serde reports a 1-based column within the fragment it was given.
+            let col = error.column().saturating_sub(1);
+            self.error_at_line(
+                self.line,
+                fragment_start.plus(col),
+                format!("MINIMAL JSON must be valid JSON: {}", serde_reason(&error)),
+            )
         })?;
         // The target decides how source facts apply to the fragment's interior —
         // e.g. an annotated tree marks interior strings Quoted, since that is how
@@ -2305,28 +3036,76 @@ impl<'a, T: Tree> Parser<'a, T> {
         Ok(T::from_minimal_json(value, ContainerFacts { span, table: false }))
     }
 
-    fn line_str(&self, index: usize) -> Option<&str> {
-        self.line_offsets.get(index).map(|s| &self.input[s.start..s.start + s.len])
+    fn line_str(&self, index: usize) -> Option<Line<'a>> {
+        self.line_offsets.get(index).map(|s| s.text(self.input))
     }
 
-    fn current_line(&self) -> Option<&str> {
+    fn current_line(&self) -> Option<Line<'a>> {
         self.line_str(self.line)
     }
 
     fn skip_ignorable_lines(&mut self) -> std::result::Result<(), ParseError> {
         let mut first_comment: Option<usize> = None;
+        // The indent of the previous line in the current run of comments, so a run
+        // that steps back out can be refused.
+        //
+        // Never needs resetting, and a local rather than a field for the same
+        // reason: a run cannot outlive one call. The loop below continues only on
+        // a comment, so the first line that is not one ends the call -- and a blank
+        // line between two comments is refused as a blank line before the question
+        // of a run arises. Anything else at the end of a run is content, which is
+        // what the run annotates.
+        let mut run_indent: Option<usize> = None;
         while let Some(line) = self.current_line() {
             self.ensure_line_has_no_tabs(self.line)?;
-            let trimmed = line.trim_start_matches(' ');
+            let trimmed = line.text().trim_start_matches(' ');
             if trimmed.starts_with("//") {
+                let indent = line.text().len() - trimmed.len();
+                // A run of comment lines may stay level or step further in, never
+                // back out.
+                //
+                // A comment belongs to what it sits against, so where it sits is
+                // what says which thing it annotates. A run that steps outward may
+                // need its lines reordered for each comment to stay with its
+                // subject -- and *may* is the whole point. Sometimes it would not:
+                // both comments can be close enough to annotate the same thing.
+                // Deciding which is not a question every parser should have to
+                // answer, so the format asks the run to hold its column or move
+                // inward, and a parser that only compares two numbers gets the rule
+                // right.
+                //
+                // Checked whatever the tree does with comments: a document is
+                // well formed or it is not, and `Value` discarding them afterwards
+                // does not make an ill-formed one legal.
+                if let Some(above) = run_indent
+                    && indent < above
+                {
+                    let found = line.column_at(ByteOffset::new(indent)).number();
+                    let outer = line.column_at(ByteOffset::new(above)).number();
+                    return Err(self.error_at_line(
+                        self.line,
+                        ByteOffset::new(indent),
+                        format!(
+                            "this comment is at column {found}, further out than the \
+                             comment on the line above it at column {outer}. A run of \
+                             comment lines may stay at one column or step further in, \
+                             never back out: a comment belongs to whatever it sits \
+                             against, so a run that steps outward may need reordering \
+                             for each comment to stay with its subject. Sometimes it \
+                             would not -- both may be close enough to annotate the same \
+                             thing -- but that is not a question every parser should \
+                             have to answer. Line them up at column {outer}, indent \
+                             this one further, or put the value they annotate between \
+                             them."
+                        ),
+                    ));
+                }
+                run_indent = Some(indent);
                 if first_comment.is_none() {
                     first_comment = Some(self.line);
                 }
                 if T::KEEPS_COMMENTS {
-                    let comment = RawComment {
-                        col: line.len() - trimmed.len(),
-                        text: trimmed.to_owned(),
-                    };
+                    let comment = RawComment { col: indent, text: trimmed.to_owned() };
                     self.pending_comments.push(comment);
                 }
                 self.line += 1;
@@ -2352,7 +3131,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 if !line.is_empty() && self.options.trailing_spaces == TrailingSpaces::Reject {
                     return Err(self.error_at_line(
                         self.line,
-                        1,
+                        ByteOffset::START,
                         "a line of nothing but spaces is only meaningful inside a \
                          multiline string; here it is trailing whitespace -- remove \
                          the spaces, or delete the line",
@@ -2364,7 +3143,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 }
                 return Err(self.error_at_line(
                     self.line,
-                    1,
+                    ByteOffset::START,
                     "blank lines are not allowed within TJSON; only trailing blank \
                      lines at the end of the document are ignored",
                 ));
@@ -2381,7 +3160,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         // and reports whatever it was left holding, which is never the truth.
         if let Some(comment_line) = first_comment
             && let Some(next) = self.current_line()
-            && next.trim_start_matches(' ').starts_with("/ ")
+            && next.text().trim_start_matches(' ').starts_with(Marker::Fold.text())
         {
             self.comment_in_fold(
                 comment_line,
@@ -2397,7 +3176,7 @@ impl<'a, T: Tree> Parser<'a, T> {
     fn only_blank_lines_remain(&self, from: usize) -> bool {
         (from..self.line_offsets.len())
             .filter_map(|index| self.line_str(index))
-            .all(|line| line.trim_start_matches(' ').is_empty())
+            .all(|line| line.text().trim_start_matches(' ').is_empty())
     }
 
     /// Apply the comment-in-fold policy to a comment sitting at `line_no`.
@@ -2418,7 +3197,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         match self.options.comment_placement_error {
             CommentPlacementError::Reject => Err(self.error_at_line(
                 line_no,
-                1,
+                ByteOffset::START,
                 format!("a comment may not appear inside a fold; {detail}"),
             )),
             CommentPlacementError::Hoist => {
@@ -2431,9 +3210,9 @@ impl<'a, T: Tree> Parser<'a, T> {
                 if T::KEEPS_COMMENTS
                     && let Some(line) = self.line_str(line_no)
                 {
-                    let trimmed = line.trim_start_matches(' ');
+                    let trimmed = line.text().trim_start_matches(' ');
                     let comment = RawComment {
-                        col: line.len() - trimmed.len(),
+                        col: line.text().len() - trimmed.len(),
                         text: trimmed.to_owned(),
                     };
                     self.pending_comments.push(comment);
@@ -2459,7 +3238,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         &self,
         content: &str,
         literal: &str,
-        col: Option<usize>,
+        col: Option<ByteOffset>,
         context: ArrayLineValueContext,
     ) -> std::result::Result<(), ParseError> {
         let rest = &content[literal.len()..];
@@ -2472,44 +3251,115 @@ impl<'a, T: Tree> Parser<'a, T> {
         // the two spaces separating those pairs cannot appear inside a bare
         // string. Suggesting a line that parses differently is worse than saying
         // nothing.
-        let token = &content[..simple_token_end(content, context)];
-        if next == ' ' || (next == ',' && context == ArrayLineValueContext::ArrayLine) {
+        let token = &content[..token_end(content, context)];
+        if next == ' '
+            || (next == ',' && matches!(context, ArrayLineValueContext::ArrayLine(_)))
+        {
             return Ok(());
         }
         Err(self.error_at_col(
-            col.map(|c| c + literal.len()),
+            col.map(|c| c.plus(literal.len())),
             format!(
                 "`{literal}` is followed by `{next}`, and nothing may follow it. \
                  `k:{literal}` writes the {} itself, so it has to end there. If you \
                  meant the text `{token}`, write it as a bare string with a space \
                  after the colon -- `k: {token}` -- since the space is what opens a \
-                 string",
+                 string.",
                 if literal == "null" { "null" } else { "boolean" }
             ),
         ))
     }
 
-    /// Did this line close the string, only at the wrong indentation?
+    /// A body line whose margin does not line up with the rest of its string.
     ///
-    /// A misindented closer otherwise reports as a malformed body line, which is
-    /// true and useless: the writer did close the string, they closed it a
-    /// column off, and nothing in "body lines must start with `| `" says where
-    /// it belonged. The glyph carries no indentation cue of its own and the
-    /// miss is usually one space, so it is invisible on the page -- the only
-    /// thing that helps is naming both columns.
-    fn closer_misindent(&self, line: &str, closer: &str) -> Option<String> {
+    /// Names both columns, because the miss is usually one space and invisible on
+    /// the page -- the same reason `closer_misindent` exists. Says which column
+    /// the string chose rather than implying a fixed one, since any column is
+    /// allowed as long as they agree.
+    fn ragged_margin_error(&self, found: ByteOffset, expected: ByteOffset, marker: Marker) -> ParseError {
+        self.error_at_line(
+            self.line,
+            found,
+            format!(
+                "this `{}` is at column {}, but this string's margin is at column {}. \
+                 Any column is fine, but every line of one multiline string has to use \
+                 the same one -- a margin is what gives a reader a straight edge to \
+                 read down, and it stops being one as soon as the lines disagree. Move \
+                 this line to column {}, or move the others to match it.",
+                marker.text().trim_end(),
+                self.column_of_margin(found),
+                self.column_of_margin(expected),
+                self.column_of_margin(expected),
+            ),
+        )
+    }
+
+    /// The column a margin offset reads as in a message.
+    ///
+    /// Everything before a margin is spaces, so bytes and columns coincide here
+    /// and the current line serves for either offset. Routed through [`Column`]
+    /// anyway, because that is where 0-based becomes 1-based and a site that does
+    /// it by hand is a site that can stop agreeing with the caret beside it.
+    fn column_of_margin(&self, at: ByteOffset) -> usize {
+        match self.line_str(self.line) {
+            Some(line) => line.column_at(at).number(),
+            None => Column::at_unknown_line(at).number(),
+        }
+    }
+
+    /// Was this line trying to be the closing glyph, and what stopped it counting?
+    ///
+    /// A closer is the bare glyph, alone on its line, at one fixed column. Both
+    /// ways of missing that -- a column off, or spaces after it -- are invisible
+    /// on the page, and the writer did close the string; they are not owed a
+    /// complaint about body lines, they are owed the difference between what they
+    /// wrote and a closer.
+    ///
+    /// `misplaced_reads_as` says what the line is taken for where it sits, which
+    /// differs by flavour: the `` body reads it as a body line wanting a marker,
+    /// the ` body as an indented content line.
+    ///
+    /// Recognition goes through [`is_attempted_closer`], which is the whole point
+    /// of this rewrite: it used to strip only the *leading* spaces here, so a
+    /// closer with a space after it was not an attempted closer at all and came
+    /// back as "body lines must start with `| `" -- an instruction whose edit
+    /// makes the line a body line and leaves the string unterminated.
+    fn closer_fault(
+        &self,
+        line: Line<'_>,
+        closer: &str,
+        misplaced_reads_as: &str,
+    ) -> Option<String> {
         let glyph = closer.trim_start_matches(' ');
-        if line.trim_start_matches(' ') != glyph {
+        let text = line.text();
+        if !is_attempted_closer(text, glyph) {
             return None;
         }
-        let expected = closer.len() - glyph.len() + 1;
-        let found = count_leading_spaces(line) + 1;
-        Some(format!(
-            "the closing {glyph} glyph is at column {found} but belongs at column \
-             {expected}, one space further in than the key that opened the string. \
-             Where it is, it reads as a body line -- and a body line has to start \
-             with '| ' or '/ '"
-        ))
+        // The closer is spaces then the glyph, so its indent is what precedes the
+        // glyph; both columns go through `Column` rather than being 1-based by
+        // hand, so the numbers in the message and any caret cannot drift.
+        let expected =
+            Line::new(closer).column_at(ByteOffset::new(closer.len() - glyph.len())).number();
+        let found = line.column_at(ByteOffset::new(count_leading_spaces(text))).number();
+        let has_trailing = text.trim_start_matches(' ') != glyph;
+        Some(match (found == expected, has_trailing) {
+            // Already a closer, so the caller matched it before asking.
+            (true, false) => return None,
+            (true, true) => format!(
+                "this {glyph} has spaces after it, and a closing glyph has to be the whole \
+                 line -- delete them and it closes the string opened above"
+            ),
+            (false, false) => format!(
+                "the closing {glyph} glyph is at column {found} but belongs at column \
+                 {expected}, one space further in than the key that opened the string. \
+                 Where it is, {misplaced_reads_as}"
+            ),
+            (false, true) => format!(
+                "this {glyph} is at column {found}, belongs at column {expected}, and has \
+                 spaces after it -- a closer is the bare glyph alone on its line. Move it \
+                 to column {expected} and delete the spaces after it."
+            ),
+        })
     }
 
     /// The error for a multiline string that never closed.
@@ -2522,12 +3372,17 @@ impl<'a, T: Tree> Parser<'a, T> {
     /// missing that (wrong indent, trailing spaces) are invisible on the page.
     fn unterminated_multiline(&self, opener_line: usize, closer: &str) -> ParseError {
         let glyph = closer.trim_start_matches(' ');
-        let column = closer.len() - glyph.len() + 1;
+        let column = Line::new(closer).column_at(ByteOffset::new(closer.len() - glyph.len())).number();
 
         let mut probe = opener_line + 1;
         while let Some(line) = self.line_str(probe) {
-            if line.trim_start_matches(' ').trim_end() == glyph {
-                let found = count_leading_spaces(line) + 1;
+            if is_attempted_closer(line.text(), glyph) {
+                // One offset, one conversion. The column the prose states and
+                // the column the caret lands on are the same value derived the
+                // same way -- computing them separately is how they came to
+                // disagree.
+                let found_at = ByteOffset::new(count_leading_spaces(line.text()));
+                let found = line.column_at(found_at).number();
                 let reason = if found == column {
                     "has trailing spaces after it, and a closing glyph has to be the \
                      whole line"
@@ -2537,7 +3392,7 @@ impl<'a, T: Tree> Parser<'a, T> {
                 };
                 return self.error_at_line(
                     probe,
-                    1,
+                    found_at,
                     format!(
                         "unterminated multiline string: the {glyph} on this line {reason}, \
                          so it did not close the string opened on line {}. The closer must \
@@ -2551,11 +3406,11 @@ impl<'a, T: Tree> Parser<'a, T> {
 
         self.error_at_line(
             opener_line,
-            1,
+            ByteOffset::START,
             format!(
                 "unterminated multiline string: no closing {glyph} was found. It must be \
                  {glyph} alone on its own line at column {column}, one space further in \
-                 than the key that opened the string"
+                 than the key that opened the string."
             ),
         )
     }
@@ -2573,7 +3428,7 @@ impl<'a, T: Tree> Parser<'a, T> {
     /// once per element and again once a separator reveals the line is comma
     /// packed -- and a message written out at each of the four sites is a message
     /// that drifts at three of them.
-    fn bare_comma_error(&self, col: Option<usize>) -> ParseError {
+    fn bare_comma_error(&self, col: Option<ByteOffset>) -> ParseError {
         self.error_at_col(
             col,
             "a bare string in a comma separated packed array may not contain a comma; \
@@ -2581,7 +3436,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         )
     }
 
-    fn mixed_pack_error(&self, col: Option<usize>, bare_scalar: Option<&str>) -> ParseError {
+    fn mixed_pack_error(&self, col: Option<ByteOffset>, bare_scalar: Option<&str>) -> ParseError {
         match bare_scalar {
             Some(text) => self.error_at_col(
                 col,
@@ -2618,24 +3473,29 @@ impl<'a, T: Tree> Parser<'a, T> {
         // spaces alone made `line[..indent_end]` all spaces by construction, so the
         // search below could never succeed and every tab surfaced as some unrelated
         // complaint about indent depth.
-        let indent_end = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let indent_end =
+            ByteOffset::new(line.text().len() - line.text().trim_start_matches([' ', '\t']).len());
         if let Some(column) = line[..indent_end].find('\t') {
             return Err(self.error_at_line(
                 line_index,
-                column + 1,
+                ByteOffset::new(column),
                 "tab characters are not allowed as indentation",
             ));
         }
         Ok(())
     }
 
-    fn looks_like_object_start(&self, content: &str, fold_indent: usize) -> bool {
+    fn looks_like_object_start(
+        &self,
+        content: &str,
+        fold_indent: LogicalIndent,
+    ) -> std::result::Result<bool, ParseError> {
         if content.starts_with('|') || starts_with_marker_chain(content) {
-            return false;
+            return Ok(false);
         }
         if let Some(end) = parse_bare_key_prefix(content, &self.options) {
             if content.get(end..).is_some_and(|rest| rest.starts_with(':')) {
-                return true;
+                return Ok(true);
             }
             // Bare run fills the whole line and continues with `/ `. That is
             // either a folded key whose colon lands on a later line, or a
@@ -2644,13 +3504,13 @@ impl<'a, T: Tree> Parser<'a, T> {
             // than assuming. Assuming "key" made a folded number in an array
             // fail to parse as `invalid object key`.
             if only_held_back_tail(content, end, &self.options)
-                && self.folded_bare_has_colon(content, fold_indent)
+                && self.folded_bare_has_colon(content, fold_indent)?
             {
-                return true;
+                return Ok(true);
             }
         }
         if let Some((_, end)) = parse_json_string_prefix(content) {
-            return content.get(end..).is_some_and(|rest| rest.starts_with(':'));
+            return Ok(content.get(end..).is_some_and(|rest| rest.starts_with(':')));
         }
         // A quoted string that doesn't close on this line may be a folded object
         // key OR a folded string value (an array element, or the whole root).
@@ -2661,7 +3521,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         if content.starts_with('"') && parse_json_string_prefix(content).is_none() {
             return self.folded_json_string_has_colon(content, fold_indent);
         }
-        false
+        Ok(false)
     }
 
     /// What follows a fold, decided in one place.
@@ -2671,12 +3531,15 @@ impl<'a, T: Tree> Parser<'a, T> {
     /// means they cannot drift, and gives the comment case somewhere to live:
     /// the spec says a comment may not be within a fold, so it is neither a
     /// continuation nor a clean end.
-    fn classify_fold_next(&self, line_no: usize, fold_indent: usize) -> FoldNext<'_> {
+    fn classify_fold_next(&self, line_no: usize, fold_indent: LogicalIndent) -> FoldNext<'a> {
         let Some(line) = self.line_str(line_no) else {
             return FoldNext::Ends;
         };
-        let raw_fi = count_leading_spaces(line);
-        let rest = &line[raw_fi..];
+        let raw_fi = ByteOffset::new(count_leading_spaces(line.text()));
+        // `Line::from` rather than `&line[raw_fi..]`: the tail is returned to the
+        // caller inside `FoldNext`, so it has to borrow the input and not the
+        // local `Line`.
+        let rest = line.from(raw_fi);
         // A comment may sit at any indent, so this is checked before the indent
         // match rather than after it.
         //
@@ -2687,7 +3550,7 @@ impl<'a, T: Tree> Parser<'a, T> {
         if rest.starts_with("//") {
             let mut ahead = line_no + 1;
             while let Some(peek) = self.line_str(ahead) {
-                if peek.trim_start_matches(' ').starts_with("//") {
+                if peek.text().trim_start_matches(' ').starts_with("//") {
                     ahead += 1;
                     continue;
                 }
@@ -2698,8 +3561,14 @@ impl<'a, T: Tree> Parser<'a, T> {
                 _ => FoldNext::Ends,
             };
         }
-        if self.idt.logical(raw_fi) != fold_indent || !rest.starts_with("/ ") {
+        if !rest.starts_with(Marker::Fold.text()) {
             return FoldNext::Ends;
+        }
+        if self.byte_offset_of(line, fold_indent) != Some(raw_fi) {
+            // A fold marker, at a column that is not the one asked about. Saying
+            // `Ends` here is what let a wrong `fold_indent` look like a finished
+            // value.
+            return FoldNext::ContinuesElsewhere;
         }
         FoldNext::Continues(&rest[2..])
     }
@@ -2707,7 +3576,11 @@ impl<'a, T: Tree> Parser<'a, T> {
     /// Reassemble a quoted string across its `/ ` fold continuations and report
     /// whether a `:` follows it. Read-only lookahead: the caller re-walks the
     /// same lines once it has decided how to interpret them.
-    fn folded_json_string_has_colon(&self, content: &str, fold_indent: usize) -> bool {
+    fn folded_json_string_has_colon(
+        &self,
+        content: &str,
+        fold_indent: LogicalIndent,
+    ) -> std::result::Result<bool, ParseError> {
         let mut acc = content.to_owned();
         let mut next = self.line + 1;
         loop {
@@ -2720,14 +3593,32 @@ impl<'a, T: Tree> Parser<'a, T> {
                     continue;
                 }
                 FoldNext::Ends => break,
+                // A `/ ` in a column this value does not own. Reported, not
+                // absorbed: `Ends` used to swallow it and answer "the value
+                // finished", so a stray marker became part of whatever the caller
+                // built next -- no error, a different document.
+                //
+                // Two causes reach here. A malformed document, which is what this
+                // message is for and is reachable from input (the sweep mutates
+                // one into `  "` then `/ ` at column 1). Or a caller that passed
+                // the wrong `fold_indent`, in which case a well-formed folded key
+                // stops being recognised -- and now says so loudly instead of
+                // quietly becoming an array element. See G2.
+                // Now reported rather than absorbed. If this ever fires on a
+                // well-formed document it means the caller's `fold_indent` is
+                // wrong -- which is the other half of G2, and an error is how it
+                // announces itself instead of quietly changing the document.
+                FoldNext::ContinuesElsewhere => {
+                    return Err(self.stray_fold_marker(next, fold_indent));
+                }
             };
             acc.push_str(rest);
             next += 1;
             if let Some((_, end)) = parse_json_string_prefix(&acc) {
-                return acc.get(end..).is_some_and(|r| r.starts_with(':'));
+                return Ok(acc.get(end..).is_some_and(|r| r.starts_with(':')));
             }
         }
-        false
+        Ok(false)
     }
 
     /// Reassemble a bare run across its `/ ` fold continuations and report
@@ -2737,7 +3628,11 @@ impl<'a, T: Tree> Parser<'a, T> {
     ///
     /// Read-only lookahead; the caller re-walks the same lines once it has
     /// decided how to read them.
-    fn folded_bare_has_colon(&self, content: &str, fold_indent: usize) -> bool {
+    fn folded_bare_has_colon(
+        &self,
+        content: &str,
+        fold_indent: LogicalIndent,
+    ) -> std::result::Result<bool, ParseError> {
         let mut acc = content.to_owned();
         let mut next = self.line + 1;
         loop {
@@ -2756,16 +3651,34 @@ impl<'a, T: Tree> Parser<'a, T> {
                     continue;
                 }
                 FoldNext::Ends => break,
+                // A `/ ` in a column this value does not own. Reported, not
+                // absorbed: `Ends` used to swallow it and answer "the value
+                // finished", so a stray marker became part of whatever the caller
+                // built next -- no error, a different document.
+                //
+                // Two causes reach here. A malformed document, which is what this
+                // message is for and is reachable from input (the sweep mutates
+                // one into `  "` then `/ ` at column 1). Or a caller that passed
+                // the wrong `fold_indent`, in which case a well-formed folded key
+                // stops being recognised -- and now says so loudly instead of
+                // quietly becoming an array element. See G2.
+                // Now reported rather than absorbed. If this ever fires on a
+                // well-formed document it means the caller's `fold_indent` is
+                // wrong -- which is the other half of G2, and an error is how it
+                // announces itself instead of quietly changing the document.
+                FoldNext::ContinuesElsewhere => {
+                    return Err(self.stray_fold_marker(next, fold_indent));
+                }
             };
             acc.push_str(rest);
             next += 1;
             if let Some(end) = parse_bare_key_prefix(&acc, &self.options)
                 && acc.get(end..).is_some_and(|r| r.starts_with(':'))
             {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     /// Error at a known byte column within the current line.
@@ -2781,10 +3694,10 @@ impl<'a, T: Tree> Parser<'a, T> {
     /// the missing glyph would have occupied. `depth` is how many markers were
     /// already read on this line, which is what makes the message able to say
     /// which level went unwritten rather than just that something is off.
-    fn missing_marker_error(&self, col: usize, depth: usize) -> ParseError {
+    fn missing_marker_error(&self, col: ByteOffset, depth: usize) -> ParseError {
         self.error_at_line(
             self.line,
-            col + 1,
+            col,
             format!(
                 "two spaces sit here where a nesting marker belongs. This column is one \
                  level deeper than the {depth} marker(s) before it, so TJSON reads the \
@@ -2796,51 +3709,266 @@ impl<'a, T: Tree> Parser<'a, T> {
         )
     }
 
-    fn error_at_col(&self, col: Option<usize>, message: impl Into<String>) -> ParseError {
+    fn error_at_col(&self, col: Option<ByteOffset>, message: impl Into<String>) -> ParseError {
         match col {
-            Some(c) => self.error_at_line(self.line, c + 1, message),
+            Some(c) => self.error_at_line(self.line, c, message),
             None => self.error_current(message),
         }
     }
 
-    fn error_current(&self, message: impl Into<String>) -> ParseError {
-        let column = self
-            .current_line()
-            .map(|line| count_leading_spaces(line) + 1)
-            .unwrap_or(1);
-        self.error_at_line(self.line, column, message)
+    /// Where a structural position lands in `line`'s bytes.
+    ///
+    /// The full reduction in one place: a logical indent crosses to the file
+    /// frame (which is where an active ` /<` offset is accounted for), and only
+    /// then does the line turn that column count into a byte position. Every
+    /// error that points at a structural position goes through here or through
+    /// [`Self::error_at_indent`], so none of them can skip the glyph offset the
+    /// way a bare `indent + 1` did.
+    ///
+    /// Takes the line because the last step needs the text: an indent counts
+    /// columns and a slice wants bytes, and only the characters in between say
+    /// how far apart those are.
+    fn byte_offset_of(&self, line: Line<'_>, indent: LogicalIndent) -> Option<ByteOffset> {
+        line.byte_offset_of(self.idt.to_file(indent))
     }
 
+    /// The content of `line` at and after a structural indent, empty when the
+    /// line does not reach it.
+    ///
+    /// The clamp, stated where it is decided rather than hidden in the crossing:
+    /// a line shorter than the indent has no content there, and empty is the
+    /// honest answer for *slicing*. Comparisons must not use this -- they want
+    /// [`Self::byte_offset_of`] and its `None`, or they end up comparing against
+    /// the line's length by accident.
+    fn content_at<'l>(&self, line: Line<'l>, indent: LogicalIndent) -> &'l str {
+        self.byte_offset_of(line, indent).map_or("", |at| line.from(at))
+    }
+
+    /// A `/ ` continuation marker in a column no folded value owns.
+    ///
+    /// Raised from the fold *lookahead*, which is why it exists: the lookahead
+    /// used to answer "the value ended" here, and a stray marker was absorbed
+    /// into whatever the caller built next -- silently, and as a different
+    /// document. See G2 in `local/fuzzer-found-breakage.md`.
+    fn stray_fold_marker(&self, line_no: usize, fold_indent: LogicalIndent) -> ParseError {
+        let marker = Marker::Fold.text().trim_end();
+        let at = self
+            .line_str(line_no)
+            .map_or(ByteOffset::START, |line| {
+                ByteOffset::new(count_leading_spaces(line.text()))
+            });
+        let found = self.line_str(line_no).map_or(1, |line| line.column_at(at).number());
+        let want = Column::of_indent(self.idt.to_file(fold_indent)).number();
+        self.error_at_line(
+            line_no,
+            at,
+            format!(
+                "this `{marker}` is at column {found}, but the value it would continue is \
+                 folded at column {want}. A `{marker}` carries on the value above it and has \
+                 to start in that value's column -- in any other column there is nothing \
+                 above for it to continue, so it is not a continuation at all. Move it to \
+                 column {want}, or delete it if the line above is complete.",
+            ),
+        )
+    }
+
+    /// A line inside an object that opens a value where an entry has to begin.
+    ///
+    /// An [`Opener`] is the value's own first column, so a line carrying one is
+    /// a value and an object has nowhere to put a value that is not an entry.
+    /// The reason it needs saying at all is that the text after the opener reads
+    /// exactly like an entry -- `   b: 2` is a key one column right -- and it was
+    /// accepted as one for as long as the slice stepped over the opener.
+    fn opener_where_an_entry_belongs(&self, line: Line<'_>, leading: Leading) -> ParseError {
+        let at = leading.content_start(line);
+        let column = line.column_at(at).number();
+        let opened = match leading.opener {
+            Opener::BareString => "a bare string's opening space",
+            Opener::Glyph => "the space that begins an indent offset glyph",
+            // Unreachable: this is only called where `unopened` said no.
+            Opener::None => "an opener",
+        };
+        self.error_at_line(
+            self.line,
+            at,
+            format!(
+                "column {column} holds {opened}, so this line is a value -- but it sits where an \
+                 object's entries begin, and an object has nowhere to put a value that is not an \
+                 entry. The text after it reads like a key because it is one column right of \
+                 where a key goes. Delete the space so the key starts at column {column}, or \
+                 move the value onto the line of the key it belongs to.",
+            ),
+        )
+    }
+
+    /// A marker written one column off the indent, where no marker may begin.
+    ///
+    /// Raised by [`Leading::of`] rather than by whichever walk happens to reach
+    /// the line, because the column is wrong on its own terms: a marker stands
+    /// inside the indent it points at, so it begins where a level ends, and the
+    /// odd column between two levels is not one a marker can occupy whatever the
+    /// line is doing. The two legal columns are the neighbours of the one found,
+    /// which is the whole of what a reader needs to fix it.
+    fn marker_off_column(&self, line_no: usize, line: Line<'_>, fault: OffColumnMarker) -> ParseError {
+        let marker = fault.marker.text().trim_end();
+        let found = line.column_at(fault.at).number();
+        // Both neighbours are named as the nearest columns a marker may occupy,
+        // never as two fixes to choose between: only one of them is the column
+        // of the value this continues, and this function does not know which.
+        // Whichever walk would have known is not reached -- the line is refused
+        // where it is measured. Promising either one specifically would be an
+        // escape route that leads somewhere else.
+        self.error_at_line(
+            line_no,
+            fault.at,
+            format!(
+                "this `{marker}` is at column {found}, between two indent levels. A `{marker}` \
+                 stands inside the indent it points at, so it can only begin where a level ends \
+                 -- column {} or column {} here, and column {found} is neither. One space too \
+                 many or one too few puts a marker here, and the space it then sits past is read \
+                 as a bare string's opening quote, which a marker may not follow. Move it to the \
+                 column the value it continues is folded at.",
+                found - 1,
+                found + 1,
+            ),
+        )
+    }
+
+    /// A ` />` written where no ` /<` has opened a frame.
+    ///
+    /// Names what is missing rather than what the line resembles. Nothing about
+    /// this line is ambiguous -- it is unmistakably a closer -- so the fault is
+    /// entirely that the thing it closes was never opened, and that is what the
+    /// message says. It used to be read as ordinary content and reported by
+    /// whichever parser claimed it, which produced `invalid object key` for a
+    /// line containing no key.
+    fn closer_with_nothing_open(&self, line: Line<'_>) -> ParseError {
+        let close = Glyph::IndentClose.body();
+        let open = Glyph::IndentOpen.body();
+        let at = ByteOffset::new(count_leading_spaces(line.text()));
+        self.error_at_line(
+            self.line,
+            at,
+            format!(
+                "this `{close}` closes an indent offset frame, but no `{open}` has opened one, \
+                 so there is no frame here to close. A `{close}` is only ever the second half of \
+                 a pair. Delete it, or add the `{open}` above that it was meant to close.",
+            ),
+        )
+    }
+
+    /// A ` />` that is not where the frame it would close puts its closer.
+    ///
+    /// Both directions land here: too shallow used to dedent out of the object
+    /// and be reparsed as a root-level key, which reported `invalid object key`
+    /// and never mentioned the glyph; too deep used to be read as ordinary
+    /// content one level in, which raised nothing at all and silently moved the
+    /// following entries inside the container.
+    fn misplaced_closer(&self, line: Line<'_>, expected: FileIndent) -> ParseError {
+        let glyph = Glyph::IndentClose.body();
+        let found_at = ByteOffset::new(count_leading_spaces(line.text()));
+        let found = line.column_at(found_at).number();
+        // The frame's indent names the column the glyph's own leading space
+        // occupies, so the `/>` a reader sees begins one column further right.
+        let want = Column::of_indent(expected).number() + Opener::Glyph.width();
+        self.error_at_line(
+            self.line,
+            found_at,
+            format!(
+                "this `{glyph}` is at column {found}, but the `{}` it closes puts its closer \
+                 at column {want}. The two have to sit at the same column -- that pairing is \
+                 the only thing that says where the shifted frame ends, so at any other \
+                 column this line is not a closer at all and gets read as ordinary content \
+                 one level further in. Move it to column {want}.",
+                Glyph::IndentOpen.body(),
+            ),
+        )
+    }
+
+    /// A position `bytes` into the content that begins at `indent` on the current
+    /// line.
+    ///
+    /// For errors that point at the end of a construct rather than its start: the
+    /// indent is a column count, `bytes` is a length measured on the content
+    /// already sliced out of the line, and the two may only be added once the
+    /// first has become a byte position — which is what this does and what doing
+    /// it by hand at a call site gets wrong.
+    fn byte_offset_past(&self, indent: LogicalIndent, bytes: usize) -> ByteOffset {
+        self.current_line()
+            .and_then(|line| self.byte_offset_of(line, indent))
+            .unwrap_or(ByteOffset::START)
+            .plus(bytes)
+    }
+
+    /// Report an error at a structural indent on `line_index`.
+    ///
+    /// Saves every call site the crossing: they name the indent they are
+    /// reasoning about, and the byte position a caret needs is worked out here,
+    /// where the line is already in hand. A missing line reports at the margin,
+    /// which is where a caret with no text to point into belongs.
+    fn error_at_indent(
+        &self,
+        line_index: usize,
+        indent: LogicalIndent,
+        message: impl Into<String>,
+    ) -> ParseError {
+        let at = self
+            .line_str(line_index)
+            .and_then(|line| self.byte_offset_of(line, indent))
+            .unwrap_or(ByteOffset::START);
+        self.error_at_line(line_index, at, message)
+    }
+
+    fn error_current(&self, message: impl Into<String>) -> ParseError {
+        let at = self
+            .current_line()
+            .map_or(ByteOffset::START, |line| ByteOffset::new(count_leading_spaces(line.text())));
+        self.error_at_line(self.line, at, message)
+    }
+
+    /// Report at a byte offset into `line_index`. Callers pass the offset they
+    /// already hold — a slice position, a scan result — and the column a reader
+    /// is told is derived here, so no call site does that arithmetic itself.
     fn error_at_line(
         &self,
         line_index: usize,
-        column: usize,
+        at: ByteOffset,
         message: impl Into<String>,
     ) -> ParseError {
-        // Callers count columns in bytes, because that is what parsing works in.
-        // A reader counts characters, and so does the caret the error prints. The
-        // two agree only for ASCII, so the conversion happens here -- the one
-        // funnel every error passes through -- rather than at each of the callers
-        // that would each have to remember.
+        // An error raised once the input ran out holds a cursor, not a position.
+        // The line it names does not exist, so it prints no source and no caret
+        // and points the reader past the end of their own file. Where the
+        // document actually stopped is the end of the last line someone wrote --
+        // a trailing newline does not add a line anyone typed, and TJSON has no
+        // blank lines, so the last non-empty one is that line.
+        let (line_index, at) = match self.line_str(line_index) {
+            Some(_) => (line_index, at),
+            None => match self.last_written_line() {
+                Some((last, len)) => (last, ByteOffset::new(len)),
+                None => (line_index, at),
+            },
+        };
         let source = self.line_str(line_index);
         let column = match source {
-            Some(line) => {
-                let mut byte = column.saturating_sub(1).min(line.len());
-                while byte > 0 && !line.is_char_boundary(byte) {
-                    byte -= 1;
-                }
-                line[..byte].chars().count() + 1
-            }
-            None => column,
+            Some(line) => line.column_at(at),
+            None => Column::at_unknown_line(at),
         };
-        ParseError::new(line_index + 1, column, message, source.map(str::to_owned))
+        ParseError::new(line_index + 1, column, message, source.map(|line| line.text().to_owned()))
+    }
+
+    /// The last line with anything on it, and its byte length.
+    fn last_written_line(&self) -> Option<(usize, usize)> {
+        (0..self.line_offsets.len())
+            .rev()
+            .map(|index| (index, self.line_offsets[index].len))
+            .find(|&(_, len)| len > 0)
     }
 }
 
 
 fn bare_string_end(content: &str, context: ArrayLineValueContext) -> usize {
     match context {
-        ArrayLineValueContext::ArrayLine | ArrayLineValueContext::ObjectValue => {
+        ArrayLineValueContext::ArrayLine(_) | ArrayLineValueContext::ObjectValue => {
             bare_string_run(content)
         }
         ArrayLineValueContext::SingleValue => content.len(),
@@ -2871,15 +3999,17 @@ fn scalar_spelling(text: &str) -> Option<&'static str> {
     }
 }
 
-/// Is everything past `end` just the tail a key/string run holds back?
+/// Is everything past `end` just the tail a bare key run holds back?
 ///
-/// A run stops short of trailing spaces and commas because it may not end on one.
-/// When a fold continuation follows, the value does not end there at all, so that
-/// tail is interior content and the run does reach the end of the line.
+/// A run stops short of a trailing space, comma or quote because it may not end
+/// on one. When a fold continuation follows, the value does not end there at all,
+/// so that tail is interior content and the run does reach the end of the line.
+///
+/// The set is [`is_held_back_from_run_end`] and not a list written here: this and
+/// [`parse_bare_key_prefix`] are one rule asked from two directions, and a copy
+/// each is how they came to disagree about PIPELIKE.
 fn only_held_back_tail(content: &str, end: usize, forms: &ParseOptions) -> bool {
-    content[end..]
-        .chars()
-        .all(|c| c == ' ' || forms.is_comma_like(c) || forms.is_quote_like(c))
+    content[end..].chars().all(|ch| is_held_back_from_run_end(ch, forms))
 }
 
 /// How far a bare string runs.
@@ -2899,7 +4029,7 @@ fn only_held_back_tail(content: &str, end: usize, forms: &ParseOptions) -> bool 
 /// walk is only ever reached for a bare string, and the one array format whose
 /// separator is a comma forbids bare strings outright, so no comma this walk can
 /// see is ever a separator. A bare string still may not *end* on one -- but that
-/// is a rule about the finished value, so it belongs to `bare_string_fault` and
+/// is a rule about the finished value, so it belongs to `check_bare_string` and
 /// not here. Dropping the comma instead would make `k: value,` silently parse as
 /// "value", which is exactly the class of error the rule exists to catch.
 ///
@@ -2935,9 +4065,51 @@ fn bare_string_run(content: &str) -> usize {
 /// Unlike a bare string this *does* stop at `, `: a scalar carries no leading
 /// space, so a single space after the comma is Array separator 2 rather than
 /// content.
+/// serde_json's description of a failure, without the ` at line N column M` it
+/// appends.
+///
+/// Those coordinates are relative to the fragment serde was handed, not to the
+/// document, so printing them lands two different frames of reference in one
+/// sentence -- the caller's caret says column 4 while serde's text says column
+/// 2, and both are correct about different things. The position is already
+/// carried properly by the caller; this is only the reason.
+fn serde_reason(error: &serde_json::Error) -> String {
+    let text = error.to_string();
+    match text.rfind(" at line ") {
+        Some(cut) => text[..cut].to_owned(),
+        None => text,
+    }
+}
+
+/// The literal `token` was trying to spell, when it differs from one only by
+/// case (`TRUE`, `Null`, `fAlSe`).
+///
+/// Worth asking as its own question because the bare-string ladder further down
+/// answers this case with "a bare string opens with a space, and there is none
+/// here" -- advice that is true, parses, and then silently yields the *string*
+/// `"TRUE"` instead of the boolean the writer plainly meant. A suggestion that
+/// works and produces the wrong value is worse than one that fails.
+fn miscased_literal(token: &str) -> Option<&'static str> {
+    ["true", "false", "null"]
+        .into_iter()
+        .find(|literal| token != *literal && token.eq_ignore_ascii_case(literal))
+}
+
+/// Was this line trying to be `glyph`, alone on its line?
+///
+/// One recognition test, so the places that ask cannot disagree about what counts
+/// as an attempt. They did: the body loops stripped only the leading spaces while
+/// the search for a would-be closer downstream stripped both ends, so a closer
+/// with a space after it was an attempted closer to one of them and invisible to
+/// the other -- and the reader got a message about body-line markers for a line
+/// that was plainly a closer.
+fn is_attempted_closer(text: &str, glyph: &str) -> bool {
+    text.trim_start_matches(' ').trim_end() == glyph
+}
+
 fn simple_token_end(content: &str, context: ArrayLineValueContext) -> usize {
     match context {
-        ArrayLineValueContext::ArrayLine => {
+        ArrayLineValueContext::ArrayLine(_) => {
             let mut end = content.len();
             if let Some(index) = content.find(", ") {
                 end = end.min(index);
@@ -2953,6 +4125,19 @@ fn simple_token_end(content: &str, context: ArrayLineValueContext) -> usize {
         ArrayLineValueContext::ObjectValue => content.find("  ").unwrap_or(content.len()),
         ArrayLineValueContext::SingleValue => content.len(),
     }
+}
+
+/// Where the token at the front of `content` ends, never including the spaces at
+/// the end of the line.
+///
+/// The tokens this bounds are numbers and the three literals, none of which can
+/// contain a space, so trailing ones were never part of the token -- they are the
+/// line's, and the line has its own policy for them. Swallowing them turned a
+/// stray space at the end of `scores:  90 ` into `invalid JSON number: "90 "`,
+/// which names a token nobody wrote and says nothing about the space.
+fn token_end(content: &str, context: ArrayLineValueContext) -> usize {
+    let end = simple_token_end(content, context);
+    content[..end].trim_end_matches(' ').len()
 }
 
 #[cfg(test)]
@@ -3350,6 +4535,223 @@ mod parse_policy_tests {
         assert!(parse("  a: ```\nx\ny\n   ```\n", ParseOptions::default()).is_ok());
     }
 
+    /// A run of comment lines may stay level or step in, never back out.
+    ///
+    /// Where a comment sits is what says which thing it annotates, so a run that
+    /// steps outward annotates something enclosing what the line above it
+    /// annotated. Both cannot be kept with their subjects on a re-render without
+    /// emitting them in an order the author did not write, so the run is refused
+    /// rather than silently reordered.
+    ///
+    /// Only lines that touch form a run: separate them with the value they
+    /// annotate and any indents are legal again.
+    #[test]
+    fn a_run_of_comments_may_not_step_back_out() {
+        for legal in [
+            "// a\n// b\n  k:1\n",              // level
+            "// a\n  // b\n  k:1\n",            // stepping in
+            "// a\n  // b\n    // c\n  k:1\n",  // stepping in twice
+            "// a\n  k:1\n// b\n  j:2\n",       // not a run: content between them
+        ] {
+            parse(legal, ParseOptions::default())
+                .unwrap_or_else(|e| panic!("{legal:?} is a legal run: {e}"));
+        }
+
+        for illegal in ["  // a\n// b\n  k:1\n", "    // a\n  // b\n  k:1\n"] {
+            let error = parse(illegal, ParseOptions::default())
+                .expect_err(&format!("{illegal:?} steps back out and must be refused"));
+            assert!(
+                error.message().contains("further out than the comment on the line above"),
+                "{illegal:?} must be refused for stepping out, not for something else: {error}"
+            );
+        }
+    }
+
+    /// The renderer never writes a run the parser would now refuse.
+    ///
+    /// A new parse restriction is only safe if the generator already respects it;
+    /// otherwise the two halves of the library disagree and a document this crate
+    /// wrote cannot be read back by it.
+    #[test]
+    fn comment_runs_this_crate_writes_are_ones_it_accepts() {
+        let sources = [
+            "// above the root\n  a:1\n  b:2\n",
+            "  a:1\n// between entries\n  b:2\n",
+            "// one\n// two\n  a:1\n",
+            "  k:\n// above a container\n    a:1\n",
+            "  k:\n// above a marker chain\n  [ { a:1\n",
+            "// outer\n  a:\n    // inner\n    b:1\n",
+        ];
+        for source in sources {
+            let document: crate::Document =
+                source.parse().unwrap_or_else(|e| panic!("{source:?}: {e}"));
+            let rendered = document.to_tjson_with(crate::RenderOptions::default());
+            rendered.parse::<crate::Document>().unwrap_or_else(|e| {
+                panic!("re-rendered {source:?} into a document this parser refuses: {e}\n{rendered}")
+            });
+        }
+    }
+
+    /// Every multiline flavour recognises a line that was trying to be its closer.
+    ///
+    /// The three bodies each run their own loop, and only ``` used to say what was
+    /// wrong with a closer carrying a space after it. `` called it a body line
+    /// missing its marker and ` called it a content line at the wrong indent --
+    /// both true about where the line sits, both useless about what the writer
+    /// did, and the edit each one asks for leaves the string unterminated.
+    #[test]
+    fn every_multiline_flavour_names_a_closer_that_missed() {
+        for (label, input) in [
+            ("``", "  k: ``\n  | ab\n   `` \n"),
+            ("`", "  k: `\n    ab\n   ` \n"),
+            ("```", "  k: ```\n    ab\n   ``` \n"),
+        ] {
+            let error = parse(input, ParseOptions::default()).unwrap_err().to_string();
+            assert!(
+                error.contains("spaces after it"),
+                "{label}: the fault is the spaces after the closer, and the message has to \
+                 say so: {error}"
+            );
+            assert!(
+                !error.contains("must start with"),
+                "{label}: this line is a closer, not a body line missing a marker -- that \
+                 advice does not close the string: {error}"
+            );
+        }
+    }
+
+    /// Trailing spaces mean the same thing however the value is spelled.
+    ///
+    /// Each row is a document with spaces after its last value, paired with the
+    /// same document without them. The policy has to answer every spelling the
+    /// same way: refused by default, discarded on request, and once discarded the
+    /// value is exactly the one the clean document gives.
+    ///
+    /// The parity is the point. The old test covered only a lone object value, so
+    /// nothing noticed that the element loop rejected trailing spaces under *both*
+    /// policies -- it never consulted the option at all -- while the entry loop
+    /// beside it honoured them.
+    ///
+    /// Spaces that are data are the other half of the same rule and are pinned in
+    /// [`spaces_a_fold_joins_with_are_data`].
+    ///
+    /// The parity claimed here is about **trailing spaces only**, and it stops
+    /// there deliberately. The spellings are not interchangeable in general -- a
+    /// bare key may not hold a `"` at all, so a law reading "the quoted form and
+    /// the bare form always agree" would demand an equivalence the format does
+    /// not have, and would fail on a difference that is the design rather than a
+    /// defect. Widen this only with a rule that survives that case.
+    #[test]
+    fn trailing_spaces_read_the_same_however_the_value_is_spelled() {
+        for (dirty, clean) in [
+            ("  k:90 \n", "  k:90\n"),
+            ("  k:true \n", "  k:true\n"),
+            ("  k:\"x\" \n", "  k:\"x\"\n"),
+            ("  k: bare \n", "  k: bare\n"),
+            ("  k:  1, 2 \n", "  k:  1, 2\n"),
+            ("  k:   a   b \n", "  k:   a   b\n"),
+        ] {
+            assert!(
+                parse(dirty, ParseOptions::default()).is_err(),
+                "{dirty:?} must be refused while trailing spaces are errors"
+            );
+            let discarded =
+                parse(dirty, ParseOptions::default().trailing_spaces(TrailingSpaces::Discard))
+                    .unwrap_or_else(|e| panic!("{dirty:?} must parse once discarded: {e}"));
+            let expected = parse(clean, ParseOptions::default())
+                .unwrap_or_else(|e| panic!("{clean:?} is supposed to be valid: {e}"));
+            assert_eq!(discarded, expected, "{dirty:?} and {clean:?} must agree");
+        }
+    }
+
+    /// The spaces a fold joins its halves with are data, under either policy.
+    ///
+    /// The counterweight to [`trailing_spaces_read_the_same_however_the_value_is_spelled`]:
+    /// a space at the end of a folded line is not trailing whitespace, it is the
+    /// character between the two words, and a fold whose halves are both spaces
+    /// is a string of spaces. Discarding those would silently change the data
+    /// rather than refuse it, which is the one outcome worth pinning hardest.
+    #[test]
+    fn spaces_a_fold_joins_with_are_data() {
+        for policy in [TrailingSpaces::Reject, TrailingSpaces::Discard] {
+            let options = ParseOptions::default().trailing_spaces(policy);
+            for (input, expected) in [
+                ("  k: hello \n  / world\n", "hello world"),
+                ("  k: hello\n  / world\n", "helloworld"),
+                ("  k:\"hello \n  / world\"\n", "hello world"),
+                ("  k:\"  \n  /   \"\n", "    "),
+            ] {
+                let value = parse(input, options.clone())
+                    .unwrap_or_else(|e| panic!("{input:?} under {policy:?}: {e}"));
+                assert_eq!(
+                    key_str(&value, "k"),
+                    Some(expected),
+                    "{input:?} under {policy:?} must keep the spaces it folds with"
+                );
+            }
+        }
+    }
+
+    /// The rewrite an error recommends has to be one that parses.
+    ///
+    /// Each row is a document that fails, paired with the document its message
+    /// tells the writer to produce instead. A suggestion that merely trades this
+    /// error for the next one is worse than no suggestion, because the writer
+    /// spends the edit before finding out.
+    ///
+    /// The space packed array is the case that caught it: its elements used to be
+    /// told to delete the opening space before a `"`, which is right in every
+    /// other context and here left a quoted element on a line that admits none.
+    /// The same line was separately told about commas it did not contain.
+    #[test]
+    fn the_rewrite_an_error_recommends_actually_parses() {
+        for (broken, fixed) in [
+            // "wants three spaces in front of it rather than two"
+            ("  tags:   rust   wasm  extra\n", "  tags:   rust   wasm   extra\n"),
+            // "give the array one element per line"
+            ("  tags:   rust   \"quoted\"\n", "  tags:\n     rust\n    \"quoted\"\n"),
+            // "delete that one space before the opening \"" -- still right here
+            ("  tags:  1, 2,  \"quoted\"\n", "  tags:  1, 2, \"quoted\"\n"),
+            ("  k: \"quoted\"\n", "  k:\"quoted\"\n"),
+            // "the literals are lowercase, so write `true`"
+            ("  v:TRUE\n", "  v:true\n"),
+        ] {
+            let error = parse(broken, ParseOptions::default())
+                .expect_err(&format!("{broken:?} is supposed to be rejected"));
+            assert!(
+                parse(fixed, ParseOptions::default()).is_ok(),
+                "the rewrite {fixed:?} does not parse, so the advice in this message \
+                 costs the writer an edit and leaves them stuck: {error}"
+            );
+        }
+    }
+
+    /// A table cell fault points at the cell, not at the row.
+    ///
+    /// Written as "the caret lands between this cell's pipes" rather than as an
+    /// expected column, because the number is the thing most likely to be edited
+    /// to match a regression. Every cell error used to report column 1: the
+    /// splitter returned owned strings and dropped the offsets it had just
+    /// computed, so there was nothing to point with, and counting cells by eye in
+    /// a wide table is exactly the work an error is supposed to save.
+    #[test]
+    fn a_bad_table_cell_is_pointed_at_rather_than_its_row() {
+        // Third column, so a caret at the row's start, at the first cell, or at
+        // the last one are all distinguishable failures.
+        let row = "    |1|2|,bad|";
+        let input = format!("  t:\n    |x|y|z|\n{row}\n");
+        let error = parse(&input, ParseOptions::default()).unwrap_err();
+
+        let opens = row.find(",bad").expect("the offending cell is in the row");
+        let closes = opens + ",bad".len();
+        // `column()` is 1-based and counted in characters; this row is ASCII.
+        let column = error.column() - 1;
+        assert!(
+            (opens..closes).contains(&column),
+            "caret at column {column} is outside the offending cell (bytes {opens}..{closes}): {error}"
+        );
+    }
+
     #[test]
     fn a_scalar_with_one_space_too_many_is_named_as_such() {
         // `,  92` reads as a bare string beside numbers. The rule it breaks is
@@ -3409,6 +4811,44 @@ mod parse_policy_tests {
             cell.contains("opening quote"),
             "and why the second space is not padding: {cell}"
         );
+    }
+
+    /// The two halves of one rule, checked against each other over the whole
+    /// held-back set rather than over the one character that happened to differ.
+    ///
+    /// A run gives back what it may not end on; the fold lookahead asks whether
+    /// what was given back is only that. Written as two lists, they disagreed
+    /// about PIPELIKE -- reachable because U+01C0 is a PIPELIKE and a letter, so
+    /// it gets into a run and is then stripped out of it -- and a folded bare key
+    /// ending in one was refused with `there is no colon on this line`, which was
+    /// false: the colon was on the continuation.
+    ///
+    /// A letter from each set is used, so the test is about the sets and not
+    /// about `|` or `,`, neither of which can end a run in the first place.
+    #[test]
+    fn a_folded_bare_key_reads_the_same_whatever_it_holds_back() {
+        // U+01C0 PIPELIKE, U+02BB COMMALIKE, U+02BC QUOTELIKE -- each also a
+        // letter, so each reaches the end of a run.
+        for held_back in ['\u{01C0}', '\u{02BB}', '\u{02BC}'] {
+            let folded = format!("  ab{held_back}\n  / cd: 1\n");
+            let value = parse(&folded, ParseOptions::default())
+                .unwrap_or_else(|error| panic!("U+{:04X}: {error}", held_back as u32));
+            // A fold joins the two fragments with nothing between them, so the
+            // held-back character ends up interior rather than trailing -- which
+            // is exactly why it stops being held back.
+            assert_eq!(
+                key_str(&value, &format!("ab{held_back}cd")),
+                Some("1"),
+                "U+{:04X}: a held-back character is interior once the fold continues it",
+                held_back as u32,
+            );
+            // The rule it is held back by is untouched: ending there is still out.
+            let ends_on_it = format!("  ab{held_back}: 1\n");
+            let error = parse(&ends_on_it, ParseOptions::default())
+                .expect_err("a bare key may not end on a held-back character")
+                .to_string();
+            assert!(error.contains("cannot end with"), "U+{:04X}: {error}", held_back as u32);
+        }
     }
 
     #[test]

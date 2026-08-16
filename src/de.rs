@@ -22,7 +22,7 @@ use serde::de::{
 };
 
 use crate::error::{DeserializeError, Location};
-use crate::number::Number;
+use crate::number::{Number, DECIMAL_POINT, EXPONENT_MARKERS};
 use crate::spanned;
 use crate::tree::{NodeRef, Span, Tree};
 
@@ -191,13 +191,12 @@ fn exactness_hint<T: Tree>(node: &T) -> Option<(String, Option<Span>)> {
 fn first_exact_only_number<T: Tree>(node: &T) -> Option<&T> {
     match node.node() {
         NodeRef::Number(n) => {
-            let digits = n.as_str();
-            let fits_integer = digits.parse::<u64>().is_ok()
-                || digits.parse::<i64>().is_ok()
-                || digits.parse::<u128>().is_ok()
-                || digits.parse::<i128>().is_ok();
-            let rides_f64 = digits.parse::<f64>().is_ok_and(|f| f64_round_trips(digits, f));
-            if fits_integer || rides_f64 { None } else { Some(node) }
+            // Asked of the same function the visitor ladder uses, so "the exact
+            // form is the only one that works" cannot come to mean two things.
+            match delivery_of(n.as_str()) {
+                Delivery::ExactOnly => Some(node),
+                _ => None,
+            }
         }
         NodeRef::Array(items) => items.iter().find_map(first_exact_only_number),
         NodeRef::Object(entries) => entries
@@ -211,8 +210,8 @@ fn first_exact_only_number<T: Tree>(node: &T) -> Option<&T> {
 /// when there are any — the "2.50" / "1.00" case, where the loss through f64 is purely
 /// the written zeros.
 fn fraction_trailing_zeros(digits: &str) -> Option<usize> {
-    let mantissa = digits.split(['e', 'E']).next().unwrap_or(digits);
-    if !mantissa.contains('.') {
+    let mantissa = digits.split(EXPONENT_MARKERS).next().unwrap_or(digits);
+    if !mantissa.contains(DECIMAL_POINT) {
         return None;
     }
     let zeros = mantissa.len() - mantissa.trim_end_matches('0').len();
@@ -239,6 +238,49 @@ fn f64_round_trips(digits: &str, value: f64) -> bool {
     serde_json::Number::from_f64(value).is_some_and(|n| n.to_string() == digits)
 }
 
+/// How a number's digits can reach a visitor.
+///
+/// The ladder in [`TreeDeserializer::deserialize_any`] and the question
+/// "would this number have to ride the exact token map?" in
+/// [`first_exact_only_number`] are the same rule. They were written twice --
+/// once as a chain of `if let`, once as a disjunction over the same four integer
+/// types plus the same round-trip check -- with nothing holding the two lists
+/// together. Adding a type to one would have left the other quietly wrong, and
+/// since the second only feeds an error note, the result would have been a
+/// misleading explanation rather than a failure anyone would notice.
+enum Delivery {
+    U64(u64),
+    I64(i64),
+    U128(u128),
+    I128(i128),
+    /// Exact through an f64: the digit string is recoverable from the value, so
+    /// visiting it loses neither the number nor its spelling.
+    F64(f64),
+    /// Nothing but the digits themselves will do.
+    ExactOnly,
+}
+
+/// Which delivery `digits` qualifies for, in the order a visitor should be offered
+/// them: the widest exact integer first, then an f64 that keeps the spelling, then
+/// the token map.
+fn delivery_of(digits: &str) -> Delivery {
+    if let Ok(u) = digits.parse::<u64>() {
+        Delivery::U64(u)
+    } else if let Ok(i) = digits.parse::<i64>() {
+        Delivery::I64(i)
+    } else if let Ok(u) = digits.parse::<u128>() {
+        Delivery::U128(u)
+    } else if let Ok(i) = digits.parse::<i128>() {
+        Delivery::I128(i)
+    } else if let Ok(f) = digits.parse::<f64>()
+        && f64_round_trips(digits, f)
+    {
+        Delivery::F64(f)
+    } else {
+        Delivery::ExactOnly
+    }
+}
+
 macro_rules! deserialize_parsed_number {
     ($method:ident, $ty:ty, $visit:ident) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
@@ -262,18 +304,16 @@ impl<'de, T: Tree> Deserializer<'de> for TreeDeserializer<'de, T> {
             NodeRef::Bool(b) => self.stamp_result(visitor.visit_bool(b)),
             NodeRef::Number(n) => {
                 let digits = n.as_str();
-                let result = if let Ok(u) = digits.parse::<u64>() {
-                    visitor.visit_u64(u)
-                } else if let Ok(i) = digits.parse::<i64>() {
-                    visitor.visit_i64(i)
-                } else if let Ok(u) = digits.parse::<u128>() {
-                    visitor.visit_u128(u)
-                } else if let Ok(i) = digits.parse::<i128>() {
-                    visitor.visit_i128(i)
-                } else if digits.parse::<f64>().is_ok_and(|f| f64_round_trips(digits, f)) {
-                    visitor.visit_f64(digits.parse::<f64>().expect("checked just above"))
-                } else {
-                    visitor.visit_map(NumberTokenAccess { digits: Some(digits.to_owned()) })
+                let result = match delivery_of(digits) {
+                    Delivery::U64(u) => visitor.visit_u64(u),
+                    Delivery::I64(i) => visitor.visit_i64(i),
+                    Delivery::U128(u) => visitor.visit_u128(u),
+                    Delivery::I128(i) => visitor.visit_i128(i),
+                    // Carried out of the check rather than parsed a second time.
+                    Delivery::F64(f) => visitor.visit_f64(f),
+                    Delivery::ExactOnly => {
+                        visitor.visit_map(NumberTokenAccess { digits: Some(digits.to_owned()) })
+                    }
                 };
                 self.stamp_result(result)
             }

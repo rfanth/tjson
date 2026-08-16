@@ -173,13 +173,18 @@ pub(crate) trait Tree: Sized {
     /// Attach comment lines that preceded this node in the source. `node_level` is the
     /// node's logical indent, used to classify placement (Left iff the comment sits at
     /// column 0 AND the node is deeper than 0; AtLevel otherwise).
-    fn attach_comments_before(_node: &mut Self, _comments: Vec<RawComment>, _node_level: usize) {}
+    fn attach_comments_before(
+        _node: &mut Self,
+        _comments: Vec<RawComment>,
+        _node_level: crate::position::LogicalIndent,
+    ) {
+    }
 
     /// Attach comment lines that preceded this object entry in the source.
     fn attach_entry_comments(
         _entry: &mut Self::Entry,
         _comments: Vec<RawComment>,
-        _entry_level: usize,
+        _entry_level: crate::position::LogicalIndent,
     ) {
     }
 

@@ -1,6 +1,13 @@
 use std::path::Path;
 use tjson::{TjsonConfig, RenderOptions, Value};
 
+/// Where the fixtures actually live, which is not always where they appear to.
+///
+/// `.cargo/config.toml` sets `TJSON_TESTS_DIR`, so a checkout beside this repo wins
+/// over the `tests/fixtures` submodule -- and the submodule is the one `git status`
+/// and `ls` point at. Editing the wrong copy produces a file that plainly says one
+/// thing and a test that plainly reports another, so every failure below names the
+/// directory it read.
 fn tests_dir() -> std::path::PathBuf {
     let pathbuf = if let Ok(p) = std::env::var("TJSON_TESTS_DIR") {
         std::path::PathBuf::from(p)
@@ -132,7 +139,13 @@ fn parse_valid() {
     }
 
     if !failures.is_empty() {
-        panic!("\n\nFAILED: {}/{} parse_valid fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
+        panic!(
+            "\n\nFAILED: {}/{} parse_valid fixture(s) from {}:\n\n{}\n",
+            failures.len(),
+            total,
+            tests_dir().canonicalize().unwrap_or_else(|_| tests_dir()).display(),
+            failures.join("\n\n")
+        );
     }
 }
 
@@ -173,7 +186,13 @@ fn parse_invalid() {
     }
 
     if !failures.is_empty() {
-        panic!("\n\nFAILED: {}/{} parse_invalid fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
+        panic!(
+            "\n\nFAILED: {}/{} parse_invalid fixture(s) from {}:\n\n{}\n",
+            failures.len(),
+            total,
+            tests_dir().canonicalize().unwrap_or_else(|_| tests_dir()).display(),
+            failures.join("\n\n")
+        );
     }
 }
 
@@ -249,7 +268,13 @@ fn roundtrip() {
     }
 
     if !failures.is_empty() {
-        panic!("\n\nFAILED: {}/{} roundtrip fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
+        panic!(
+            "\n\nFAILED: {}/{} roundtrip fixture(s) from {}:\n\n{}\n",
+            failures.len(),
+            total,
+            tests_dir().canonicalize().unwrap_or_else(|_| tests_dir()).display(),
+            failures.join("\n\n")
+        );
     }
 }
 
@@ -370,6 +395,12 @@ fn render() {
     }
 
     if !failures.is_empty() {
-        panic!("\n\nFAILED: {}/{} render fixture(s):\n\n{}\n", failures.len(), total, failures.join("\n\n"));
+        panic!(
+            "\n\nFAILED: {}/{} render fixture(s) from {}:\n\n{}\n",
+            failures.len(),
+            total,
+            tests_dir().canonicalize().unwrap_or_else(|_| tests_dir()).display(),
+            failures.join("\n\n")
+        );
     }
 }

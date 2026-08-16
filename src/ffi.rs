@@ -286,9 +286,14 @@ pub extern "C" fn tjson_to_json(tjson_utf8: *const c_char, err: *mut TjsonError)
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<String, FfiError> {
         // SAFETY: the caller contract requires a valid C string or null.
         let input = unsafe { borrow_utf8(tjson_utf8, "input") }?;
-        let value: serde_json::Value = crate::from_str(input).map_err(tjson_parse_failure)?;
-        serde_json::to_string(&value)
-            .map_err(|e| FfiError::new(TJSON_ERR_INTERNAL, e.to_string()))
+        // This crate's own writer, not a serde_json round trip. Two things are lost
+        // on that route and both matter here: `-0` flattens to `0`, and characters
+        // TJSON forbids literally are re-emitted literally, so an input that wrote
+        // one as an honest \u200d escape comes back with it hidden -- and the
+        // output stops being valid TJSON. Going straight through `Value` also drops
+        // an entire tree conversion per call.
+        let value: crate::Value = input.parse().map_err(tjson_parse_failure)?;
+        Ok(value.to_json())
     }));
     finish(result, err)
 }
@@ -402,6 +407,38 @@ mod tests {
     }
 
     /// include/tjson.h is hand-maintained; its TJSON_ABI_VERSION macro must
+    /// `tjson_to_json` must give a C caller exactly what a Rust caller gets from
+    /// [`crate::Value::to_json`].
+    ///
+    /// Two bindings answering one question is how they drift apart. This one did:
+    /// routing through `serde_json::Value` flattened `-0` to `0` and re-emitted a
+    /// character TJSON forbids literally, turning an input that wrote it as an
+    /// escape into output where it is hidden — and output that is no longer valid
+    /// TJSON.
+    #[test]
+    fn to_json_matches_the_rust_api() {
+        for source in [
+            "  n:-0\n",
+            "  n:18446744073709551616\n",
+            "  n:2.50\n",
+            "  k:\"a\\u200db\"\n",
+            "  k:\"a\\u007fb\"\n",
+            "  k: hello\n",
+        ] {
+            let input = CString::new(source).unwrap();
+            let mut err = new_err();
+            let from_c = take(tjson_to_json(input.as_ptr(), &mut err));
+            let from_rust = source.parse::<crate::Value>().unwrap().to_json();
+            assert_eq!(from_c, from_rust, "C and Rust disagree for {source:?}");
+            // Whatever it produced must still be readable as TJSON, which is what
+            // escaping the forbidden set buys.
+            assert!(
+                from_c.parse::<crate::Value>().is_ok(),
+                "C output is not valid TJSON for {source:?}: {from_c}"
+            );
+        }
+    }
+
     /// match this module's constant. Deliberately nothing here tracks the
     /// crate version — the header only changes when the ABI changes, so
     /// ordinary releases touch Cargo.toml alone. (The rest of the header is

@@ -54,6 +54,7 @@ mod ffi;
 mod de;
 pub mod document;
 mod error;
+mod position;
 mod number;
 pub mod options;
 mod parse;
@@ -1705,6 +1706,45 @@ mod tests {
         let reparsed = to_json_value(rendered.parse::<Value>().unwrap());
         assert_eq!(reparsed, json(r#"{"abcdefghijklmnopqrst":1}"#),
             "roundtrip must recover original key");
+    }
+
+    /// A value's placement is decided by the value, never by the key's fold style.
+    ///
+    /// Was `examples/glyphcmp.rs`, a standing hand-run reproducer. A 60-digit
+    /// number after a long bare key came out at 93 columns against a 40-column
+    /// margin -- because `place_value` asked whether *bare-string keys* may fold,
+    /// and that was switched off. The continuation it was never offered had 36
+    /// columns free, so the ten-digit minimum was satisfiable twice over; the
+    /// rule was fine, it was being asked about the wrong line.
+    ///
+    /// The two settings are the assertion: a key option must not move a number.
+    #[test]
+    fn a_key_fold_style_does_not_decide_a_values_placement() {
+        let value = Value::from(json(
+            r#"{"alpha bravo charlie delta echo":123456789012345678901234567890123456789012345678901234567890}"#,
+        ));
+        let with_key_folding = |style| {
+            value.to_tjson_with(
+                RenderOptions::default()
+                    .wrap_width(Some(40))
+                    .number_fold_style(FoldStyle::Auto)
+                    .string_bare_fold_style(style),
+            )
+        };
+        let off = with_key_folding(FoldStyle::None);
+        assert_eq!(off, with_key_folding(FoldStyle::Auto), "a key option moved the number");
+        for line in off.lines() {
+            assert!(
+                line.chars().count() <= 40,
+                "line runs past the margin: {line:?}\n{off}"
+            );
+        }
+        // And every chunk it did produce clears the ten-digit minimum the policy
+        // exists to protect -- the fix keeps that rule rather than relaxing it.
+        for line in off.lines().skip(1) {
+            let digits = line.trim_start().trim_start_matches("/ ").trim();
+            assert!(digits.len() >= 10, "chunk under the minimum: {digits:?}");
+        }
     }
 
     #[test]

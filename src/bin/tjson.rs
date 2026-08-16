@@ -21,6 +21,24 @@ fn terminal_width() -> Option<usize> {
     None
 }
 
+/// What this run writes. Exactly one form per run, so it is one value rather than
+/// a set of booleans that could contradict each other.
+///
+/// `MinimalJson` is deliberately both things at once: MINIMAL JSON is valid JSON
+/// *and* valid TJSON, because every simple JSON value is already a TJSON value and
+/// the MINIMAL JSON rule closes the gap for the only two that were not, nonempty
+/// objects and arrays. So `-J` output can be piped back into `tjson` unchanged.
+/// Pinned by `minimal_json_and_tjson_contain_each_other` in `tests/fuzz.rs`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Output {
+    /// Readable TJSON. The only form the TJSON Output Formatting options shape.
+    Tjson,
+    /// Indented JSON, for a consumer that wants JSON a person will also read.
+    Json,
+    /// JSON with no whitespace outside strings -- the smallest faithful form.
+    MinimalJson,
+}
+
 fn help_text() -> String {
     format!("\
 Usage: tjson [OPTIONS] [-i FILE] [-o FILE]
@@ -30,6 +48,7 @@ Convert JSON to TJSON or TJSON to JSON.
 Options:
   -t, --tjson                 Output TJSON from JSON input (default)
   -j, --json                  Output pretty JSON from TJSON input
+  -J, --minimal-json          Output minimal JSON from TJSON input
   -i, --input FILE            Read from file instead of stdin
   -o, --output FILE           Write to file instead of stdout
       --[no-]final-newline    Enable/disable final newline (default: on)
@@ -123,6 +142,7 @@ fn main() {
 
     let flag_term        = args.contains("-T");
     let flag_json     = args.contains(["-j", "--json"]);
+    let flag_minimal_json = args.contains(["-J", "--minimal-json"]);
     let flag_termjson    = args.contains(["-t", "--tjson"]);
     let flag_canonical = args.contains(["-C", "--canonical"]);
     let flag_force_markers   = args.contains("--force-markers");
@@ -190,10 +210,34 @@ fn main() {
         std::process::exit(1);
     }
 
-    if flag_json && flag_termjson {
-        eprintln!("tjson: --json and --tjson are mutually exclusive");
+    // The three output forms are one decision, not three independent switches, so
+    // they are collapsed into `Output` here and matched exhaustively from now on.
+    // Naming every flag the user actually passed beats a fixed pair in the message,
+    // which was wrong as soon as there were three of them.
+    let requested: Vec<&str> = [
+        (flag_termjson, "--tjson"),
+        (flag_json, "--json"),
+        (flag_minimal_json, "--minimal-json"),
+    ]
+    .into_iter()
+    .filter_map(|(given, name)| given.then_some(name))
+    .collect();
+
+    if requested.len() > 1 {
+        eprintln!(
+            "tjson: {} are mutually exclusive -- a run produces one output form; pick one",
+            requested.join(" and ")
+        );
         std::process::exit(1);
     }
+
+    let output = if flag_json {
+        Output::Json
+    } else if flag_minimal_json {
+        Output::MinimalJson
+    } else {
+        Output::Tjson
+    };
 
     // --eol governs TJSON output line endings. On the CLI we deliberately keep JSON output at
     // LF (matching the library and canonical JSON) instead of applying --eol to it — the
@@ -209,7 +253,7 @@ fn main() {
     // accept-and-ignore *correctly* with -j — so batch it into a breaking release. --eol is
     // different: its only prior behavior with -j (in 0.6.6, hours old) was the buggy mixed-ending
     // output, so rejecting it is a bugfix that breaks nobody, not the loss of relied-upon behavior.
-    if opt_eol.is_some() && flag_json {
+    if opt_eol.is_some() && output != Output::Tjson {
         eprintln!(
             "tjson: --eol sets TJSON output line endings only; JSON output is always LF. \
              To change JSON line endings, use a line-ending conversion tool for your platform"
@@ -241,11 +285,24 @@ fn main() {
         }
     };
 
-    let result = if flag_json {
+    let result = match output {
         // TJSON -> JSON
-        input.parse::<tjson::Value>()
-            .and_then(|v| serde_json::to_string_pretty(&serde_json::Value::from(v)).map_err(tjson::Error::from))
-    } else {
+        Output::Json => input.parse::<tjson::Value>()
+            .and_then(|v| serde_json::to_string_pretty(&serde_json::Value::from(v)).map_err(tjson::Error::from)),
+
+        // TJSON -> MINIMAL JSON, through this crate's own writer rather than
+        // serde_json, for two reasons. It escapes the TJSON forbidden set that JSON
+        // passes through literally, so the output is valid TJSON as well as valid
+        // JSON. And it never builds a serde_json::Value, so what -j flattens on the
+        // way out -- -0 becomes 0, integers past u64 lose their spelling -- survives
+        // here.
+        //
+        // That is a claim about *writing* only. Reading JSON back in (-t) still goes
+        // through serde_json's parser, so `-J | -t` loses -0 again; the loss is at
+        // the parse, not the serialization, and it is not ours to fix.
+        Output::MinimalJson => input.parse::<tjson::Value>().map(|v| v.to_json()),
+
+        Output::Tjson => {
         let mut opts = if flag_canonical {
             tjson::RenderOptions::canonical()
         } else {
@@ -337,6 +394,7 @@ fn main() {
             .map_err(tjson::Error::from)
             .map(tjson::Value::from)
             .map(|v| v.to_tjson_with(opts))
+        }
     };
 
     let output_str = result.unwrap_or_else(|e| {
