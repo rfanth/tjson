@@ -9,7 +9,7 @@ Usage as a binary, library (including WASM too), through serde Serialize, and fr
 The below JSON is hand-formatted and hand-aligned.  It is used here as a theoretical upper bound on how good JSON can look for comparison.  The output of JSON.stringify(json, null, 2) and most platform pretty printers look far worse than this.  The TJSON output is completely automatic with zero hand tuning or options, and still looks better.
 
 **Hand-Formatted JSON Input**
-```json
+```
 {
   "name": "Alice",
   "age": 30,
@@ -47,7 +47,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tjson = { package = "tjson-rs", version = "0.8" }
+tjson = { package = "tjson-rs", version = "0.10" }
 ```
 
 Install the CLI:

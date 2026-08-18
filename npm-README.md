@@ -7,7 +7,7 @@ TJSON represents the same data model as JSON but renders it in a way that feels 
 The below JSON is hand-formatted and hand-aligned.  It is used here as a theoretical upper bound on how good JSON can look for comparison.  The output of JSON.stringify(json, null, 2) and most platform pretty printers look far worse than this.  The TJSON output is completely automatic with zero hand tuning or options, and still looks better.
 
 **Hand-Formatted JSON Input**
-```json
+```
 {
   "name": "Alice",
   "age": 30,

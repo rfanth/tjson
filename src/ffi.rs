@@ -431,7 +431,6 @@ mod tests {
         assert_eq!(align_of::<TjsonError>(), align_of::<*mut c_char>());
     }
 
-    /// include/tjson.h is hand-maintained; its TJSON_ABI_VERSION macro must
     /// `tjson_to_json` must give a C caller exactly what a Rust caller gets from
     /// [`crate::Value::to_json`].
     ///
@@ -439,7 +438,8 @@ mod tests {
     /// routing through `serde_json::Value` flattened `-0` to `0` and re-emitted a
     /// character TJSON forbids literally, turning an input that wrote it as an
     /// escape into output where it is hidden — and output that is no longer valid
-    /// TJSON.
+    /// TJSON (minimal JSON is also valid TJSON, assuming it has no forbidden
+    /// literal characters).
     #[test]
     fn to_json_matches_the_rust_api() {
         for source in [
@@ -484,6 +484,7 @@ mod tests {
         }
     }
 
+    /// include/tjson.h is hand-maintained; its TJSON_ABI_VERSION macro must
     /// match this module's constant. Deliberately nothing here tracks the
     /// crate version — the header only changes when the ABI changes, so
     /// ordinary releases touch Cargo.toml alone. (The rest of the header is
