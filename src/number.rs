@@ -36,6 +36,32 @@ pub(crate) const DECIMAL_POINT: char = '.';
 /// The only sign a JSON number may be written with. JSON has no leading `+`.
 pub(crate) const MINUS_SIGN: char = '-';
 
+/// The one spelling of the signed zero that looks like an integer. JSON forbids
+/// leading zeros, so `-00` does not exist; `-0.0` and `-0e1` carry a fraction or
+/// an exponent and are refused by every integer parse already.
+const NEGATIVE_ZERO: &str = "-0";
+
+/// The value of the JSON number `digits` as an integer type, or `None` when that
+/// type cannot hold it exactly.
+///
+/// Every conversion of a number to an integer type goes through here: the
+/// accessors on [`Number`], the visitor ladder in `de`, and typed deserialization
+/// into integer fields. An integer type holds nothing but an integer, so it holds
+/// a number only when the text is an integer and nothing more. `str::parse`
+/// already refuses a fraction, an exponent and a value out of range; the signed
+/// zero is the one spelling it accepts that an integer cannot keep, since it
+/// reads `-0` as `0` and the sign is gone.
+///
+/// `digits` must be a JSON number, as every [`Number`] is: `str::parse` also takes
+/// a leading `+`, which JSON does not have. Pinned by
+/// `integer_conversions_refuse_negative_zero`.
+pub(crate) fn exact_integer<T: FromStr>(digits: &str) -> Option<T> {
+    if digits == NEGATIVE_ZERO {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Error returned when a value is not a finite, valid JSON number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidNumber(String);
@@ -54,14 +80,22 @@ impl Number {
         &self.0
     }
 
-    /// Returns the value as an `i64` if it is an integer that fits.
+    /// Returns the value as an `i64` if it is written as an integer that fits.
+    ///
+    /// `None` for anything an `i64` cannot give back as written: a fraction or
+    /// an exponent (`1.0`, `1e2`), a value out of range, and `-0`, whose sign an
+    /// integer has nowhere to keep.
     pub fn as_i64(&self) -> Option<i64> {
-        self.0.parse().ok()
+        exact_integer(&self.0)
     }
 
-    /// Returns the value as a `u64` if it is a non-negative integer that fits.
+    /// Returns the value as a `u64` if it is written as a non-negative integer
+    /// that fits.
+    ///
+    /// `None` for the same spellings as [`Number::as_i64`], `-0` among them, and
+    /// for every negative number.
     pub fn as_u64(&self) -> Option<u64> {
-        self.0.parse().ok()
+        exact_integer(&self.0)
     }
 
     /// Returns the value as an `f64`, or `None` when it has no finite `f64`.
@@ -136,7 +170,7 @@ impl Number {
     pub fn is_plain_integer(&self) -> bool {
         // Past the first two checks there is no fraction and no exponent, and JSON
         // forbids leading zeros, so the signed zero has exactly one spelling left.
-        !self.has_decimal() && !self.has_exponent() && self.0 != "-0"
+        !self.has_decimal() && !self.has_exponent() && self.0 != NEGATIVE_ZERO
     }
 
     /// Returns `true` if the number has no fractional or exponent part.
@@ -261,6 +295,24 @@ mod tests {
         assert_eq!(Number::from(42i64).as_str(), "42");
         assert_eq!(Number::from(u64::MAX).as_str(), "18446744073709551615");
         assert_eq!(Number::from(-1i64).as_str(), "-1");
+    }
+
+    /// `-0` reads as `0` to `str::parse`, and an integer has no sign to keep, so
+    /// every integer conversion refuses it rather than answer with a different
+    /// number. The float keeps it.
+    #[test]
+    fn integer_conversions_refuse_negative_zero() {
+        let n: Number = "-0".parse().unwrap();
+        assert_eq!(n.as_i64(), None);
+        assert_eq!(n.as_u64(), None);
+        assert_eq!(exact_integer::<i8>("-0"), None);
+        assert_eq!(exact_integer::<i128>("-0"), None);
+        assert_eq!(exact_integer::<u128>("-0"), None);
+        assert!(n.as_f64().unwrap().is_sign_negative());
+
+        let n: Number = "0".parse().unwrap();
+        assert_eq!(n.as_i64(), Some(0));
+        assert_eq!(n.as_u64(), Some(0));
     }
 
     #[test]

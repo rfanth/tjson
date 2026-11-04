@@ -22,7 +22,7 @@ use serde::de::{
 };
 
 use crate::error::{DeserializeError, Location};
-use crate::number::{Number, DECIMAL_POINT, EXPONENT_MARKERS};
+use crate::number::{exact_integer, Number, DECIMAL_POINT, EXPONENT_MARKERS};
 use crate::spanned;
 use crate::tree::{NodeRef, Span, Tree};
 
@@ -263,14 +263,17 @@ enum Delivery {
 /// Which delivery `digits` qualifies for, in the order a visitor should be offered
 /// them: the widest exact integer first, then an f64 that keeps the spelling, then
 /// the token map.
+///
+/// The integer rungs ask [`exact_integer`], so `-0`, which no integer type can
+/// hold, goes on to the f64 and then the exact route.
 fn delivery_of(digits: &str) -> Delivery {
-    if let Ok(u) = digits.parse::<u64>() {
+    if let Some(u) = exact_integer::<u64>(digits) {
         Delivery::U64(u)
-    } else if let Ok(i) = digits.parse::<i64>() {
+    } else if let Some(i) = exact_integer::<i64>(digits) {
         Delivery::I64(i)
-    } else if let Ok(u) = digits.parse::<u128>() {
+    } else if let Some(u) = exact_integer::<u128>(digits) {
         Delivery::U128(u)
-    } else if let Ok(i) = digits.parse::<i128>() {
+    } else if let Some(i) = exact_integer::<i128>(digits) {
         Delivery::I128(i)
     } else if let Ok(f) = digits.parse::<f64>()
         && f64_round_trips(digits, f)
@@ -281,7 +284,25 @@ fn delivery_of(digits: &str) -> Delivery {
     }
 }
 
-macro_rules! deserialize_parsed_number {
+/// Deserialization into an integer field: the number only when the integer type
+/// holds it exactly, by the same rule as every other integer conversion.
+macro_rules! deserialize_integer {
+    ($method:ident, $ty:ty, $visit:ident) => {
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+            match self.node.node() {
+                NodeRef::Number(n) => match exact_integer::<$ty>(n.as_str()) {
+                    Some(value) => self.stamp_result(visitor.$visit(value)),
+                    None => Err(self.invalid_type(&visitor)),
+                },
+                _ => Err(self.invalid_type(&visitor)),
+            }
+        }
+    };
+}
+
+/// Deserialization into a float field: the nearest value, as asking for a float
+/// means.
+macro_rules! deserialize_float {
     ($method:ident, $ty:ty, $visit:ident) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
             match self.node.node() {
@@ -336,18 +357,18 @@ impl<'de, T: Tree> Deserializer<'de> for TreeDeserializer<'de, T> {
         }
     }
 
-    deserialize_parsed_number!(deserialize_i8, i8, visit_i8);
-    deserialize_parsed_number!(deserialize_i16, i16, visit_i16);
-    deserialize_parsed_number!(deserialize_i32, i32, visit_i32);
-    deserialize_parsed_number!(deserialize_i64, i64, visit_i64);
-    deserialize_parsed_number!(deserialize_i128, i128, visit_i128);
-    deserialize_parsed_number!(deserialize_u8, u8, visit_u8);
-    deserialize_parsed_number!(deserialize_u16, u16, visit_u16);
-    deserialize_parsed_number!(deserialize_u32, u32, visit_u32);
-    deserialize_parsed_number!(deserialize_u64, u64, visit_u64);
-    deserialize_parsed_number!(deserialize_u128, u128, visit_u128);
-    deserialize_parsed_number!(deserialize_f32, f32, visit_f32);
-    deserialize_parsed_number!(deserialize_f64, f64, visit_f64);
+    deserialize_integer!(deserialize_i8, i8, visit_i8);
+    deserialize_integer!(deserialize_i16, i16, visit_i16);
+    deserialize_integer!(deserialize_i32, i32, visit_i32);
+    deserialize_integer!(deserialize_i64, i64, visit_i64);
+    deserialize_integer!(deserialize_i128, i128, visit_i128);
+    deserialize_integer!(deserialize_u8, u8, visit_u8);
+    deserialize_integer!(deserialize_u16, u16, visit_u16);
+    deserialize_integer!(deserialize_u32, u32, visit_u32);
+    deserialize_integer!(deserialize_u64, u64, visit_u64);
+    deserialize_integer!(deserialize_u128, u128, visit_u128);
+    deserialize_float!(deserialize_f32, f32, visit_f32);
+    deserialize_float!(deserialize_f64, f64, visit_f64);
 
     fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         match self.node.node() {

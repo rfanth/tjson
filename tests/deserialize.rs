@@ -610,30 +610,38 @@ fn the_number_ladder_matches_the_oracle_at_every_boundary() {
 }
 
 
-/// KNOWN GAP, not a flaky test: `-0` loses its sign on the way to an exact field.
-///
-/// `-0` parses as an `i64` and an `i64` has no negative zero, so the ladder hands
-/// the visitor `0` and the spelling is gone before anything downstream can keep
-/// it. Every other exact spelling survives -- see `exact_digits_survive_every_rung`
-/// -- and `serde_json::Value` agrees with the oracle here, so the divergence is
-/// confined to fields that asked for the exact digits.
-///
-/// The cause is upstream and known; a patched serde_json tree exists outside this
-/// repository, and this crate deliberately does not build against it. Pinned as
-/// the behaviour that is true today so that a fix announces itself:
-///
-/// ```text
-/// cargo test --test deserialize -- --ignored negative_zero
-/// ```
+/// `-0` keeps its sign on the way to an exact field, and an integer field refuses
+/// it rather than take `0`: no integer type has a sign of zero to keep it in.
+/// Every integer conversion asks the same rule, `exact_integer` in `number.rs`.
 #[test]
-#[ignore = "known gap: -0 loses its sign through the integer rung"]
-fn negative_zero_keeps_its_sign_for_an_exact_field() {
+fn negative_zero_keeps_its_sign_or_is_refused() {
     #[derive(Deserialize)]
-    struct Holder {
+    struct Exact {
         n: tjson::Number,
     }
-    let holder: Holder = tjson::from_str("  n:-0").expect("-0 is a valid number");
-    assert_eq!(holder.n.as_str(), "-0", "-0 lost its sign");
+    let exact: Exact = tjson::from_str("  n:-0").expect("-0 is a valid number");
+    assert_eq!(exact.n.as_str(), "-0", "-0 lost its sign");
+
+    #[derive(Deserialize)]
+    struct Float {
+        n: f64,
+    }
+    let float: Float = tjson::from_str("  n:-0").expect("an f64 holds -0");
+    assert!(float.n == 0.0 && float.n.is_sign_negative(), "-0 lost its sign in an f64");
+
+    #[derive(Deserialize, Debug)]
+    struct Signed {
+        #[allow(dead_code)]
+        n: i64,
+    }
+    #[derive(Deserialize, Debug)]
+    struct Unsigned {
+        #[allow(dead_code)]
+        n: u8,
+    }
+    assert!(tjson::from_str::<Signed>("  n:-0").is_err(), "an i64 field took -0 as 0");
+    assert!(tjson::from_str::<Unsigned>("  n:-0").is_err(), "a u8 field took -0 as 0");
+    assert!(tjson::from_str::<Signed>("  n:0").is_ok());
 }
 
 /// KNOWN GAP, not a flaky test: `flatten` and untagged reject numbers past `u64`.
